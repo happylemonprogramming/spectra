@@ -14,7 +14,7 @@ can read.
 | --- | --- |
 | Repository | New repo. Code is pulled from Rainbow Player where it is relevant, and referenced otherwise |
 | Platform | Omarchy only (Arch + Hyprland). No portability work until it works here |
-| Hardware | One USB optical drive: an LG BU40N (MT1959) in a USB-C slim enclosure. Selling hardware is out of scope |
+| Hardware | One USB optical drive on LG's MT1959 platform, so it can take OmniDrive later: an LG BU40N in a 9.5 mm USB-C enclosure, or an LG BP50NB40 (svc code NB50/NB52). See the [Redump OmniDrive page](https://wiki.redump.info/OmniDrive). Selling hardware is out of scope |
 | Stack | Tauri 2 (Rust core, React/three.js UI). Revisit after Phase 0 if a spike argues otherwise |
 | License | GPL-3.0-or-later, the same as Rainbow Player, so its code can be reused |
 | Emulators | Hosted, not forked. Standalone programs or libretro cores do the emulation; Spectra identifies the disc, routes it, and supplies the UI |
@@ -158,7 +158,9 @@ that has been cached loads faster than it does from the drive.
 
 ## Phase 3: the OmniDrive tier
 
-- [ ] Build OmniDrive and flash it with `sdftool`. Use a second drive if one
+- [ ] Flash Redump's prebuilt OmniDrive (BU40N image for slim drives):
+      `redumper flash::mt1959` for a BU40N, MakeMKV 1.17.7's `sdftool` for
+      drives that need cross-flashing (BP50NB40). Use a second drive if one
       is available, so a bad flash does not stop the project
 - [ ] Detect the drive's capabilities (OmniDrive version) and gray out systems
       it cannot read
@@ -230,6 +232,6 @@ playing.
 | Risk | Mitigation |
 | --- | --- |
 | PCSX2 or RetroArch cannot boot a physical disc | `vdisc` (Phase 2) turns every drive into a file, so bring it forward |
-| The enclosure's USB bridge interferes with raw commands | Test in Phase 0; keep a second enclosure model in mind |
+| The enclosure's USB bridge interferes with raw commands | Test in Phase 0. Known cases: INIC-3619 bridges block flashing; the Verbatim 43888's bridge truncates some transfer sizes over USB 3 (OmniDrive issue #85), so keep raw read sizes in its safe bands or use a USB 2 cable |
 | A flash bricks the drive | Phase 3 only, preferably on a second drive |
 | Bus power is marginal for a slim BD drive | USB-C 10 Gbps port, a Y-cable, or a powered hub |
