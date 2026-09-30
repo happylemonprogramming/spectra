@@ -13,9 +13,9 @@ can read.
 | Question | Decision |
 | --- | --- |
 | Repository | New repo. Code is pulled from Rainbow Player where it is relevant, and referenced otherwise |
-| Platform | Omarchy only (Arch + Hyprland). No portability work until it works here |
+| Platform | Omarchy first (Arch + Hyprland). macOS kept possible, not built: see [Portability](#portability) |
 | Hardware | One USB optical drive on LG's MT1959 platform, so it can take OmniDrive later: an LG BU40N in a 9.5 mm USB-C enclosure, or an LG BP50NB40 (svc code NB50/NB52). See the [Redump OmniDrive page](https://wiki.redump.info/OmniDrive). Selling hardware is out of scope |
-| Stack | Tauri 2 (Rust core, React/three.js UI). Revisit after Phase 0 if a spike argues otherwise |
+| Stack | Rust throughout. The UI is [iced](https://iced.rs) 0.14 on wgpu, with the disc as a wgpu shader. Chosen over Tauri by the UI weight spike (`docs/spikes.md`): a quarter of the memory of an empty WebKitGTK page, with the whole screen built |
 | License | GPL-3.0-or-later, the same as Rainbow Player, so its code can be reused |
 | Emulators | Hosted, not forked. Standalone programs or libretro cores do the emulation; Spectra identifies the disc, routes it, and supplies the UI |
 
@@ -37,28 +37,37 @@ can read.
 
 ## Budgets
 
-Measured on a ThinkPad P14s Gen 6 (Ryzen AI 7 PRO 350). "Now" is the Phase 0
-shell, a nearly empty page, as a release build.
+Measured on a ThinkPad P14s Gen 6 (Ryzen AI 7 PRO 350, Radeon 860M, 60 Hz).
+"Now" is the Phase 0 UI spike - the finished player screen - as a release
+build.
 
 | What | Budget | Now |
 | --- | --- | --- |
-| Binary size (UI, core and PS2 title table included) | < 10 MB | 6.4 MB |
-| Launch to window on screen | < 500 ms | ~300 ms |
+| Binary size | < 10 MB | 8.7 MB (the PS2 title table adds 0.8 MB when the core is linked) |
+| Launch to window on screen | < 500 ms | ~380-450 ms, about 200 of it Mesa creating a Vulkan instance |
 | CPU while idle | 0% | 0% |
-| Memory with the menu open (all processes) | < 150 MB | ~220 MB (WebKitGTK) |
+| Memory with the menu open | < 150 MB | 25 MB |
 | Spectra's memory while a game runs | < 20 MB | not built yet |
-| GPU while the menu sits idle | 0% (no animation loop running when nothing moves) | not built yet |
+| GPU while the menu sits idle | 0% | 0% above the desktop's own baseline |
+| CPU while the disc spins | none set | ~14% of one core at 60 Hz: iced lays the whole view out every frame |
 | Emulators bundled | none: installed when a disc first needs them | none |
 
 How the design keeps to them:
 
-- **Nothing resident but a watcher.** A small Rust process (no webview)
+- **Nothing resident but a watcher.** A small Rust process (no window)
   waits for media-change events; the UI starts when a disc goes in.
-- **The UI steps aside for games.** While an emulator runs, the webview is
-  torn down, so Spectra shrinks to the watcher and the disc cache.
-- **The 3D disc is optional and on demand.** It renders only while it
-  moves, caps its frame rate, and falls back to a still image on weak GPUs or
-  with reduced motion.
+- **The UI steps aside for games.** While an emulator runs, the UI process
+  exits, so Spectra shrinks to the watcher and the disc cache.
+- **Frames only while something moves.** The disc shows off both faces on
+  arrival, then rests; a frame subscription exists only while anything is
+  animating. `--reduced-motion` skips the flips.
+- **Only the GPU backend in use.** wgpu starts Vulkan alone where a Vulkan
+  driver is installed (OpenGL costs 90 ms of startup for nothing), and keeps
+  OpenGL as the fallback on GPUs without one.
+- **Computed once, not per frame.** The blurred backdrop is a 48-pixel image
+  blurred on the CPU at load and stretched by the texture filter.
+- **Dependencies built for size.** iced, wgpu and naga are compiled at
+  `opt-level = "s"`, Spectra's own code at 3, and panics abort.
 - **Hardware video decoding.** DVD and Blu-ray go through mpv with VA-API,
   which costs almost no CPU.
 - **Emulators on demand.** The first PS2 disc offers to install PCSX2;
@@ -71,8 +80,8 @@ How the design keeps to them:
 ## Architecture
 
 ```
-┌───────────────────────── Spectra (Tauri) ─────────────────────────┐
-│ UI (React/three.js): 3D disc, library, BIOS setup, gamepad remote │
+┌──────────────────────────── Spectra (Rust) ───────────────────────┐
+│ UI (iced + wgpu): 3D disc, library, BIOS setup, gamepad remote    │
 ├───────────────────────────────────────────────────────────────────┤
 │ Rust core                                                         │
 │   drive     SG_IO on /dev/sg*: TOC, READ CD, READ(12), events     │
@@ -87,6 +96,24 @@ How the design keeps to them:
    scummvm, openblack
 ```
 
+## Portability
+
+Omarchy is the target; macOS should stay a port rather than a rewrite. Three
+rules keep it that way:
+
+1. **Heavy things are separate programs.** Video in mpv, games in their
+   emulators, all of which exist on macOS. Spectra is the menu and launcher.
+2. **Platform code lives in two places.** The drive backend (SG_IO here,
+   IOKit's SCSITaskDeviceInterface on macOS) behind the `Disc` trait, and a
+   small `platform` module for window focus, media-change events (udev,
+   DiskArbitration) and paths.
+3. **Everything else is cross-platform crates.** winit and wgpu (Vulkan here,
+   Metal there), gilrs, cpal, `directories`, `rfd`.
+
+What would stay weaker on macOS: the Phase 2 virtual disc (macFUSE needs a
+kernel extension; FSKit or dump-first instead), and PC games (CrossOver
+rather than Proton).
+
 ## Rainbow Player
 
 Upstream: `nostr://alex@gleasonator.com/git.shakespeare.diy/rainbow-player`.
@@ -100,13 +127,16 @@ Credit it in anything that is ported.
 | `src/lib/cd/mmc.ts` | Port to Rust `drive`: TOC, READ CD, GET EVENT/STATUS, eject, the 150-sector offset rules |
 | `src/lib/dvd/scsi.ts` | Port READ(12) and READ CAPACITY; the CSS commands are not needed (libdvdcss replaces them) |
 | `src/lib/cd/bot.ts` | Reference only. Keep the lesson that sense data must be collected after a failure; SG_IO replaces the transport |
-| `src/lib/cd/discid.ts`, `musicbrainz.ts`, `cache.ts` | Reuse as is (TypeScript, UI side) |
+| `src/lib/cd/discid.ts` | Ported (`spectra-core::discid`) |
+| `src/lib/cd/musicbrainz.ts`, `cache.ts` | Port to Rust: lookups and a disk cache under `~/.cache/spectra` |
 | `src/lib/game/identify.ts`, `iso9660.ts` | Port to Rust `identify`, then extend it to more systems |
 | `src/lib/game/disc.ts` | Design basis for `vdisc`: 64 KB blocks, LRU, read-ahead, keep-spinning |
 | `src/lib/game/catalog.ts`, `scripts/ps2-titles.mjs` | Reuse for serial → title and cover lookups |
-| `src/lib/discArt.ts`, `discScene.ts`, `components/player/*` | Reuse for the UI |
-| `src/hooks/useCdAudio.ts`, `src/lib/cd/drive.ts` (audio path) | Reuse, fed by the Rust drive instead of WebUSB |
-| `src/lib/input/remote.ts`, `hooks/useRemote.ts` | Reuse for gamepad and keyboard control of the menus |
+| `src/lib/discScene.ts` | Ported: the shaders to WGSL (`crates/spectra/src/disc.wgsl`), the motion to `motion.rs`. Bloom not yet |
+| `src/lib/discArt.ts` | Port to Rust: finding the disc in a Cover Art Archive scan |
+| `components/player/*` | Reference for the layout |
+| `src/hooks/useCdAudio.ts`, `src/lib/cd/drive.ts` (audio path) | Port: READ CD into `cpal` instead of Web Audio |
+| `src/lib/input/remote.ts`, `hooks/useRemote.ts` | Ported in spirit: `Remote` in the UI, pads through `gilrs` |
 | `electron/usb/virtual/*`, `src/lib/cd/virtualDrive.test.ts` | Design basis for the fake drive used in tests |
 | `electron/`, `src/lib/cd/usb.ts`, `src/lib/dvd/*` decoders, `emulators/play/` | Do not port. Native access, libmpv and native emulators replace them |
 
@@ -115,9 +145,10 @@ Credit it in anything that is ported.
 ```
 crates/spectra-core/    reading and identifying discs (drive over SG_IO, or images)
 crates/spectra-discid/  command line: what disc is this?
-app/                    the Tauri shell: React UI in app/src, Rust in app/src-tauri
-docs/spikes.md          Phase 0 questions that need the drive, and their answers
-scripts/check.sh        fmt, clippy, tests, frontend build
+crates/spectra/         the app: iced UI, the disc shader, motion, gamepads
+docs/spikes.md          Phase 0 questions and their answers
+scripts/check.sh        fmt, clippy, tests
+scripts/measure.sh      a release build against the budgets
 ```
 
 Rust is pinned per-project by `mise.toml`.
@@ -130,7 +161,7 @@ Answer the unknowns cheaply before building anything big.
 - [ ] Assemble the test disc set (see [Test discs](#test-discs))
 - [ ] `sudo pacman -S sg3_utils libdvdcss libaacs` and load the `sg` module
       at boot (`/etc/modules-load.d/sg.conf`)
-- [x] Scaffold the repo: Cargo workspace plus the Tauri app, and
+- [x] Scaffold the repo: Cargo workspace plus the app, and
       `scripts/check.sh` for the checks. Hook it up to CI once the repo has a
       host
 - [ ] **Spike: SG_IO.** Can Rust send INQUIRY, READ TOC and READ(12) to
@@ -140,12 +171,11 @@ Answer the unknowns cheaply before building anything big.
       disc (`cdrom://` or `/dev/sr0`)?
 - [ ] **Spike: enclosure.** Does it attach as UAS or BOT, and does SG_IO
       behave differently between the two?
-- [ ] **Spike: UI weight.** The spinning rainbow disc, twice: Rainbow
-      Player's three.js scene in the Tauri webview, and the same shader in a
-      native Rust window (wgpu). Measure memory, GPU and startup for each.
-      If the webview cannot get under the menu memory budget, the UI goes
-      native before Phase 1 ports it, so the port is only done once. Needs no
-      drive
+- [x] **Spike: UI weight.** Webview or native, decided before Phase 1 ports
+      the UI. Answer: native. One finished screen in iced - the rainbow disc,
+      a blurred cover backdrop, a gamepad-driven track list with an animated
+      focus glow - meets every budget; an empty Tauri page already missed
+      the memory one. Details in `docs/spikes.md`
 - [x] Build `spectra-discid`, a command-line tool that prints the media type
       and identity. Port `identify.ts` and `iso9660.ts`, and test it against
       disc images before the drive arrives. It also covers UDF (DVD and
@@ -161,8 +191,8 @@ every spike has a written yes or no answer in `docs/spikes.md`.
 
 Get the core experience working for the most common discs.
 
-- [ ] Tauri shell: fullscreen, a launcher in the Omarchy app menu, and the
-      Rainbow Player UI running against the Rust drive
+- [ ] The app: fullscreen, a launcher in the Omarchy app menu, and the spike
+      screen running against the Rust drive and real MusicBrainz lookups
 - [ ] Watcher: a media-change event brings Spectra forward with the disc
       shown
 - [ ] Audio CD: Rainbow Player's audio path (MusicBrainz, the 3D disc,

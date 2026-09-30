@@ -93,28 +93,54 @@ WebUSB build only sees subclass 02, but SG_IO does not care.
 
 ## 5. UI weight: webview or native
 
-Needs no drive. The Phase 0 shell already costs about 220 MB with a nearly
-empty page, almost all of it WebKitGTK, against a menu budget of 150 MB (see
-PLAN.md, Budgets). The question is what the real UI costs, and whether a native
-window beats it by enough to be worth giving up the direct port of Rainbow
-Player's React and three.js code.
+Answered without the drive. The question was whether Spectra's UI should be a
+webview (Tauri, reusing Rainbow Player's React and three.js) or native.
 
-Build the same thing twice: the disc turning, with the rainbow read side
-(`discScene.ts`'s grating shader) and a cover texture.
+**Answer: native, with iced 0.14 on wgpu.**
 
-1. In the Tauri app, using Rainbow Player's `discScene.ts` and `discArt.ts`.
-2. In a native Rust window with wgpu, with the shader ported to WGSL.
+The Tauri shell, showing a nearly empty page, already cost about 220 MB
+across its processes, almost all of it WebKitGTK - over the 150 MB menu budget
+before any real UI existed. So the native side was built as one finished
+screen rather than a bare disc (`crates/spectra`):
 
-For each, from a release build, record:
+- Rainbow Player's disc shaders ported to WGSL: the grating-equation rainbow,
+  the lacquered label with its concentric sheen, the metallised lip, the
+  polycarbonate edge, Khronos PBR Neutral tone mapping. Rendered off-screen
+  with 4x multisampling and composited over the UI. No bloom yet.
+- Its motion: the eased flips, sway, tilt and spin-up, except that the disc
+  settles after two flips instead of flipping forever.
+- The album's cover, blurred, behind everything; title in Adwaita Sans; a
+  track list driven by keyboard or gamepad with an animated focus glow in the
+  cover's own colour.
 
-- time to window (`/tmp/opencode/measure.sh`-style: launch, poll `hyprctl
-  clients` for the pid)
-- total PSS across all processes, with the disc turning and when stopped
-- CPU and GPU while turning and while stopped (`radeontop` or
-  `/sys/class/drm/card*/device/gpu_busy_percent`)
+Release build, measured with `scripts/measure.sh`
+(poll `hyprctl clients` for the pid, `smaps_rollup` for PSS, `/proc/pid/stat`
+for CPU, `gpu_busy_percent` for the GPU):
 
-Go native if the webview version misses the 150 MB budget by more than
-tuning can recover. Keep Tauri if it stays within it.
+| | Tauri, empty page | iced, full screen |
+| --- | --- | --- |
+| Binary | 6.4 MB | 8.7 MB |
+| Launch to window | ~300 ms | ~380-450 ms |
+| Memory (PSS, all processes) | ~220 MB | 25 MB |
+| CPU at rest | 0% | 0% |
+| GPU at rest | - | nothing above the desktop's baseline |
+| CPU while spinning | - | ~14% of one core |
+
+Two things were tuned to get there: wgpu now starts Vulkan alone when a
+Vulkan driver is installed (it was also starting OpenGL, which cost 90 ms and
+the memory of a second driver), and dependencies are built at
+`opt-level = "s"` with `panic = "abort"`, which took the binary from 11.9 MB
+to 8.7 MB. About 200 ms of the launch is Mesa creating a Vulkan instance,
+which Spectra cannot shorten; the watcher-launches-UI design hides it behind
+the drive spinning up anyway.
+
+It also answered "can it look good": the one effect iced lacks, a blur
+behind a panel, was not needed - blurring the cover once on the CPU gives the
+same backdrop for nothing per frame.
+
+Left for Phase 1: bloom on the rainbow, per-frame CPU while spinning (the
+whole view is laid out every frame; caching the static parts should cut it),
+and a bundled font instead of relying on Adwaita Sans being installed.
 
 ## Results
 
@@ -124,7 +150,7 @@ tuning can recover. Keep Tauri if it stays within it.
 | 2. PCSX2 off the drive | pending | |
 | 3. RetroArch off the drive | pending | |
 | 4. Enclosure mode | pending | |
-| 5. UI weight | pending | |
+| 5. UI weight | **Native: iced + wgpu** | Section 5 above: 25 MB vs ~220 MB, all budgets met |
 
 Drive: model, firmware and enclosure, as `spectra-discid --list` and `lsusb`
 report them:

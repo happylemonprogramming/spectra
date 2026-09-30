@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "app/src-tauri"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,3 +23,8 @@ codegen-units = 1
 lto = true
 opt-level = 3
 strip = true
+panic = "abort"
+
+# Dependencies (iced, wgpu, naga) optimised for size; Spectra's own code for speed.
+[profile.release.package."*"]
+opt-level = "s"

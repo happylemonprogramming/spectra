@@ -1,0 +1,24 @@
+[package]
+name = "spectra"
+description = "Spectra: put a disc in, and it plays"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+gilrs = "0.11"
+glam = "0.33"
+# No software renderer, no bundled font, no web colours: wgpu draws
+# everything, and images are decoded here rather than inside iced.
+iced = { version = "0.14", default-features = false, features = [
+    "wgpu",
+    "crisp",
+    "thread-pool",
+    "wayland",
+    "x11",
+    "image-without-codecs",
+] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde.workspace = true
+serde_json.workspace = true
