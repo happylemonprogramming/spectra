@@ -33,6 +33,8 @@ impl std::fmt::Debug for Label {
 pub struct Art {
     pub label: Arc<Label>,
     pub backdrop: iced::widget::image::Handle,
+    /// The cover, small, for layouts with no room for the disc.
+    pub thumbnail: iced::widget::image::Handle,
     /// The cover's characteristic colour, for tinting the room and the UI.
     pub accent: [f32; 3],
 }
@@ -43,6 +45,7 @@ impl Art {
         Self {
             label: Arc::new(label(&square)),
             backdrop: backdrop(&square),
+            thumbnail: thumbnail(&square),
             accent: accent(&square),
         }
     }
@@ -86,6 +89,12 @@ fn backdrop(square: &RgbaImage) -> iced::widget::image::Handle {
     let small = imageops::resize(square, 48, 48, FilterType::Triangle);
     let blurred = imageops::blur(&small, 5.0);
     iced::widget::image::Handle::from_rgba(blurred.width(), blurred.height(), blurred.into_raw())
+}
+
+/// Enough pixels for a thumbnail at twice its largest size.
+fn thumbnail(square: &RgbaImage) -> iced::widget::image::Handle {
+    let small = imageops::resize(square, 192, 192, FilterType::CatmullRom);
+    iced::widget::image::Handle::from_rgba(small.width(), small.height(), small.into_raw())
 }
 
 /// The most characterful colour: an average weighted towards saturated,

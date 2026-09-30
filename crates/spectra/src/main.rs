@@ -20,9 +20,14 @@ use iced::alignment::Vertical;
 use iced::font::Weight;
 use iced::gradient::Linear;
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{column, container, image, row, shader, space, stack, text};
+use iced::widget::scrollable::{AbsoluteOffset, Direction, Scrollbar, Viewport};
+use iced::widget::text::Wrapping;
+use iced::widget::{
+    Id, button, column, container, image, mouse_area, operation, responsive, row, scrollable,
+    shader, space, stack, text,
+};
 use iced::{
-    Background, Border, Color, ContentFit, Element, Fill, FillPortion, Font, Radians, Shadow,
+    Background, Border, Color, ContentFit, Element, Fill, Font, Radians, Shadow, Size,
     Subscription, Task, Theme, Vector, window,
 };
 
@@ -35,10 +40,13 @@ const BOLD: Font = Font {
     weight: Weight::Bold,
     ..FONT
 };
-/// Rows visible at once; the list scrolls to keep the focus inside it.
-const VISIBLE_ROWS: usize = 10;
 /// A CD's track pitch in nanometres.
 const CD_PITCH: f32 = 1600.0;
+const TRACKS: &str = "tracks";
+/// Room around the rows inside the scrolling list, so the focus glow is not
+/// clipped at its edges.
+const LIST_PAD: f32 = 14.0;
+const ROW_GAP: f32 = 4.0;
 
 /// The remote control: keyboard and gamepads both speak it.
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +55,8 @@ pub enum Remote {
     Down,
     Select,
     PlayPause,
+    Previous,
+    Next,
     Back,
     Quit,
 }
@@ -54,7 +64,87 @@ pub enum Remote {
 #[derive(Debug, Clone)]
 enum Message {
     Remote(Remote),
+    /// A track clicked.
+    Pick(usize),
+    /// The track list scrolled or changed size.
+    Scrolled(Viewport),
     Frame(Instant),
+}
+
+/// How the screen is arranged, from the most room to the least.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Layout {
+    /// The disc beside the album: landscape windows with room for both.
+    Beside { disc: f32 },
+    /// The disc above the album: portrait windows.
+    Above { disc: f32 },
+    /// No disc: the cover as a thumbnail, and the room goes to the tracks.
+    List,
+    /// Too small for a list: what is playing, and the controls.
+    Controls,
+}
+
+/// Width the album needs beside the disc.
+const PANEL_MIN: f32 = 440.0;
+/// Height the album keeps under a disc placed above it.
+const BELOW_MIN: f32 = 340.0;
+/// Smaller than this, the disc is a decoration; the room is better spent on
+/// the tracks.
+const DISC_MIN: f32 = 260.0;
+
+impl Layout {
+    fn for_size(size: Size) -> Self {
+        let (w, h) = (size.width, size.height);
+        if w < 240.0 || h < 220.0 {
+            return Self::Controls;
+        }
+        if h <= w * 1.05 {
+            let disc = h.min(w - PANEL_MIN).min(w * 0.55);
+            if disc >= DISC_MIN {
+                return Self::Beside { disc };
+            }
+        }
+        let disc = (h - BELOW_MIN).min(w).min(h * 0.45);
+        if disc >= DISC_MIN {
+            return Self::Above { disc };
+        }
+        Self::List
+    }
+}
+
+/// Type and spacing: roomy when the window is, tighter when it is not.
+#[derive(Clone, Copy)]
+struct Scale {
+    title: f32,
+    artist: f32,
+    detail: f32,
+    track: f32,
+    row: f32,
+    gap: f32,
+}
+
+impl Scale {
+    fn for_size(size: Size) -> Self {
+        if size.height >= 600.0 && size.width >= 560.0 {
+            Self {
+                title: 42.0,
+                artist: 22.0,
+                detail: 15.0,
+                track: 18.0,
+                row: 46.0,
+                gap: 24.0,
+            }
+        } else {
+            Self {
+                title: 24.0,
+                artist: 16.0,
+                detail: 13.0,
+                track: 15.0,
+                row: 36.0,
+                gap: 12.0,
+            }
+        }
+    }
 }
 
 struct Spectra {
@@ -62,12 +152,12 @@ struct Spectra {
     art: Art,
     motion: Motion,
     focus: usize,
-    /// First visible row.
-    scroll: usize,
     playing: Option<usize>,
     paused: bool,
     /// Per row, 0 to 1: how strongly it glows as the focus.
     glow: Vec<f32>,
+    /// The track list's last reported viewport, while it overflows.
+    list: Option<Viewport>,
     last_frame: Option<Instant>,
 }
 
@@ -113,10 +203,10 @@ impl Spectra {
             art,
             motion: Motion::new(options.reduced_motion),
             focus: 0,
-            scroll: 0,
             playing: None,
             paused: false,
             glow,
+            list: None,
             last_frame: None,
         };
         if options.play {
@@ -149,36 +239,94 @@ impl Spectra {
                         *glow = target;
                     }
                 }
+                Task::none()
+            }
+            Message::Scrolled(viewport) => {
+                // A new size can leave the focus out of sight; a scroll by
+                // hand is left where it was put.
+                let resized = self
+                    .list
+                    .is_none_or(|old| old.bounds().size() != viewport.bounds().size());
+                self.list = Some(viewport);
+                if resized {
+                    self.reveal_focus()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::Pick(track) => {
+                self.focus = track;
+                self.play(track);
+                Task::none()
             }
             Message::Remote(remote) => {
                 let count = self.album.tracks.len();
+                if count == 0 {
+                    return if let Remote::Quit = remote {
+                        iced::exit()
+                    } else {
+                        Task::none()
+                    };
+                }
                 match remote {
                     Remote::Up => self.focus = self.focus.saturating_sub(1),
-                    Remote::Down => self.focus = (self.focus + 1).min(count.saturating_sub(1)),
-                    Remote::Select if count > 0 => self.play(self.focus),
+                    Remote::Down => self.focus = (self.focus + 1).min(count - 1),
+                    Remote::Select => self.play(self.focus),
                     Remote::PlayPause => match self.playing {
                         Some(_) => {
                             self.paused = !self.paused;
                             self.motion.set_spinning(!self.paused);
                         }
-                        None if count > 0 => self.play(self.focus),
-                        None => {}
+                        None => self.play(self.focus),
                     },
+                    Remote::Previous | Remote::Next => {
+                        let current = self.playing.unwrap_or(self.focus);
+                        self.focus = match remote {
+                            Remote::Previous => current.saturating_sub(1),
+                            _ => (current + 1).min(count - 1),
+                        };
+                        if self.playing.is_some() {
+                            self.play(self.focus);
+                        }
+                    }
                     Remote::Back => {
                         self.playing = None;
                         self.motion.set_spinning(false);
                     }
                     Remote::Quit => return iced::exit(),
-                    Remote::Select => {}
                 }
-                if self.focus < self.scroll {
-                    self.scroll = self.focus;
-                } else if self.focus >= self.scroll + VISIBLE_ROWS {
-                    self.scroll = self.focus + 1 - VISIBLE_ROWS;
-                }
+                self.reveal_focus()
             }
         }
-        Task::none()
+    }
+
+    /// Scroll the track list just enough to show the focused row, glow
+    /// included. Rows are all one height, so where a row sits follows from
+    /// the list's content height.
+    fn reveal_focus(&self) -> Task<Message> {
+        let Some(list) = self.list else {
+            return Task::none();
+        };
+        let count = self.album.tracks.len() as f32;
+        let pitch = (list.content_bounds().height - 2.0 * LIST_PAD + ROW_GAP) / count;
+        let top = self.focus as f32 * pitch;
+        let bottom = top + pitch - ROW_GAP + 2.0 * LIST_PAD;
+        let offset = list.absolute_offset().y;
+        let height = list.bounds().height;
+        let y = if top < offset {
+            top
+        } else if bottom > offset + height {
+            bottom - height
+        } else {
+            return Task::none();
+        };
+        operation::scroll_to(
+            Id::from(TRACKS),
+            AbsoluteOffset {
+                x: None,
+                y: Some(y.max(0.0)),
+            },
+        )
     }
 
     fn animating(&self) -> bool {
@@ -204,8 +352,6 @@ impl Spectra {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let accent = Color::from_rgb(self.art.accent[0], self.art.accent[1], self.art.accent[2]);
-
         let backdrop = image(self.art.backdrop.clone())
             .width(Fill)
             .height(Fill)
@@ -223,118 +369,261 @@ impl Spectra {
                 )),
                 ..Default::default()
             });
+        stack![backdrop, shade, responsive(|size| self.screen(size))].into()
+    }
 
-        let disc = shader(disc::Disc {
+    /// Everything over the backdrop, arranged for the room there is.
+    fn screen(&self, size: Size) -> Element<'_, Message> {
+        let scale = Scale::for_size(size);
+        match Layout::for_size(size) {
+            Layout::Beside { disc } => {
+                let album = column![self.header(scale), self.tracks(scale), self.hints(scale)]
+                    .spacing(scale.gap)
+                    .max_width(560);
+                let pad = if scale.gap > 20.0 { [40, 44] } else { [16, 20] };
+                row![
+                    self.disc().width(disc).height(Fill),
+                    container(album).padding(pad).height(Fill).center_y(Fill),
+                ]
+                .into()
+            }
+            Layout::Above { disc } => column![
+                self.disc().width(Fill).height(disc),
+                container(
+                    column![self.header(scale), self.tracks(scale), self.hints(scale)]
+                        .spacing(scale.gap)
+                        .max_width(560),
+                )
+                .padding([0, 20])
+                .center_x(Fill)
+                .height(Fill),
+            ]
+            .into(),
+            Layout::List => container(
+                column![
+                    row![self.cover(64.0), self.header(scale)]
+                        .spacing(14)
+                        .align_y(Vertical::Center),
+                    self.tracks(scale),
+                ]
+                .spacing(scale.gap),
+            )
+            .padding([16, 14])
+            .into(),
+            Layout::Controls => self.controls(size),
+        }
+    }
+
+    fn accent(&self) -> Color {
+        Color::from_rgb(self.art.accent[0], self.art.accent[1], self.art.accent[2])
+    }
+
+    fn disc(&self) -> iced::widget::Shader<Message, disc::Disc> {
+        shader(disc::Disc {
             pose: self.motion.pose(),
             label: self.art.label.clone(),
             accent: self.art.accent,
             pitch: CD_PITCH,
         })
-        .width(FillPortion(11))
-        .height(Fill);
+    }
 
+    fn cover(&self, side: f32) -> Element<'_, Message> {
+        image(self.art.thumbnail.clone())
+            .width(side)
+            .height(side)
+            .border_radius(side * 0.08)
+            .into()
+    }
+
+    fn header(&self, scale: Scale) -> Element<'_, Message> {
         let album = &self.album;
-        let total = album.total_seconds();
         let details = [
             album.year.map(|y| y.to_string()),
             Some(format!("{} tracks", album.tracks.len())),
-            Some(format!("{} min", total.div_ceil(60))),
+            Some(format!("{} min", album.total_seconds().div_ceil(60))),
         ]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join("  ·  ");
-        let header = column![
-            text(&album.title).font(BOLD).size(42).color(Color::WHITE),
-            text(&album.artist)
-                .font(FONT)
-                .size(22)
-                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.78)),
-            text(details)
-                .font(FONT)
-                .size(15)
-                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5)),
-        ]
-        .spacing(6);
+        container(
+            column![
+                text(&album.title)
+                    .font(BOLD)
+                    .size(scale.title)
+                    .color(Color::WHITE),
+                text(&album.artist)
+                    .font(FONT)
+                    .size(scale.artist)
+                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.78)),
+                text(details)
+                    .font(FONT)
+                    .size(scale.detail)
+                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5)),
+            ]
+            .spacing(scale.gap / 4.0),
+        )
+        .padding([0.0, LIST_PAD])
+        .into()
+    }
 
-        let rows = album
-            .tracks
-            .iter()
-            .enumerate()
-            .skip(self.scroll)
-            .take(VISIBLE_ROWS)
-            .map(|(i, track)| {
-                let glow = self.glow[i];
-                let is_playing = self.playing == Some(i);
-                let marker = match (is_playing, self.paused) {
-                    (true, false) => "▶".to_string(),
-                    (true, true) => "❚❚".to_string(),
-                    _ => format!("{}", i + 1),
-                };
-                let strong =
-                    Color::from_rgba(1.0, 1.0, 1.0, 0.72 + 0.28 * glow.max(f32::from(is_playing)));
-                let row = row![
-                    text(marker)
-                        .font(FONT)
-                        .size(15)
-                        .width(34)
-                        .color(if is_playing { accent } else { strong }),
+    fn tracks(&self, scale: Scale) -> Element<'_, Message> {
+        let accent = self.accent();
+        let rows = self.album.tracks.iter().enumerate().map(|(i, track)| {
+            let glow = self.glow[i];
+            let is_playing = self.playing == Some(i);
+            let marker = match (is_playing, self.paused) {
+                (true, false) => "▶".to_string(),
+                (true, true) => "❚❚".to_string(),
+                _ => format!("{}", i + 1),
+            };
+            let strong =
+                Color::from_rgba(1.0, 1.0, 1.0, 0.72 + 0.28 * glow.max(f32::from(is_playing)));
+            let line = row![
+                text(marker)
+                    .font(FONT)
+                    .size(scale.track - 3.0)
+                    .width(scale.track * 1.9)
+                    .color(if is_playing { accent } else { strong }),
+                container(
                     text(&track.title)
                         .font(if is_playing { BOLD } else { FONT })
-                        .size(18)
-                        .color(strong)
-                        .width(Fill),
-                    text(format!("{}:{:02}", track.seconds / 60, track.seconds % 60))
-                        .font(FONT)
-                        .size(15)
-                        .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5)),
-                ]
-                .align_y(Vertical::Center);
-                container(row)
-                    .padding([11, 18])
-                    .width(Fill)
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(
-                            Color {
-                                a: 0.07 + 0.13 * glow,
-                                ..accent
-                            }
-                            .scale_alpha(glow),
-                        )),
-                        border: Border {
-                            color: Color {
-                                a: 0.55 * glow,
-                                ..accent
-                            },
-                            width: 1.0,
-                            radius: 12.0.into(),
-                        },
-                        shadow: Shadow {
-                            color: Color {
-                                a: 0.45 * glow,
-                                ..accent
-                            },
-                            offset: Vector::ZERO,
-                            blur_radius: 22.0 * glow,
-                        },
-                        ..Default::default()
-                    })
-                    .into()
-            });
-        let list = column(rows).spacing(4);
-
-        let hints = text("↑↓ Choose    ✕ Play    Start Pause    ○ Stop")
-            .font(FONT)
-            .size(13)
-            .color(Color::from_rgba(1.0, 1.0, 1.0, 0.4));
-
-        let panel = container(column![header, list, hints].spacing(28).max_width(560))
-            .width(FillPortion(9))
-            .height(Fill)
-            .padding([48, 56])
+                        .size(scale.track)
+                        .wrapping(Wrapping::None)
+                        .color(strong),
+                )
+                .width(Fill)
+                .clip(true),
+                text(format!("{}:{:02}", track.seconds / 60, track.seconds % 60))
+                    .font(FONT)
+                    .size(scale.track - 3.0)
+                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5)),
+            ]
+            .spacing(8)
             .align_y(Vertical::Center);
+            let row = container(line)
+                .padding([0.0, scale.row * 0.36])
+                .width(Fill)
+                .height(scale.row)
+                .center_y(scale.row)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(
+                        Color {
+                            a: 0.07 + 0.13 * glow,
+                            ..accent
+                        }
+                        .scale_alpha(glow),
+                    )),
+                    border: Border {
+                        color: Color {
+                            a: 0.55 * glow,
+                            ..accent
+                        },
+                        width: 1.0,
+                        radius: (scale.row * 0.26).into(),
+                    },
+                    shadow: Shadow {
+                        color: Color {
+                            a: 0.45 * glow,
+                            ..accent
+                        },
+                        offset: Vector::ZERO,
+                        blur_radius: 22.0 * glow,
+                    },
+                    ..Default::default()
+                });
+            mouse_area(row).on_press(Message::Pick(i)).into()
+        });
+        scrollable(column(rows).spacing(ROW_GAP).padding(LIST_PAD))
+            .id(TRACKS)
+            .on_scroll(Message::Scrolled)
+            .direction(Direction::Vertical(
+                Scrollbar::new().width(3).scroller_width(3).margin(2),
+            ))
+            .into()
+    }
 
-        stack![backdrop, shade, row![disc, panel]].into()
+    fn hints(&self, scale: Scale) -> Element<'_, Message> {
+        if scale.gap < 20.0 {
+            return space().into();
+        }
+        container(
+            text("↑↓ Choose    ✕ Play    L1 R1 Skip    Start Pause    ○ Stop")
+                .font(FONT)
+                .size(13)
+                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.4)),
+        )
+        .padding([0.0, LIST_PAD])
+        .into()
+    }
+
+    /// The smallest layout: the cover, what is playing (or would play), and
+    /// buttons for the mouse.
+    fn controls(&self, size: Size) -> Element<'_, Message> {
+        let accent = self.accent();
+        let now = self.playing.unwrap_or(self.focus);
+        let title = self.album.tracks.get(now).map_or("", |t| t.title.as_str());
+        let control = |glyph: &'static str, remote: Remote| {
+            button(text(glyph).font(FONT).size(15).center())
+                .width(40)
+                .height(40)
+                .on_press(Message::Remote(remote))
+                .style(move |_, status| button::Style {
+                    background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                        .then_some(Background::Color(Color { a: 0.3, ..accent })),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        radius: 20.0.into(),
+                        ..Border::default()
+                    },
+                    ..button::Style::default()
+                })
+        };
+        let playing = self.playing.is_some() && !self.paused;
+        let buttons = row![
+            control("❚◀", Remote::Previous),
+            control(if playing { "❚❚" } else { "▶" }, Remote::PlayPause),
+            control("▶❚", Remote::Next),
+        ]
+        .spacing(4);
+        let line = |text_size: f32| {
+            column![
+                text(title)
+                    .font(BOLD)
+                    .size(text_size)
+                    .wrapping(Wrapping::None)
+                    .color(Color::WHITE),
+                text(&self.album.artist)
+                    .font(FONT)
+                    .size(text_size - 2.0)
+                    .wrapping(Wrapping::None)
+                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.7)),
+            ]
+            .spacing(2)
+        };
+        // Side by side when wide; stacked and centred when narrow; and when
+        // there is no room for words, only the buttons.
+        let content: Element<'_, Message> = if size.width >= 300.0 {
+            let mut side = row![].spacing(12).align_y(Vertical::Center);
+            if size.width >= 360.0 {
+                side = side.push(self.cover(48.0));
+            }
+            side.push(container(line(15.0)).width(Fill).clip(true))
+                .push(buttons)
+                .into()
+        } else if size.height >= 150.0 {
+            let mut stacked = column![].spacing(10).align_x(iced::Center);
+            if size.height >= 230.0 {
+                stacked = stacked.push(self.cover(56.0));
+            }
+            stacked
+                .push(container(line(14.0).align_x(iced::Center)).clip(true))
+                .push(buttons)
+                .into()
+        } else {
+            buttons.into()
+        };
+        container(content).padding([8, 12]).center(Fill).into()
     }
 }
 
@@ -345,6 +634,8 @@ fn key(event: keyboard::Event) -> Option<Remote> {
     match key.as_ref() {
         Key::Named(Named::ArrowUp) => Some(Remote::Up),
         Key::Named(Named::ArrowDown) => Some(Remote::Down),
+        Key::Named(Named::ArrowLeft) => Some(Remote::Previous),
+        Key::Named(Named::ArrowRight) => Some(Remote::Next),
         Key::Named(Named::Enter) => Some(Remote::Select),
         Key::Named(Named::Space) => Some(Remote::PlayPause),
         Key::Named(Named::Backspace) => Some(Remote::Back),
@@ -383,4 +674,36 @@ fn main() -> iced::Result {
         .window_size((1280.0, 760.0))
         .antialiasing(true)
         .run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(w: f32, h: f32) -> Layout {
+        Layout::for_size(Size::new(w, h))
+    }
+
+    #[test]
+    fn landscape_windows_put_the_disc_beside() {
+        assert!(matches!(layout(1536.0, 950.0), Layout::Beside { disc } if disc > 800.0));
+        assert!(matches!(layout(1536.0, 420.0), Layout::Beside { disc } if disc == 420.0));
+        assert!(matches!(layout(760.0, 470.0), Layout::Beside { .. }));
+    }
+
+    #[test]
+    fn portrait_windows_put_the_disc_above() {
+        assert!(matches!(layout(760.0, 950.0), Layout::Above { .. }));
+        assert!(matches!(layout(500.0, 950.0), Layout::Above { .. }));
+        assert!(matches!(layout(400.0, 620.0), Layout::Above { .. }));
+    }
+
+    #[test]
+    fn small_windows_drop_the_disc_then_the_list() {
+        assert_eq!(layout(420.0, 300.0), Layout::List);
+        assert_eq!(layout(640.0, 460.0), Layout::List);
+        assert_eq!(layout(300.0, 500.0), Layout::List);
+        assert_eq!(layout(600.0, 160.0), Layout::Controls);
+        assert_eq!(layout(220.0, 500.0), Layout::Controls);
+    }
 }

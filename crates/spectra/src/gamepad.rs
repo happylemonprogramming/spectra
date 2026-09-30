@@ -31,6 +31,8 @@ pub fn subscription() -> Subscription<Remote> {
                             Button::South => Some(Remote::Select),
                             Button::East => Some(Remote::Back),
                             Button::Start => Some(Remote::PlayPause),
+                            Button::LeftTrigger => Some(Remote::Previous),
+                            Button::RightTrigger => Some(Remote::Next),
                             _ => None,
                         },
                         // A stick is a d-pad here: one step per lean, not a
