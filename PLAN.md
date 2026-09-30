@@ -14,7 +14,7 @@ can read.
 | --- | --- |
 | Repository | New repo. Code is pulled from Rainbow Player where it is relevant, and referenced otherwise |
 | Platform | Omarchy first (Arch + Hyprland). macOS kept possible, not built: see [Portability](#portability) |
-| Hardware | One USB optical drive on LG's MT1959 platform, so it can take OmniDrive later: an LG BU40N in a 9.5 mm USB-C enclosure, or an LG BP50NB40 (svc code NB50/NB52). See the [Redump OmniDrive page](https://wiki.redump.info/OmniDrive). Selling hardware is out of scope |
+| Hardware | Phases 0-2 and 4: any name-brand USB DVD drive (about $20). It reads every CD and DVD format Spectra plays except GameCube, Wii and Xbox. Phase 3 and Blu-ray need a drive on LG's MT1959 platform, which OmniDrive runs on - ideally a used internal LG Blu-ray drive in a USB enclosure, checked against the [Redump OmniDrive page](https://wiki.redump.info/OmniDrive). Selling hardware is out of scope |
 | Stack | Rust throughout. The UI is [iced](https://iced.rs) 0.14 on wgpu, with the disc as a wgpu shader. Chosen over Tauri by the UI weight spike (`docs/spikes.md`): a quarter of the memory of an empty WebKitGTK page, with the whole screen built |
 | License | GPL-3.0-or-later, the same as Rainbow Player, so its code can be reused |
 | Emulators | Hosted, not forked. Standalone programs or libretro cores do the emulation; Spectra identifies the disc, routes it, and supplies the UI |
@@ -72,8 +72,16 @@ How the design keeps to them:
   no interface) as a separate process, because disc menus are required and
   mpv does not do them. Only the pieces needed are installed - `vlc-cli` and
   the DVD, Blu-ray, ffmpeg, AC-3, PulseAudio and FreeType plugins: 4.3 MB to
-  download, 14.6 MB installed, against 169 MB for the full `vlc` package -
-  and only when the first DVD goes in.
+  download, 14.6 MB installed, against 169 MB for the full `vlc` package.
+  It runs through XWayland: VLC 3 cannot open a Wayland window on Hyprland,
+  and Omarchy runs XWayland anyway (spike 6).
+- **What installs with Spectra, and what on demand.** Spectra's package
+  depends on what DVDs need - those VLC pieces and `libdvdcss`, about 15 MB -
+  because a DVD is the likeliest first disc, and an install prompt then would
+  spoil the first impression. None of it is copied into Spectra: `libdvdcss`
+  is legally delicate to distribute, and system packages get security
+  fixes. The package also loads the `sg` module at boot, if spike 1 shows it
+  is needed.
 - **Emulators on demand.** The first PS2 disc offers to install PCSX2;
   nobody downloads Dolphin to play CDs.
 - **Old laptops.** Spectra itself, music, films and CD-era consoles should
@@ -168,6 +176,7 @@ crates/spectra/         the app: iced UI, the disc shader, motion, gamepads
 docs/spikes.md          Phase 0 questions and their answers
 scripts/check.sh        fmt, clippy, tests
 scripts/measure.sh      a release build against the budgets
+scripts/first-drive.sh  the first evening with a drive: spikes 1, 4 and 6
 ```
 
 Rust is pinned per-project by `mise.toml`.
@@ -176,10 +185,11 @@ Rust is pinned per-project by `mise.toml`.
 
 Answer the unknowns cheaply before building anything big.
 
-- [ ] Buy the drive and enclosure (no OmniDrive flash yet)
+- [ ] Buy a USB DVD drive (the OmniDrive-capable one waits for Phase 3)
 - [ ] Assemble the test disc set (see [Test discs](#test-discs))
-- [ ] `sudo pacman -S sg3_utils libdvdcss libaacs` and load the `sg` module
-      at boot (`/etc/modules-load.d/sg.conf`)
+- [x] `sudo pacman -S sg3_utils libdvdcss`, the trimmed VLC, and the `sg`
+      module loaded at boot (`/etc/modules-load.d/sg.conf`). `libaacs` waits
+      for a Blu-ray drive
 - [x] Scaffold the repo: Cargo workspace plus the app, and
       `scripts/check.sh` for the checks. Hook it up to CI once the repo has a
       host
@@ -188,8 +198,9 @@ Answer the unknowns cheaply before building anything big.
 - [ ] **Spike: PCSX2.** Does it boot a PS2 disc straight from `/dev/sr0`?
 - [ ] **Spike: RetroArch.** Do Beetle PSX and Genesis Plus GX boot a physical
       disc (`cdrom://` or `/dev/sr0`)?
-- [ ] **Spike: enclosure.** Does it attach as UAS or BOT, and does SG_IO
-      behave differently between the two?
+- [ ] **Spike: USB bridge.** Does the drive attach as UAS or BOT, which
+      USB bridge chip does it use, and does SG_IO behave differently between
+      the two modes?
 - [x] **Spike: UI weight.** Webview or native, decided before Phase 1 ports
       the UI. Answer: native. One finished screen in iced - the rainbow disc,
       a blurred cover backdrop, a gamepad-driven track list with an animated
@@ -200,10 +211,10 @@ Answer the unknowns cheaply before building anything big.
       disc images before the drive arrives. It also covers UDF (DVD and
       Blu-ray), cue sheets, MusicBrainz disc IDs, and PC Engine CD, Neo Geo
       CD, PS3, GameCube, Wii and Xbox detection
-- [ ] **Spike: VLC for video discs.** Does `cvlc` open a native Wayland
-      window with hardware decoding, how much memory and startup does it cost
-      next to mpv, and can DVD menus be driven from outside VLC? Needs no drive
-      until the menu part
+- [ ] **Spike: VLC for video discs.** Measured on test files: through
+      XWayland, lighter than mpv (133 ms and 78 MB against 1.1 s and 141 MB),
+      GPU decoding for Blu-ray's H.264. Left: can DVD menus be driven from
+      outside VLC? Needs the DVD
 - [ ] Run `spectra-discid` against every disc in the test set on the real
       drive
 
@@ -340,6 +351,6 @@ know the settings exist.
 | Risk | Mitigation |
 | --- | --- |
 | PCSX2 or RetroArch cannot boot a physical disc | `vdisc` (Phase 2) turns every drive into a file, so bring it forward |
-| The enclosure's USB bridge interferes with raw commands | Test in Phase 0. Known cases: INIC-3619 bridges block flashing; the Verbatim 43888's bridge truncates some transfer sizes over USB 3 (OmniDrive issue #85), so keep raw read sizes in its safe bands or use a USB 2 cable |
+| The drive's USB bridge interferes with raw commands | Test in Phase 0. Known cases: INIC-3619 bridges block flashing; the Verbatim 43888's bridge truncates some transfer sizes over USB 3 (OmniDrive issue #85), so keep raw read sizes in its safe bands or use a USB 2 cable |
 | A flash bricks the drive | Phase 3 only, preferably on a second drive |
 | Bus power is marginal for a slim BD drive | USB-C 10 Gbps port, a Y-cable, or a powered hub |

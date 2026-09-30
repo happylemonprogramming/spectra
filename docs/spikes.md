@@ -7,16 +7,20 @@ Record the answer in the table at the bottom, with the output that proves it.
 ## Setup, once
 
 ```bash
-sudo pacman -S sg3_utils libdvdcss libaacs
+sudo pacman -S sg3_utils libdvdcss               # libaacs too, for Blu-ray
 echo sg | sudo tee /etc/modules-load.d/sg.conf   # /dev/sg* at every boot
 sudo modprobe sg                                 # and now
 ```
 
-Plug the drive in, then check the kernel sees it:
+Plug the drive in and put a disc in, then run spikes 1, 4 and 6 in one go:
 
 ```bash
-cargo run -q -p spectra-discid -- --list
+scripts/first-drive.sh
 ```
+
+It saves everything it prints to `docs/drive-logs/`, which is the evidence for
+the Results table. The sections below say what each check means, and how to
+run it by hand.
 
 ## 1. SG_IO as a normal user
 
@@ -72,11 +76,11 @@ retroarch -L /usr/lib/libretro/<beetle psx core>.so cdrom://drive1.cue
 - If Load Disc is missing from the menu, this RetroArch build has no physical
   disc support; the fallback is Phase 2's virtual disc, brought forward.
 
-## 4. The enclosure: UAS or BOT
+## 4. The USB bridge: UAS or BOT
 
 ```bash
 lsusb -t                                       # Driver=uas or Driver=usb-storage
-lsusb                                          # note the enclosure's VID:PID
+lsusb                                          # note the drive's VID:PID
 lsusb -v -d VID:PID | grep -E 'bInterface(Class|SubClass|Protocol)'
 ```
 
@@ -90,6 +94,10 @@ echo VID:PID:u | sudo tee /sys/module/usb_storage/parameters/quirks
 
 (The quirk lasts until reboot.) Note the subclass too: Rainbow Player's
 WebUSB build only sees subclass 02, but SG_IO does not care.
+
+A one-piece USB drive has its bridge chip inside; the VID:PID names it (for
+example `152d` is JMicron, `13fd` Initio, `174c` ASMedia). Write it down:
+bridges are the usual cause when raw commands fail over USB.
 
 ## 5. UI weight: webview or native
 
@@ -154,23 +162,55 @@ sudo pacman -S --asdeps vlc-cli vlc-plugin-dvd vlc-plugin-bluray \
 ```
 
 That is 4.3 MB to download and 14.6 MB installed; the full `vlc` package is
-169 MB. Then, first with a DVD-format test file made by ffmpeg, later with a
-real disc:
+169 MB.
 
-- **Wayland.** Does `cvlc` open a native Wayland window (not XWayland:
-  `hyprctl clients` shows `xwayland: 0`) with GPU output and VA-API decoding?
-- **Weight.** Launch to first frame, memory (PSS) and CPU while playing, next
-  to `mpv` on the same file. Nothing of Spectra's is running meanwhile.
-- **Menus from outside.** Can another process move between menu buttons and
-  press them, over VLC's `rc` interface or D-Bus? The watcher will translate
-  gamepad presses into these while the UI is closed. Needs a DVD image, so
-  this part waits for the drive.
+### Measured without a disc
 
-- **Yes** if it plays natively on Wayland within a similar cost to mpv, and
-  menus can be driven from outside.
-- If it only runs through XWayland or without hardware decoding, try
-  `--vout` choices before deciding; the fallback is mpv for playback with
-  Spectra listing titles itself, and drawing menus on libdvdnav later.
+On test files made by ffmpeg: a DVD-format one (`-target ntsc-dvd`: MPEG-2,
+AC-3, DVD navigation packets) and a Blu-ray-like one (1080p H.264 at 25
+Mbit/s). Windowed, muted, 5 s of playback each.
+
+| | VLC 3.0.23 (`cvlc`) | mpv 0.41 |
+| --- | --- | --- |
+| Launch to window, DVD file | 133 ms | 1110 ms |
+| Memory (PSS), DVD file | 78 MB | 141 MB |
+| CPU, DVD file | 8% of one core | 11% |
+| Memory, 1080p H.264 | 102 MB | - |
+| CPU, 1080p H.264, GPU decoding | 4% | - |
+| CPU, 1080p H.264, forced software | 64% | - |
+| Window | XWayland | native Wayland |
+
+- **VLC 3 cannot open a Wayland window on Hyprland.** Its Wayland window
+  module only knows the two pre-standard shell protocols (`xdg_shell` v5,
+  `zxdg_shell_v6`), and Hyprland offers only the finished `xdg_wm_base`. With
+  `DISPLAY` unset to force Wayland, it never shows a window and spins at 57%
+  of a core. So Spectra launches it with `DISPLAY` set, through XWayland.
+- **XWayland costs nothing extra here.** Omarchy runs it from login (43 MB,
+  already paid), and `xwayland:force_zero_scaling` is on, so video gets the
+  panel's real pixels despite the 1.25x scale.
+- **GPU decoding works through XWayland** (VA-API, then `gl` output). This
+  Radeon 860M has no MPEG-2 decoder, so DVDs decode on the CPU - cheaply, at
+  8% of a core. Blu-ray's H.264 is on the GPU.
+- **Lighter than mpv**, in both startup and memory. mpv's Vulkan renderer is
+  its cost.
+- **Remote control works** over a socket:
+  `cvlc -I oldrc --rc-fake-tty --rc-unix SOCKET` (without `--rc-fake-tty` the
+  module refuses to start unless it has a terminal). It answers `title`,
+  `chapter`, `get_title` and `quit`, and has `key` for simulated key presses;
+  the menu actions are `nav-up`, `nav-down`, `nav-left`, `nav-right`,
+  `nav-activate` (`src/misc/actions.c`). Whether `key nav-down` moves a DVD
+  menu's highlight needs a DVD.
+- VLC 4 (its `master`) has a current Wayland backend, but is not released or
+  packaged; revisit when Arch ships it.
+
+### Still needs the DVD
+
+`scripts/first-drive.sh` plays the disc with `dvd:///dev/sr0`, sends the menu
+keys, and asks whether the highlight moved.
+
+- **Yes** if the menu can be driven from outside.
+- If `key nav-*` does nothing, try `key key-nav-*` (VLC 3's older action
+  names), then D-Bus. The fallback is Spectra listing titles itself.
 
 ## Results
 
@@ -179,11 +219,11 @@ real disc:
 | 1. SG_IO as a normal user | pending | |
 | 2. PCSX2 off the drive | pending | |
 | 3. RetroArch off the drive | pending | |
-| 4. Enclosure mode | pending | |
+| 4. USB bridge | pending | |
 | 5. UI weight | **Native: iced + wgpu** | Section 5 above: 25 MB vs ~220 MB, all budgets met |
-| 6. VLC for video discs | pending | |
+| 6. VLC for video discs | **Yes so far: through XWayland** | Section 6: lighter than mpv, GPU decoding works; menus wait for a DVD |
 
-Drive: model, firmware and enclosure, as `spectra-discid --list` and `lsusb`
+Drive: model, firmware and USB bridge, as `spectra-discid --list` and `lsusb`
 report them:
 
 ```
