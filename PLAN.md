@@ -294,6 +294,16 @@ playing.
       GPL-3; everything else stays a separate process
 - [ ] AUR package and an Omarchy install script
 
+**Ideas, not yet planned:** an in-game overlay, after the ModRetro
+Chromatic's (`components/osd/` in
+[oss-chromatic-console-mcu](https://github.com/ModRetro/oss-chromatic-console-mcu),
+GPL-3): a hotkey opens a small menu over the game for brightness, colour
+correction and leaving the game. Alongside it, per-system defaults for how
+old games expect to look - colour correction for games tuned to washed-out
+LCDs, frame blending for sprites that flicker on purpose to look
+transparent, a CRT shader for console games - on without anyone having to
+know the settings exist.
+
 ## Out of scope
 
 | What | Why |
