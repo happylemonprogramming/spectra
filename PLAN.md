@@ -68,8 +68,12 @@ How the design keeps to them:
   blurred on the CPU at load and stretched by the texture filter.
 - **Dependencies built for size.** iced, wgpu and naga are compiled at
   `opt-level = "s"`, Spectra's own code at 3, and panics abort.
-- **Hardware video decoding.** DVD and Blu-ray go through mpv with VA-API,
-  which costs almost no CPU.
+- **Video discs in a trimmed VLC.** DVD and Blu-ray go to `cvlc` (VLC with
+  no interface) as a separate process, because disc menus are required and
+  mpv does not do them. Only the pieces needed are installed - `vlc-cli` and
+  the DVD, Blu-ray, ffmpeg, AC-3, PulseAudio and FreeType plugins: 4.3 MB to
+  download, 14.6 MB installed, against 169 MB for the full `vlc` package -
+  and only when the first DVD goes in.
 - **Emulators on demand.** The first PS2 disc offers to install PCSX2;
   nobody downloads Dolphin to play CDs.
 - **Old laptops.** Spectra itself, music, films and CD-era consoles should
@@ -90,9 +94,9 @@ How the design keeps to them:
 │   vdisc     FUSE image backed by drive + block cache (Phase 2)    │
 │   watcher   media-change events → bring app forward               │
 └──────┬───────────────────────┬────────────────────────┬───────────┘
-       │ separate process       │ separate process        │ library
-   pcsx2, retroarch -L …,   xemu (GPL-2: always kept  libmpv (DVD/BD),
-   dolphin-emu, dosbox,     out of process), wine     libcdio
+       │ separate process       │ separate process        │ separate process
+   pcsx2, retroarch -L …,   xemu (GPL-2: always kept  cvlc (DVD/BD, with
+   dolphin-emu, dosbox,     out of process), wine     menus)
    scummvm, openblack
 ```
 
@@ -101,7 +105,7 @@ How the design keeps to them:
 Omarchy is the target; macOS should stay a port rather than a rewrite. Three
 rules keep it that way:
 
-1. **Heavy things are separate programs.** Video in mpv, games in their
+1. **Heavy things are separate programs.** Video in VLC, games in their
    emulators, all of which exist on macOS. Spectra is the menu and launcher.
 2. **Platform code lives in two places.** The drive backend (SG_IO here,
    IOKit's SCSITaskDeviceInterface on macOS) behind the `Disc` trait, and a
@@ -138,7 +142,22 @@ Credit it in anything that is ported.
 | `src/hooks/useCdAudio.ts`, `src/lib/cd/drive.ts` (audio path) | Port: READ CD into `cpal` instead of Web Audio |
 | `src/lib/input/remote.ts`, `hooks/useRemote.ts` | Ported in spirit: `Remote` in the UI, pads through `gilrs` |
 | `electron/usb/virtual/*`, `src/lib/cd/virtualDrive.test.ts` | Design basis for the fake drive used in tests |
-| `electron/`, `src/lib/cd/usb.ts`, `src/lib/dvd/*` decoders, `emulators/play/` | Do not port. Native access, libmpv and native emulators replace them |
+| `electron/`, `src/lib/cd/usb.ts`, `src/lib/dvd/*` decoders, `emulators/play/` | Do not port. Native access, VLC and native emulators replace them |
+
+## VLC
+
+Run as a program, not linked. Its source is also a reference, shallow-cloned
+from `https://github.com/videolan/vlc.git` at commit `15b71e3` into
+`~/Projects/vlc`. The files below are LGPL-2.1-or-later, so they can be
+ported into Spectra with credit.
+
+| VLC | Use in Spectra |
+| --- | --- |
+| `modules/access/dvdnav.c`, `bluray.c` | How menus, button highlights and titles are driven, if Spectra ever draws disc menus itself |
+| `modules/access/cdda.c`, `vcd/cdrom.c` | CD-Text, for track names without a network |
+| `modules/codec/cdg.c` | CD+G karaoke graphics (Phase 2) |
+| `modules/codec/svcdsub.c`, `cvdsub.c` | SVCD and CVD subtitles (Phase 2) |
+| `modules/services_discovery/udev.c` | Noticing a disc going in, for the watcher |
 
 ## Layout
 
@@ -181,6 +200,10 @@ Answer the unknowns cheaply before building anything big.
       disc images before the drive arrives. It also covers UDF (DVD and
       Blu-ray), cue sheets, MusicBrainz disc IDs, and PC Engine CD, Neo Geo
       CD, PS3, GameCube, Wii and Xbox detection
+- [ ] **Spike: VLC for video discs.** Does `cvlc` open a native Wayland
+      window with hardware decoding, how much memory and startup does it cost
+      next to mpv, and can DVD menus be driven from outside VLC? Needs no drive
+      until the menu part
 - [ ] Run `spectra-discid` against every disc in the test set on the real
       drive
 
@@ -197,7 +220,9 @@ Get the core experience working for the most common discs.
       shown
 - [ ] Audio CD: Rainbow Player's audio path (MusicBrainz, the 3D disc,
       streaming PCM)
-- [ ] DVD-Video and Blu-ray through libmpv (or an `mpv` process to start with)
+- [ ] DVD-Video and Blu-ray through `cvlc`, with their menus, driven by the
+      gamepad (the watcher translates pad presses into VLC commands while the
+      UI is closed)
 - [ ] PS2 through PCSX2 as a separate process. Fall back to the libretro Play!
       core when there is no BIOS
 - [ ] PS1 through `retroarch -L beetle_psx_hw`

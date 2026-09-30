@@ -1,7 +1,7 @@
 # Phase 0 spikes
 
-Five questions to answer before building anything big. The first four need
-the drive; the fifth does not.
+Six questions to answer before building anything big. The first four need
+the drive; the fifth does not, and the sixth only needs it at the end.
 Record the answer in the table at the bottom, with the output that proves it.
 
 ## Setup, once
@@ -142,6 +142,36 @@ Left for Phase 1: bloom on the rainbow, per-frame CPU while spinning (the
 whole view is laid out every frame; caching the static parts should cut it),
 and a bundled font instead of relying on Adwaita Sans being installed.
 
+## 6. VLC for video discs
+
+DVD menus are required, and mpv does not do them (its manual: "DVD menus are
+not supported"), so DVD and Blu-ray go to VLC without its interface
+(`cvlc`), run as a separate process. Install only what a disc needs:
+
+```bash
+sudo pacman -S --asdeps vlc-cli vlc-plugin-dvd vlc-plugin-bluray \
+  vlc-plugin-ffmpeg vlc-plugin-a52dec vlc-plugin-pulse vlc-plugin-freetype
+```
+
+That is 4.3 MB to download and 14.6 MB installed; the full `vlc` package is
+169 MB. Then, first with a DVD-format test file made by ffmpeg, later with a
+real disc:
+
+- **Wayland.** Does `cvlc` open a native Wayland window (not XWayland:
+  `hyprctl clients` shows `xwayland: 0`) with GPU output and VA-API decoding?
+- **Weight.** Launch to first frame, memory (PSS) and CPU while playing, next
+  to `mpv` on the same file. Nothing of Spectra's is running meanwhile.
+- **Menus from outside.** Can another process move between menu buttons and
+  press them, over VLC's `rc` interface or D-Bus? The watcher will translate
+  gamepad presses into these while the UI is closed. Needs a DVD image, so
+  this part waits for the drive.
+
+- **Yes** if it plays natively on Wayland within a similar cost to mpv, and
+  menus can be driven from outside.
+- If it only runs through XWayland or without hardware decoding, try
+  `--vout` choices before deciding; the fallback is mpv for playback with
+  Spectra listing titles itself, and drawing menus on libdvdnav later.
+
 ## Results
 
 | Spike | Answer | Evidence |
@@ -151,6 +181,7 @@ and a bundled font instead of relying on Adwaita Sans being installed.
 | 3. RetroArch off the drive | pending | |
 | 4. Enclosure mode | pending | |
 | 5. UI weight | **Native: iced + wgpu** | Section 5 above: 25 MB vs ~220 MB, all budgets met |
+| 6. VLC for video discs | pending | |
 
 Drive: model, firmware and enclosure, as `spectra-discid --list` and `lsusb`
 report them:
