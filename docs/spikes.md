@@ -1,6 +1,7 @@
 # Phase 0 spikes
 
-Four questions to answer before building anything big. Each needs the drive.
+Five questions to answer before building anything big. The first four need
+the drive; the fifth does not.
 Record the answer in the table at the bottom, with the output that proves it.
 
 ## Setup, once
@@ -90,6 +91,31 @@ echo VID:PID:u | sudo tee /sys/module/usb_storage/parameters/quirks
 (The quirk lasts until reboot.) Note the subclass too: Rainbow Player's
 WebUSB build only sees subclass 02, but SG_IO does not care.
 
+## 5. UI weight: webview or native
+
+Needs no drive. The Phase 0 shell already costs about 220 MB with a nearly
+empty page, almost all of it WebKitGTK, against a menu budget of 150 MB (see
+PLAN.md, Budgets). The question is what the real UI costs, and whether a native
+window beats it by enough to be worth giving up the direct port of Rainbow
+Player's React and three.js code.
+
+Build the same thing twice: the disc turning, with the rainbow read side
+(`discScene.ts`'s grating shader) and a cover texture.
+
+1. In the Tauri app, using Rainbow Player's `discScene.ts` and `discArt.ts`.
+2. In a native Rust window with wgpu, with the shader ported to WGSL.
+
+For each, from a release build, record:
+
+- time to window (`/tmp/opencode/measure.sh`-style: launch, poll `hyprctl
+  clients` for the pid)
+- total PSS across all processes, with the disc turning and when stopped
+- CPU and GPU while turning and while stopped (`radeontop` or
+  `/sys/class/drm/card*/device/gpu_busy_percent`)
+
+Go native if the webview version misses the 150 MB budget by more than
+tuning can recover. Keep Tauri if it stays within it.
+
 ## Results
 
 | Spike | Answer | Evidence |
@@ -98,6 +124,7 @@ WebUSB build only sees subclass 02, but SG_IO does not care.
 | 2. PCSX2 off the drive | pending | |
 | 3. RetroArch off the drive | pending | |
 | 4. Enclosure mode | pending | |
+| 5. UI weight | pending | |
 
 Drive: model, firmware and enclosure, as `spectra-discid --list` and `lsusb`
 report them:

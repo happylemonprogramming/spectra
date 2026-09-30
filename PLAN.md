@@ -30,6 +30,43 @@ can read.
    Spectra decides whether that image is backed by the drive, a cache or a dump.
 5. **Nothing legally doubtful ships.** No BIOS files, keys or cracks. CSS and
    AACS come from the system's `libdvdcss` and `libaacs`.
+6. **Lean, in the Omarchy spirit.** Fast to open, nothing running when
+   nothing is happening, small to install, and fine on an old laptop. Spectra
+   should never be what makes a machine slow: when a game runs, the emulator
+   gets the machine. The budgets below are checked, not hoped for.
+
+## Budgets
+
+Measured on a ThinkPad P14s Gen 6 (Ryzen AI 7 PRO 350). "Now" is the Phase 0
+shell, a nearly empty page, as a release build.
+
+| What | Budget | Now |
+| --- | --- | --- |
+| Binary size (UI, core and PS2 title table included) | < 10 MB | 6.4 MB |
+| Launch to window on screen | < 500 ms | ~300 ms |
+| CPU while idle | 0% | 0% |
+| Memory with the menu open (all processes) | < 150 MB | ~220 MB (WebKitGTK) |
+| Spectra's memory while a game runs | < 20 MB | not built yet |
+| GPU while the menu sits idle | 0% (no animation loop running when nothing moves) | not built yet |
+| Emulators bundled | none: installed when a disc first needs them | none |
+
+How the design keeps to them:
+
+- **Nothing resident but a watcher.** A small Rust process (no webview)
+  waits for media-change events; the UI starts when a disc goes in.
+- **The UI steps aside for games.** While an emulator runs, the webview is
+  torn down, so Spectra shrinks to the watcher and the disc cache.
+- **The 3D disc is optional and on demand.** It renders only while it
+  moves, caps its frame rate, and falls back to a still image on weak GPUs or
+  with reduced motion.
+- **Hardware video decoding.** DVD and Blu-ray go through mpv with VA-API,
+  which costs almost no CPU.
+- **Emulators on demand.** The first PS2 disc offers to install PCSX2;
+  nobody downloads Dolphin to play CDs.
+- **Old laptops.** Spectra itself, music, films and CD-era consoles should
+  run on roughly a 2012-era laptop. PS2, GameCube and Wii need a stronger CPU,
+  and original Xbox a modern one; that is the emulators' floor, and Spectra
+  says so when a disc is inserted rather than stuttering.
 
 ## Architecture
 
@@ -103,6 +140,12 @@ Answer the unknowns cheaply before building anything big.
       disc (`cdrom://` or `/dev/sr0`)?
 - [ ] **Spike: enclosure.** Does it attach as UAS or BOT, and does SG_IO
       behave differently between the two?
+- [ ] **Spike: UI weight.** The spinning rainbow disc, twice: Rainbow
+      Player's three.js scene in the Tauri webview, and the same shader in a
+      native Rust window (wgpu). Measure memory, GPU and startup for each.
+      If the webview cannot get under the menu memory budget, the UI goes
+      native before Phase 1 ports it, so the port is only done once. Needs no
+      drive
 - [x] Build `spectra-discid`, a command-line tool that prints the media type
       and identity. Port `identify.ts` and `iso9660.ts`, and test it against
       disc images before the drive arrives. It also covers UDF (DVD and
