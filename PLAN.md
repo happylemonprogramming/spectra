@@ -73,6 +73,18 @@ Credit it in anything that is ported.
 | `electron/usb/virtual/*`, `src/lib/cd/virtualDrive.test.ts` | Design basis for the fake drive used in tests |
 | `electron/`, `src/lib/cd/usb.ts`, `src/lib/dvd/*` decoders, `emulators/play/` | Do not port. Native access, libmpv and native emulators replace them |
 
+## Layout
+
+```
+crates/spectra-core/    reading and identifying discs (drive over SG_IO, or images)
+crates/spectra-discid/  command line: what disc is this?
+app/                    the Tauri shell: React UI in app/src, Rust in app/src-tauri
+docs/spikes.md          Phase 0 questions that need the drive, and their answers
+scripts/check.sh        fmt, clippy, tests, frontend build
+```
+
+Rust is pinned per-project by `mise.toml`.
+
 ## Phase 0: groundwork
 
 Answer the unknowns cheaply before building anything big.
@@ -81,8 +93,9 @@ Answer the unknowns cheaply before building anything big.
 - [ ] Assemble the test disc set (see [Test discs](#test-discs))
 - [ ] `sudo pacman -S sg3_utils libdvdcss libaacs` and load the `sg` module
       at boot (`/etc/modules-load.d/sg.conf`)
-- [ ] Scaffold the repo: Cargo workspace plus the Tauri app, CI with
-      `cargo test` and the frontend checks
+- [x] Scaffold the repo: Cargo workspace plus the Tauri app, and
+      `scripts/check.sh` for the checks. Hook it up to CI once the repo has a
+      host
 - [ ] **Spike: SG_IO.** Can Rust send INQUIRY, READ TOC and READ(12) to
       `/dev/sg*` as a normal user, relying only on systemd's `uaccess`?
 - [ ] **Spike: PCSX2.** Does it boot a PS2 disc straight from `/dev/sr0`?
@@ -90,9 +103,13 @@ Answer the unknowns cheaply before building anything big.
       disc (`cdrom://` or `/dev/sr0`)?
 - [ ] **Spike: enclosure.** Does it attach as UAS or BOT, and does SG_IO
       behave differently between the two?
-- [ ] Build `spectra-discid`, a command-line tool that prints the media type
+- [x] Build `spectra-discid`, a command-line tool that prints the media type
       and identity. Port `identify.ts` and `iso9660.ts`, and test it against
-      disc images before the drive arrives
+      disc images before the drive arrives. It also covers UDF (DVD and
+      Blu-ray), cue sheets, MusicBrainz disc IDs, and PC Engine CD, Neo Geo
+      CD, PS3, GameCube, Wii and Xbox detection
+- [ ] Run `spectra-discid` against every disc in the test set on the real
+      drive
 
 **Done when:** `spectra-discid` identifies every disc in the test set, and
 every spike has a written yes or no answer in `docs/spikes.md`.
