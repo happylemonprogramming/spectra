@@ -1,7 +1,7 @@
 //! What is on screen: an album, its tracks and its cover.
 //!
 //! Until Phase 1 wires the drive and MusicBrainz in, an album comes from a
-//! small JSON file, or is a built-in placeholder with a generated cover:
+//! small JSON file; with none, the screen waits for a disc:
 //!
 //! ```json
 //! { "title": "…", "artist": "…", "year": 1997, "cover": "cover.jpg",
@@ -62,28 +62,13 @@ impl Album {
         })
     }
 
-    pub fn placeholder() -> Self {
-        let tracks = [
-            ("Pit and Land", 214),
-            ("Track Pitch", 187),
-            ("First Order", 243),
-            ("Lead-in", 96),
-            ("Grating Equation", 312),
-            ("Red Book", 201),
-            ("Subchannel Q", 176),
-            ("Lead-out", 258),
-        ];
+    /// Nothing to play yet: a blank disc, and an invitation.
+    pub fn no_disc() -> Self {
         Self {
-            title: "Spectra".into(),
-            artist: "No disc".into(),
+            title: "Insert a disc".into(),
+            artist: "Music, films and games".into(),
             year: None,
-            tracks: tracks
-                .into_iter()
-                .map(|(t, s)| Track {
-                    title: t.into(),
-                    seconds: s,
-                })
-                .collect(),
+            tracks: Vec::new(),
             cover: placeholder_cover(),
         }
     }

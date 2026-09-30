@@ -174,9 +174,11 @@ crates/spectra-core/    reading and identifying discs (drive over SG_IO, or imag
 crates/spectra-discid/  command line: what disc is this?
 crates/spectra/         the app: iced UI, the disc shader, motion, gamepads
 docs/spikes.md          Phase 0 questions and their answers
+packaging/              the desktop entry and icon
 scripts/check.sh        fmt, clippy, tests
 scripts/measure.sh      a release build against the budgets
 scripts/first-drive.sh  the first evening with a drive: spikes 1, 4 and 6
+scripts/install.sh      install for this user under ~/.local, so the launcher finds it
 ```
 
 Rust is pinned per-project by `mise.toml`.

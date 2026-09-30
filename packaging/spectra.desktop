@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Spectra
+GenericName=Disc Player
+Comment=Put a disc in, and it plays: music, films and games
+Exec=spectra %f
+Icon=spectra
+Terminal=false
+Categories=AudioVideo;Player;
+Keywords=cd;dvd;disc;music;film;playstation;emulator;
+StartupWMClass=spectra

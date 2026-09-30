@@ -191,7 +191,7 @@ impl Spectra {
                 eprintln!("spectra: {e}");
                 std::process::exit(1)
             }),
-            None => Album::placeholder(),
+            None => Album::no_disc(),
         };
         let art = Art::new(&album.cover);
         let mut glow = vec![0.0; album.tracks.len()];
@@ -437,15 +437,17 @@ impl Spectra {
 
     fn header(&self, scale: Scale) -> Element<'_, Message> {
         let album = &self.album;
-        let details = [
-            album.year.map(|y| y.to_string()),
-            Some(format!("{} tracks", album.tracks.len())),
-            Some(format!("{} min", album.total_seconds().div_ceil(60))),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("  ·  ");
+        let details = (!album.tracks.is_empty()).then(|| {
+            [
+                album.year.map(|y| y.to_string()),
+                Some(format!("{} tracks", album.tracks.len())),
+                Some(format!("{} min", album.total_seconds().div_ceil(60))),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("  ·  ")
+        });
         container(
             column![
                 text(&album.title)
@@ -456,11 +458,13 @@ impl Spectra {
                     .font(FONT)
                     .size(scale.artist)
                     .color(Color::from_rgba(1.0, 1.0, 1.0, 0.78)),
+            ]
+            .push(details.map(|details| {
                 text(details)
                     .font(FONT)
                     .size(scale.detail)
-                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5)),
-            ]
+                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5))
+            }))
             .spacing(scale.gap / 4.0),
         )
         .padding([0.0, LIST_PAD])
@@ -544,7 +548,7 @@ impl Spectra {
     }
 
     fn hints(&self, scale: Scale) -> Element<'_, Message> {
-        if scale.gap < 20.0 {
+        if scale.gap < 20.0 || self.album.tracks.is_empty() {
             return space().into();
         }
         container(
@@ -562,7 +566,11 @@ impl Spectra {
     fn controls(&self, size: Size) -> Element<'_, Message> {
         let accent = self.accent();
         let now = self.playing.unwrap_or(self.focus);
-        let title = self.album.tracks.get(now).map_or("", |t| t.title.as_str());
+        let title = self
+            .album
+            .tracks
+            .get(now)
+            .map_or(self.album.title.as_str(), |t| t.title.as_str());
         let control = |glyph: &'static str, remote: Remote| {
             button(text(glyph).font(FONT).size(15).center())
                 .width(40)
@@ -671,7 +679,17 @@ fn main() -> iced::Result {
         .subscription(Spectra::subscription)
         .theme(|_: &Spectra| Theme::Dark)
         .default_font(FONT)
-        .window_size((1280.0, 760.0))
+        .window(window::Settings {
+            size: Size::new(1280.0, 760.0),
+            // Matches the desktop entry's name, so launchers and window rules
+            // know the window is Spectra's.
+            #[cfg(target_os = "linux")]
+            platform_specific: window::settings::PlatformSpecific {
+                application_id: "spectra".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
         .antialiasing(true)
         .run()
 }
