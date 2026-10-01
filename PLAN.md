@@ -317,6 +317,52 @@ LCDs, frame blending for sprites that flicker on purpose to look
 transparent, a CRT shader for console games - on without anyone having to
 know the settings exist.
 
+## On the TV
+
+Spectra should play on the living room TV without a cable, from a computer
+anywhere in the home. Nothing in Spectra draws for the TV: both paths below
+send whatever is on screen, so the menu, `cvlc` and every emulator come along
+for free.
+
+| Path | What the TV needs | Good for |
+| --- | --- | --- |
+| Sunshine + Moonlight | The Moonlight app (Apple TV, Google TV, Android TV) | Everything, games included: low latency, and a controller paired to the TV drives Spectra through the existing gamepad remote |
+| Normal casting: Google Cast, then Miracast | Nothing, it is built in | Music and films. Games feel laggy, from the encode and buffering |
+
+AirPlay is the gap: there is no mature open-source AirPlay mirroring sender
+on Linux, so an Apple TV without Moonlight cannot be reached.
+
+- [ ] Detect `sunshine` and offer Omarchy's `omarchy-install-service-sunshine`
+      when it is missing; never install it unasked
+- [ ] "Play on TV": create a 1920×1080 headless output
+      (`hyprctl output create headless`), move Spectra and the engine it
+      launches there, and stream or cast that output. A straight mirror of a
+      16:10 laptop letterboxes on a 16:9 TV
+- [ ] Without Sunshine, cast the output through the screencast portal
+      (`gnome-network-displays`, Google Cast first, then Miracast)
+- [ ] Measure input-to-photon latency on both paths with a PS2 game, and
+      record it in `docs/spikes.md`
+- [ ] While streaming, keep the machine awake: hold a systemd inhibitor so
+      the computer does not suspend mid-film
+
+## Later: macOS and Windows
+
+Shelved, not ruled out: Omarchy comes first, and the
+[Portability](#portability) rules keep both a port rather than a rewrite.
+
+- [ ] A one-line install, the way agentic tools ship:
+      `curl -fsSL …/install.sh | sh` on macOS and Linux,
+      `irm …/install.ps1 | iex` on Windows. cargo-dist builds the binaries in
+      CI and writes both scripts; start it on Linux once the repo has CI
+- [ ] Drive backends behind the `Disc` trait: IOKit's
+      SCSITaskDeviceInterface on macOS (unmount through DiskArbitration
+      first), SPTI on Windows. Repeat the USB bridge spike on each
+- [ ] Media-change events: DiskArbitration, and `WM_DEVICECHANGE`
+- [ ] Engines from each platform's package manager: Homebrew on macOS,
+      winget on Windows. VLC there bundles `libdvdcss`
+- [ ] Signing: Apple's notarization for a `.app` ($99 a year), and a code
+      signing certificate so SmartScreen does not warn on Windows
+
 ## Out of scope
 
 | What | Why |
@@ -325,7 +371,7 @@ know the settings exist.
 | Xbox 360 | Xenia on Linux is not ready |
 | Dreamcast | Needs a second, specific old drive (GD-ROM) |
 | Online-activation DRM | The servers are often gone |
-| Other Linux distributions, macOS, Windows | Omarchy first |
+| Other Linux distributions | Omarchy first |
 
 ## Throughout
 
