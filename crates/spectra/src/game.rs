@@ -6,6 +6,9 @@
 //! then where Arch's packages do. A core that needs no BIOS comes first, so a
 //! disc plays without anything else to set up.
 //!
+//! Not every core reads through RetroArch's drive: Play!, for the PS2, opens
+//! its files itself, so it plays a kept copy rather than the disc.
+//!
 //! The user's own RetroArch settings are left as they are. What Spectra needs
 //! goes in a file of its own, passed with `--appendconfig`.
 
@@ -17,13 +20,18 @@ use spectra_core::GameSystem;
 pub struct Emulator {
     program: PathBuf,
     core: PathBuf,
+    /// Plays from the drive, not only from a copy.
+    pub reads_drive: bool,
 }
 
-/// The cores that play a system, best first.
-fn cores(system: GameSystem) -> &'static [&'static str] {
+/// The cores that play a system, best first, and whether each reads the
+/// drive.
+fn cores(system: GameSystem) -> &'static [(&'static str, bool)] {
     match system {
         // PCSX-ReARMed has a BIOS of its own; Beetle PSX needs Sony's.
-        GameSystem::Ps1 => &["pcsx_rearmed_libretro.so"],
+        GameSystem::Ps1 => &[("pcsx_rearmed_libretro.so", true)],
+        // Play! too; PCSX2 needs Sony's.
+        GameSystem::Ps2 => &[("play_libretro.so", false)],
         _ => &[],
     }
 }
@@ -49,11 +57,15 @@ fn on_path(program: &str) -> Option<PathBuf> {
 pub fn find(system: GameSystem) -> Option<Emulator> {
     let program = on_path("retroarch")?;
     let dirs = core_dirs();
-    let core = cores(system)
+    let (core, reads_drive) = cores(system)
         .iter()
-        .flat_map(|name| dirs.iter().map(move |dir| dir.join(name)))
-        .find(|path| path.is_file())?;
-    Some(Emulator { program, core })
+        .flat_map(|&(name, reads)| dirs.iter().map(move |dir| (dir.join(name), reads)))
+        .find(|(path, _)| path.is_file())?;
+    Some(Emulator {
+        program,
+        core,
+        reads_drive,
+    })
 }
 
 /// What RetroArch calls a drive: `/dev/sg0` is `cdrom://drive0.cue`. Only

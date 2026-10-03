@@ -436,7 +436,12 @@ impl Spectra {
                 }
                 self.launch = self.disc_launch();
                 let music = self.disc.as_ref().is_some_and(|d| d.game.is_none());
-                if self.launch.is_some() || music {
+                let emulator = self
+                    .disc
+                    .as_ref()
+                    .and_then(|d| d.game.as_ref())
+                    .is_some_and(|g| game::find(g.system).is_some());
+                if self.launch.is_some() || music || emulator {
                     album.note = Some(self.ready_note());
                 }
                 self.show(album);
@@ -662,7 +667,12 @@ impl Spectra {
         let kept = library::id(&disc.report)
             .and_then(|id| library::find(&id))
             .map(|entry| entry.cue().to_string_lossy().into_owned());
-        let content = kept.or_else(|| game::cdrom_uri(&disc.drive))?;
+        let content = kept.or_else(|| {
+            emulator
+                .reads_drive
+                .then(|| game::cdrom_uri(&disc.drive))
+                .flatten()
+        })?;
         Some(Launch { emulator, content })
     }
 
@@ -674,8 +684,14 @@ impl Spectra {
         let Some(disc) = &self.disc else {
             return String::new();
         };
-        if disc.game.is_some() && self.launch.is_none() {
-            return "No emulator for this console is installed".into();
+        if let Some(game) = &disc.game
+            && self.launch.is_none()
+        {
+            // An emulator that only plays copies.
+            return match (game::find(game.system), library::id(&disc.report)) {
+                (Some(_), Some(_)) => "△ or C to keep a copy, then play it from the copy".into(),
+                _ => "No emulator for this console is installed".into(),
+            };
         }
         match library::id(&disc.report) {
             Some(id) if library::find(&id).is_some() => {
