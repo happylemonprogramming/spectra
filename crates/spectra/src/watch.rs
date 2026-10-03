@@ -6,6 +6,7 @@
 //! and one that never spins the disc up. Only a change is read further, and
 //! only a change is reported, so an idle drive costs next to nothing.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use iced::Subscription;
@@ -23,7 +24,12 @@ pub enum DriveState {
     Empty,
     /// A disc went in, and is spinning up or being read.
     Reading,
-    Disc(Box<Report>),
+    Disc {
+        report: Box<Report>,
+        /// The node it was read through: `/dev/sgN`, or `/dev/srN` without
+        /// the sg module.
+        drive: PathBuf,
+    },
     /// A disc is in, but reading it failed.
     Unreadable(String),
 }
@@ -43,7 +49,8 @@ pub fn subscription() -> Subscription<DriveState> {
             std::thread::spawn(move || {
                 let mut drive: Option<Drive> = None;
                 let mut last: Option<Seen> = None;
-                loop {
+                // Until the window that wanted this is gone.
+                while !tx.is_closed() {
                     if drive.is_none() {
                         drive = Drive::open_first().ok();
                     }
@@ -116,7 +123,10 @@ fn read(drive: &mut Drive) -> DriveState {
         .wait_until_ready(SPIN_UP)
         .and_then(|()| identify(drive));
     match result {
-        Ok(report) => DriveState::Disc(Box::new(report)),
+        Ok(report) => DriveState::Disc {
+            report: Box::new(report),
+            drive: drive.path().to_path_buf(),
+        },
         // Taken out again while it was being read.
         Err(e) if e.medium_not_present() => DriveState::Empty,
         Err(e) => DriveState::Unreadable(e.to_string()),

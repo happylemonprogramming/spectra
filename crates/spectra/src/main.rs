@@ -9,6 +9,7 @@
 mod album;
 mod art;
 mod disc;
+mod game;
 mod gamepad;
 mod motion;
 mod watch;
@@ -34,6 +35,7 @@ use iced::{
 use album::Album;
 use art::Art;
 use motion::Motion;
+use spectra_core::DiscKind;
 use watch::DriveState;
 
 const FONT: Font = Font::with_name("Adwaita Sans");
@@ -71,6 +73,8 @@ enum Message {
     Scrolled(Viewport),
     Frame(Instant),
     Drive(DriveState),
+    /// The emulator closed: how it went, in words, if badly.
+    GameOver(Option<String>),
 }
 
 /// How the screen is arranged, from the most room to the least.
@@ -163,6 +167,15 @@ struct Spectra {
     last_frame: Option<Instant>,
     /// Showing the drive's disc, rather than an album file.
     watching: bool,
+    /// The game on the disc, with an emulator ready to play it.
+    launch: Option<Launch>,
+    /// A game is running, and has the gamepad.
+    in_game: bool,
+}
+
+struct Launch {
+    emulator: game::Emulator,
+    uri: String,
 }
 
 struct Options {
@@ -208,6 +221,8 @@ impl Spectra {
             list: None,
             last_frame: None,
             watching: options.album.is_none(),
+            launch: None,
+            in_game: false,
         };
         app.rewind();
         if options.play {
@@ -281,7 +296,19 @@ impl Spectra {
                 }
             }
             Message::Drive(state) => {
-                self.show(Album::from_drive(&state));
+                let mut album = Album::from_drive(&state);
+                self.launch = match &state {
+                    DriveState::Disc { report, drive } => match &report.kind {
+                        DiscKind::Game(g) => game::find(g.system).zip(game::cdrom_uri(drive)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+                .map(|(emulator, uri)| Launch { emulator, uri });
+                if self.launch.is_some() {
+                    album.note = Some("✕ or Enter to play".into());
+                }
+                self.show(album);
                 operation::scroll_to(
                     Id::from(TRACKS),
                     AbsoluteOffset {
@@ -290,10 +317,24 @@ impl Spectra {
                     },
                 )
             }
+            Message::GameOver(trouble) => {
+                self.in_game = false;
+                self.motion.set_spinning(false);
+                self.album.note = Some(trouble.map_or("✕ or Enter to play".into(), |why| {
+                    format!("{why} - see ~/.cache/spectra/game.log")
+                }));
+                Task::none()
+            }
             Message::Pick(track) => {
                 self.focus = track;
                 self.play(track);
                 Task::none()
+            }
+            // Gamepads reach every program at once: while a game runs, the
+            // buttons are the game's.
+            Message::Remote(_) if self.in_game => Task::none(),
+            Message::Remote(Remote::Select | Remote::PlayPause) if self.launch.is_some() => {
+                self.start_game()
             }
             Message::Remote(remote) => {
                 let count = self.album.tracks.len();
@@ -334,6 +375,32 @@ impl Spectra {
                 self.reveal_focus()
             }
         }
+    }
+
+    fn start_game(&mut self) -> Task<Message> {
+        let Some(launch) = &self.launch else {
+            return Task::none();
+        };
+        let mut child = match launch.emulator.launch(&launch.uri) {
+            Ok(child) => child,
+            Err(e) => {
+                self.album.note = Some(format!("Couldn't start RetroArch: {e}"));
+                return Task::none();
+            }
+        };
+        self.in_game = true;
+        self.motion.set_spinning(true);
+        self.album.note = Some("Playing in RetroArch  ·  Esc twice to quit".into());
+        let (tx, rx) = iced::futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let trouble = match child.wait() {
+                Ok(status) if status.success() => None,
+                Ok(status) => Some(format!("The game stopped with {status}")),
+                Err(e) => Some(e.to_string()),
+            };
+            let _ = tx.send(trouble);
+        });
+        Task::perform(rx, |trouble| Message::GameOver(trouble.ok().flatten()))
     }
 
     /// Scroll the track list just enough to show the focused row, glow

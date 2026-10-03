@@ -218,7 +218,7 @@ keys, and asks whether the highlight moved.
 | --- | --- | --- |
 | 1. SG_IO as a normal user | **Yes** | `drive-logs/2026-10-03-0816.txt`: `/dev/sg0` and `/dev/sr0` both carry `user:lemon:rw-` and identify a PS1 disc without sudo; no udev rule needed |
 | 2. PCSX2 off the drive | pending | |
-| 3. RetroArch off the drive | pending | |
+| 3. RetroArch off the drive | **Yes, PS1 without a BIOS** | Tomb Raider (SLUS-00152) reaches its title screen with RetroArch 1.22.2 and the buildbot PCSX-ReARMed core on its HLE BIOS: `retroarch -f -L pcsx_rearmed_libretro.so cdrom://drive0.cue`. On Linux `driveN` is `/dev/sgN` (`vfs_implementation_cdrom.c`). Native Wayland window, ~23% of one core, 146 MB. CD audio and XA music not yet checked by ear |
 | 4. USB bridge | **BOT, works** | Same log: LG GUD0N slim drive behind an Initio INIC-1618L bridge (`13fd:0840`), `usb-storage` at 480M, subclass 02; came up as BOT, so there was no UAS to force off |
 | 5. UI weight | **Native: iced + wgpu** | Section 5 above: 25 MB vs ~220 MB, all budgets met |
 | 6. VLC for video discs | **Yes so far: through XWayland** | Section 6: lighter than mpv, GPU decoding works; menus wait for a DVD |

@@ -101,7 +101,7 @@ impl Album {
             DriveState::Empty => Self::no_disc(),
             DriveState::Reading => Self::message("Reading the disc…", "One moment"),
             DriveState::Unreadable(why) => Self::message("Can't read this disc", why),
-            DriveState::Disc(report) => Self::from_report(report),
+            DriveState::Disc { report, .. } => Self::from_report(report),
         }
     }
 
@@ -125,7 +125,7 @@ impl Album {
                     .flatten()
                     .reduce(|a, b| format!("{a}  ·  {b}")),
                 Some(match game.system.plan() {
-                    Some(_) => "Starting games isn't built yet",
+                    Some(_) => "No emulator for this console is installed",
                     None => "Spectra can't play this console's games",
                 }),
             ),

@@ -63,7 +63,7 @@ impl GameSystem {
     pub fn plan(self) -> Option<(u8, &'static str)> {
         match self {
             Self::Ps2 => Some((1, "PCSX2")),
-            Self::Ps1 => Some((1, "Beetle PSX")),
+            Self::Ps1 => Some((1, "PCSX-ReARMed")),
             Self::Saturn => Some((2, "Kronos")),
             Self::SegaCd => Some((2, "Genesis Plus GX")),
             Self::PcEngineCd => Some((2, "Beetle PCE")),
