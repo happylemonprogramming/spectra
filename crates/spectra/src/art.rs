@@ -40,10 +40,13 @@ pub struct Art {
 }
 
 impl Art {
-    pub fn new(cover: &RgbaImage) -> Self {
+    /// From a cover, and a scan of the disc's printed side where there is
+    /// one: the disc wears the scan, the room takes its colours from the cover.
+    pub fn new(cover: &RgbaImage, face: Option<&RgbaImage>) -> Self {
         let square = square(cover);
+        let printed = face.map(cut_out);
         Self {
-            label: Arc::new(label(&square)),
+            label: Arc::new(label(printed.as_ref().unwrap_or(&square))),
             backdrop: backdrop(&square),
             thumbnail: thumbnail(&square),
             accent: accent(&square),
@@ -56,6 +59,34 @@ fn square(cover: &RgbaImage) -> RgbaImage {
     let side = cover.width().min(cover.height());
     let (x, y) = ((cover.width() - side) / 2, (cover.height() - side) / 2);
     imageops::crop_imm(cover, x, y, side, side).to_image()
+}
+
+/// A scan of a disc, cropped to the disc. Scans come as cut-outs on a
+/// transparent background, so the disc is wherever the scan is opaque. An
+/// opaque scan is taken as it is.
+fn cut_out(scan: &RgbaImage) -> RgbaImage {
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for (x, y, px) in scan.enumerate_pixels() {
+        if px[3] >= 128 {
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+    }
+    if x0 > x1 || y0 > y1 {
+        return square(scan);
+    }
+    // The disc is round: take the larger side, centred, in case one edge of
+    // the print is faint enough to read as background.
+    let side = (x1 - x0 + 1).max(y1 - y0 + 1);
+    let cx = (x0 + x1).div_ceil(2);
+    let cy = (y0 + y1).div_ceil(2);
+    let mut out = RgbaImage::new(side, side);
+    imageops::overlay(
+        &mut out,
+        scan,
+        i64::from(side / 2) - i64::from(cx),
+        i64::from(side / 2) - i64::from(cy),
+    );
+    out
 }
 
 /// The cover printed on a disc: the hub left clear, so the read side's
@@ -129,4 +160,25 @@ fn accent(square: &RgbaImage) -> [f32; 3] {
         let stretched = grey + (v - min) / (max - min) * (max - grey);
         (stretched * lift).min(1.0)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cut_out_is_cropped_to_the_disc() {
+        // A 40-pixel disc, off centre in a 100x80 transparent scan.
+        let mut scan = RgbaImage::new(100, 80);
+        for (x, y, px) in scan.enumerate_pixels_mut() {
+            let (dx, dy) = (x as f32 - 59.5, y as f32 - 29.5);
+            if dx.hypot(dy) < 20.0 {
+                *px = Rgba([200, 30, 30, 255]);
+            }
+        }
+        let disc = cut_out(&scan);
+        assert_eq!(disc.dimensions(), (40, 40));
+        assert_eq!(disc.get_pixel(20, 20)[3], 255);
+        assert_eq!(disc.get_pixel(0, 0)[3], 0);
+    }
 }

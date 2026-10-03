@@ -25,6 +25,8 @@ pub struct Album {
     pub year: Option<u16>,
     pub tracks: Vec<Track>,
     pub cover: RgbaImage,
+    /// A scan of the disc's printed side, to wear instead of the cover.
+    pub face: Option<RgbaImage>,
     /// The line under the artist, where the track count would go.
     pub details: Option<String>,
     /// What Spectra can and cannot do with this disc yet.
@@ -71,6 +73,7 @@ impl Album {
                 .map(|(title, seconds)| Track { title, seconds })
                 .collect(),
             cover,
+            face: None,
             details: None,
             note: None,
             playable: true,
@@ -85,6 +88,7 @@ impl Album {
             year: None,
             tracks: Vec::new(),
             cover: placeholder_cover(),
+            face: None,
             details: None,
             note: None,
             playable: false,
@@ -119,7 +123,16 @@ impl Album {
                     .clone()
                     .or(label)
                     .unwrap_or("Unknown game".into()),
-                game.system.name().to_string(),
+                // "PlayStation · Eidos Interactive · 1996"
+                [
+                    Some(game.system.name().to_string()),
+                    game.publisher.clone(),
+                    game.year.clone(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("  ·  "),
                 [game.serial.clone(), game.region.clone()]
                     .into_iter()
                     .flatten()

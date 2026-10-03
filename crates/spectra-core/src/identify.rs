@@ -86,6 +86,27 @@ pub struct GameIdentity {
     pub region: Option<String>,
     /// The executable a PlayStation boots.
     pub boot: Option<String>,
+    pub publisher: Option<String>,
+    /// Year of release, as written: "1996".
+    pub year: Option<String>,
+    /// File name of a scan of the disc's printed side, on LaunchBox's image
+    /// host, where there is one that can only be this disc.
+    pub disc_art: Option<String>,
+}
+
+impl GameIdentity {
+    pub fn new(system: GameSystem) -> Self {
+        Self {
+            system,
+            serial: None,
+            title: None,
+            region: None,
+            boot: None,
+            publisher: None,
+            year: None,
+            disc_art: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -163,7 +184,19 @@ pub fn identify(disc: &mut dyn Disc) -> Result<Report> {
     let mut read = |lba: u32, count: u32| disc.read(base + lba, count);
 
     let iso = probe(read_iso(&mut read))?;
-    if let Some(game) = identify_game(&mut read, iso.as_ref(), media)? {
+    if let Some(mut game) = identify_game(&mut read, iso.as_ref(), media)? {
+        if game.system == GameSystem::Ps1 {
+            // The disc's size, from its table of contents, tells apart the
+            // discs of a set that all carry the set's serial.
+            let sectors = toc.as_ref().map(|t| t.leadout);
+            if let Some(meta) = catalog::ps1_meta(game.serial.as_deref(), sectors) {
+                game.title = Some(meta.title);
+                game.region = meta.region.or(game.region);
+                game.publisher = meta.publisher;
+                game.year = meta.year;
+                game.disc_art = meta.disc_art;
+            }
+        }
         let label = iso.map(|v| v.volume_id).filter(|l| !l.is_empty());
         return Ok(report(DiscKind::Game(game), label));
     }
@@ -258,6 +291,7 @@ pub fn identify_game(
             serial,
             region,
             boot: Some(boot),
+            ..GameIdentity::new(GameSystem::Ps1)
         }));
     }
     if iso.has_file("PS3_DISC.SFB") {
@@ -270,13 +304,7 @@ pub fn identify_game(
 }
 
 fn game(system: GameSystem) -> GameIdentity {
-    GameIdentity {
-        system,
-        serial: None,
-        title: None,
-        region: None,
-        boot: None,
-    }
+    GameIdentity::new(system)
 }
 
 /// `KEY = value` lines. Keys are upper-cased; the rest is kept as written.
@@ -349,8 +377,7 @@ fn sega_header(b: &[u8]) -> Option<GameIdentity> {
         system,
         serial,
         title,
-        region: None,
-        boot: None,
+        ..GameIdentity::new(system)
     })
 }
 
@@ -368,8 +395,7 @@ fn nintendo_header(b: &[u8]) -> Option<GameIdentity> {
         system,
         serial: ascii(b, 0, 6),
         title: ascii(b, 0x20, 64),
-        region: None,
-        boot: None,
+        ..GameIdentity::new(system)
     })
 }
 

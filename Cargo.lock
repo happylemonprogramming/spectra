@@ -2726,6 +2726,7 @@ dependencies = [
  "glam 0.33.11",
  "iced",
  "image",
+ "libc",
  "serde",
  "serde_json",
  "spectra-core",

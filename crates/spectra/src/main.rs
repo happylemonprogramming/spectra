@@ -8,10 +8,12 @@
 
 mod album;
 mod art;
+mod artwork;
 mod disc;
 mod game;
 mod gamepad;
 mod motion;
+mod platform;
 mod watch;
 
 use std::path::PathBuf;
@@ -75,6 +77,8 @@ enum Message {
     Drive(DriveState),
     /// The emulator closed: how it went, in words, if badly.
     GameOver(Option<String>),
+    /// Pictures for the game with this serial arrived.
+    Pictures(String, artwork::Pictures),
 }
 
 /// How the screen is arranged, from the most room to the least.
@@ -171,6 +175,8 @@ struct Spectra {
     launch: Option<Launch>,
     /// A game is running, and has the gamepad.
     in_game: bool,
+    /// The serial of the game disc on screen, which its pictures are for.
+    serial: Option<String>,
 }
 
 struct Launch {
@@ -211,7 +217,7 @@ impl Spectra {
             None => Album::no_disc(),
         };
         let mut app = Self {
-            art: Art::new(&album.cover),
+            art: Art::new(&album.cover, album.face.as_ref()),
             album,
             motion: Motion::new(options.reduced_motion),
             focus: 0,
@@ -223,6 +229,7 @@ impl Spectra {
             watching: options.album.is_none(),
             launch: None,
             in_game: false,
+            serial: None,
         };
         app.rewind();
         if options.play {
@@ -235,8 +242,9 @@ impl Spectra {
     fn show(&mut self, album: Album) {
         // Blurring a cover is the costly part, and every state of the drive
         // shows the same placeholder one.
-        if album.cover != self.album.cover {
-            self.art = Art::new(&album.cover);
+        if album.cover != self.album.cover || album.face != self.album.face {
+            self.art = Art::new(&album.cover, album.face.as_ref());
+            platform::release_memory();
         }
         self.album = album;
         self.rewind();
@@ -297,25 +305,53 @@ impl Spectra {
             }
             Message::Drive(state) => {
                 let mut album = Album::from_drive(&state);
-                self.launch = match &state {
+                let game = match &state {
                     DriveState::Disc { report, drive } => match &report.kind {
-                        DiscKind::Game(g) => game::find(g.system).zip(game::cdrom_uri(drive)),
+                        DiscKind::Game(game) => Some((game.clone(), drive)),
                         _ => None,
                     },
                     _ => None,
-                }
-                .map(|(emulator, uri)| Launch { emulator, uri });
+                };
+                self.launch = game
+                    .as_ref()
+                    .and_then(|(game, drive)| game::find(game.system).zip(game::cdrom_uri(drive)))
+                    .map(|(emulator, uri)| Launch { emulator, uri });
                 if self.launch.is_some() {
                     album.note = Some("✕ or Enter to play".into());
                 }
                 self.show(album);
-                operation::scroll_to(
+                self.serial = game.as_ref().and_then(|(game, _)| game.serial.clone());
+                // The disc goes on screen now; its pictures follow when they
+                // arrive, from the cache or the network.
+                let pictures = game.and_then(|(game, _)| {
+                    let serial = game.serial.clone()?;
+                    Some(Task::perform(
+                        blocking(move || artwork::for_game(&game)),
+                        move |pictures| Message::Pictures(serial.clone(), pictures),
+                    ))
+                });
+                let top = operation::scroll_to(
                     Id::from(TRACKS),
                     AbsoluteOffset {
                         x: None,
                         y: Some(0.0),
                     },
-                )
+                );
+                Task::batch([top].into_iter().chain(pictures))
+            }
+            Message::Pictures(serial, pictures) => {
+                // Only if that disc is still the one on screen.
+                if self.serial.as_deref() == Some(serial.as_str()) {
+                    let mut album = std::mem::replace(&mut self.album, Album::no_disc());
+                    if let Some(cover) = pictures.cover.or_else(|| pictures.face.clone()) {
+                        album.cover = cover;
+                    }
+                    album.face = pictures.face;
+                    self.art = Art::new(&album.cover, album.face.as_ref());
+                    self.album = album;
+                    platform::release_memory();
+                }
+                Task::none()
             }
             Message::GameOver(trouble) => {
                 self.in_game = false;
@@ -744,6 +780,18 @@ impl Spectra {
         };
         container(content).padding([8, 12]).center(Fill).into()
     }
+}
+
+/// Blocking work - the network, the disc - on a thread of its own, as a
+/// future the UI can wait on without stopping.
+fn blocking<T: Default + Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> impl Future<Output = T> {
+    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    async move { rx.await.unwrap_or_default() }
 }
 
 fn key(event: keyboard::Event) -> Option<Remote> {
