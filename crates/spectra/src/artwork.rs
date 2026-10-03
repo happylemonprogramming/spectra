@@ -4,16 +4,13 @@
 //! asked about the first time it goes in. A picture nobody has is remembered
 //! as missing, for the same reason. The requests name only the picture - a
 //! serial, or a scan's file name - and say nothing about who is asking.
-//!
-//! `curl` does the fetching. It is on every system Spectra runs on, and
-//! saves Spectra carrying an HTTP and TLS stack of its own for a handful of
-//! requests per disc.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use image::RgbaImage;
 use spectra_core::library::Entry;
+
+use crate::net::{self, Get};
 use spectra_core::{GameIdentity, GameSystem};
 
 const COVERS_PS1: &str =
@@ -126,7 +123,7 @@ fn is_file_name(s: &str) -> bool {
 
 /// The cached file, fetching it first if need be. None if there is no such
 /// picture, or it could not be had this time.
-fn fetch(dir: &Path, name: &str, url: &str) -> Option<PathBuf> {
+pub fn fetch(dir: &Path, name: &str, url: &str) -> Option<PathBuf> {
     let path = dir.join(name);
     let missing = dir.join(format!("{name}.missing"));
     if path.is_file() {
@@ -135,40 +132,25 @@ fn fetch(dir: &Path, name: &str, url: &str) -> Option<PathBuf> {
     if missing.exists() {
         return None;
     }
-    let partial = dir.join(format!("{name}.part"));
-    let output = Command::new("curl")
-        .args(["--silent", "--location", "--max-time", "30"])
-        .args(["--user-agent", "Mozilla/5.0"])
-        .args(["--write-out", "%{http_code}", "--output"])
-        .arg(&partial)
-        .arg(url)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let status = String::from_utf8_lossy(&output.stdout);
-    match status.trim() {
-        "200" if output.status.success() => {
+    match net::get(url, net::ANONYMOUS) {
+        Get::Found(bytes) => {
+            let partial = dir.join(format!("{name}.part"));
+            std::fs::write(&partial, bytes).ok()?;
             std::fs::rename(&partial, &path).ok()?;
             Some(path)
         }
-        // Nobody has scanned this one. Asking again will not change that.
-        "404" => {
-            let _ = std::fs::remove_file(&partial);
+        // Nobody has this one. Asking again will not change that.
+        Get::Missing => {
             let _ = std::fs::write(&missing, "");
             None
         }
-        // Offline, or the host is having a bad day: try again next time.
-        _ => {
-            let _ = std::fs::remove_file(&partial);
-            None
-        }
+        Get::Failed => None,
     }
 }
 
 /// By what the file holds rather than its name: a scan kept as `face.png`
 /// may be a JPEG.
-fn decode(path: &Path) -> Option<RgbaImage> {
+pub fn decode(path: &Path) -> Option<RgbaImage> {
     let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
@@ -176,7 +158,7 @@ fn decode(path: &Path) -> Option<RgbaImage> {
     reader.decode().ok().map(|image| image.to_rgba8())
 }
 
-fn cache_dir() -> Option<PathBuf> {
+pub fn cache_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".cache")))?

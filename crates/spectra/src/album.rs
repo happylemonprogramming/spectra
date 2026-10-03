@@ -141,7 +141,7 @@ impl Album {
             DiscKind::Audio { .. } => {
                 let mut album = Self::message("Audio CD", "Unknown artist");
                 album.tracks = report.toc.as_ref().map(cd_tracks).unwrap_or_default();
-                album.note = Some("Playing CDs isn't built yet".into());
+                album.playable = !album.tracks.is_empty();
                 return album;
             }
             DiscKind::Game(game) => (

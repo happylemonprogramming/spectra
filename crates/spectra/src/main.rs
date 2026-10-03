@@ -9,10 +9,13 @@
 mod album;
 mod art;
 mod artwork;
+mod audio;
 mod disc;
 mod game;
 mod gamepad;
 mod motion;
+mod musicbrainz;
+mod net;
 mod platform;
 mod watch;
 
@@ -87,6 +90,9 @@ enum Message {
     /// Pictures for the game with this serial arrived.
     Pictures(String, artwork::Pictures),
     Keeping(Keeping),
+    Audio(audio::Event),
+    /// MusicBrainz's answer for the audio CD with this disc ID.
+    Release(String, Box<musicbrainz::Found>),
 }
 
 /// How the screen is arranged, from the most room to the least.
@@ -191,6 +197,12 @@ struct Spectra {
     shelf: Vec<library::Entry>,
     /// The row whose copy the disc on screen is wearing.
     shelf_art: Option<usize>,
+    /// The audio CD's player, while there is one in.
+    player: Option<audio::Player>,
+    /// Seconds into the playing track.
+    elapsed: u32,
+    /// The audio CD on screen, which a MusicBrainz answer is for.
+    disc_id: Option<String>,
 }
 
 struct Launch {
@@ -268,6 +280,9 @@ impl Spectra {
             copying: None,
             shelf: Vec::new(),
             shelf_art: None,
+            player: None,
+            elapsed: 0,
+            disc_id: None,
         };
         app.rewind();
         if options.play {
@@ -303,7 +318,11 @@ impl Spectra {
         if !self.album.playable {
             return;
         }
+        if let Some(player) = &self.player {
+            player.play(track);
+        }
         self.playing = Some(track);
+        self.elapsed = 0;
         self.paused = false;
         self.motion.set_spinning(true);
     }
@@ -344,6 +363,28 @@ impl Spectra {
             Message::Drive(state) => {
                 let mut album = Album::from_drive(&state);
                 let idle = matches!(state, DriveState::NoDrive | DriveState::Empty);
+                // A new disc, or none: whatever was playing stops.
+                self.player = None;
+                self.disc_id = None;
+                let mut audio_tasks = Vec::new();
+                if let DriveState::Disc { report, drive } = &state
+                    && let DiscKind::Audio { musicbrainz, .. } = &report.kind
+                    && let Some(toc) = &report.toc
+                {
+                    let (tx, rx) = iced::futures::channel::mpsc::unbounded();
+                    self.player = Some(audio::Player::new(drive.clone(), audio::spans(toc), tx));
+                    audio_tasks.push(Task::run(rx, Message::Audio));
+                    if let Some(id) = musicbrainz.clone() {
+                        self.disc_id = Some(id.disc_id.clone());
+                        audio_tasks.push(Task::perform(
+                            blocking(move || Box::new(musicbrainz::look_up(&id))),
+                            {
+                                let disc_id = self.disc_id.clone().unwrap_or_default();
+                                move |found| Message::Release(disc_id.clone(), found)
+                            },
+                        ));
+                    }
+                }
                 self.disc = match state {
                     DriveState::Disc { report, drive } => match &report.kind {
                         DiscKind::Game(game) => Some(Inserted {
@@ -388,7 +429,58 @@ impl Spectra {
                         y: Some(0.0),
                     },
                 );
-                Task::batch([top].into_iter().chain(pictures))
+                Task::batch([top].into_iter().chain(pictures).chain(audio_tasks))
+            }
+            Message::Audio(event) => {
+                match event {
+                    audio::Event::At { track, seconds } => {
+                        self.elapsed = seconds;
+                        if self.playing != Some(track) && !self.paused {
+                            // On to the next track by itself.
+                            self.playing = Some(track);
+                            self.focus = track;
+                            return self.reveal_focus();
+                        }
+                    }
+                    audio::Event::Stopped => {
+                        self.playing = None;
+                        self.motion.set_spinning(false);
+                    }
+                    audio::Event::Failed(why) => {
+                        self.playing = None;
+                        self.motion.set_spinning(false);
+                        self.album.note = Some(format!("Couldn't play: {why}"));
+                    }
+                }
+                Task::none()
+            }
+            Message::Release(disc_id, found) => {
+                if self.disc_id.as_deref() != Some(disc_id.as_str()) {
+                    return Task::none();
+                }
+                let musicbrainz::Found { release, cover } = *found;
+                if let Some(release) = release {
+                    self.album.title = release.title;
+                    self.album.artist = release.artist;
+                    self.album.year = release
+                        .date
+                        .as_deref()
+                        .and_then(|d| d.get(..4))
+                        .and_then(|y| y.parse().ok());
+                    // MusicBrainz lists the audio tracks; the TOC timed them.
+                    for (track, named) in self.album.tracks.iter_mut().zip(release.tracks) {
+                        track.title = match named.artist {
+                            Some(artist) => format!("{}  ·  {artist}", named.title),
+                            None => named.title,
+                        };
+                    }
+                }
+                if let Some(cover) = cover {
+                    self.album.cover = cover;
+                    self.art = Art::new(&self.album.cover, None);
+                    platform::release_memory();
+                }
+                Task::none()
             }
             Message::Keeping(Keeping::Progress(done, total)) => {
                 if let Some(copying) = &self.copying {
@@ -499,6 +591,13 @@ impl Spectra {
                         Some(_) => {
                             self.paused = !self.paused;
                             self.motion.set_spinning(!self.paused);
+                            if let Some(player) = &self.player {
+                                if self.paused {
+                                    player.pause();
+                                } else {
+                                    player.resume();
+                                }
+                            }
                         }
                         None => self.play(self.focus),
                     },
@@ -515,6 +614,9 @@ impl Spectra {
                     Remote::Back => {
                         self.playing = None;
                         self.motion.set_spinning(false);
+                        if let Some(player) = &self.player {
+                            player.stop();
+                        }
                     }
                     Remote::Keep => {}
                     Remote::Quit => return iced::exit(),
@@ -878,7 +980,12 @@ impl Spectra {
                 .width(Fill)
                 .clip(true),
                 text(track.detail.clone().unwrap_or_else(|| {
-                    format!("{}:{:02}", track.seconds / 60, track.seconds % 60)
+                    let length = format!("{}:{:02}", track.seconds / 60, track.seconds % 60);
+                    if is_playing && self.player.is_some() {
+                        format!("{}:{:02} / {length}", self.elapsed / 60, self.elapsed % 60)
+                    } else {
+                        length
+                    }
                 }))
                 .font(FONT)
                 .size(scale.track - 3.0)
