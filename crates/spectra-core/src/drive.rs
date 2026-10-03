@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::disc::{Disc, Media, SECTOR, Toc, Track};
+use crate::disc::{Disc, Media, RAW_SECTOR, SECTOR, Toc, Track};
 use crate::{Error, Result, ScsiError};
 
 /// Sectors per READ(12): a 64 KB transfer, which every USB bridge accepts.
@@ -392,6 +392,27 @@ impl Drive {
             READ_TIMEOUT,
         )
         .map(drop)
+    }
+
+    /// READ CD: sectors as they are on the disc, 2352 bytes each. A data
+    /// sector comes with its sync pattern, header and error correction; an
+    /// audio one is all samples, little-endian, as a `.bin` keeps them.
+    pub fn read_raw(&self, lba: u32, count: u32, audio: bool) -> Result<Vec<u8>> {
+        let [a, b, c, d] = lba.to_be_bytes();
+        let [_, e, f, g] = count.to_be_bytes();
+        let (sector_type, fields) = if audio {
+            // CD-DA; user data, which for audio is the whole sector.
+            (0x04, 0x10)
+        } else {
+            // Any type; sync, all headers, user data, EDC/ECC.
+            (0x00, 0xf8)
+        };
+        self.command(
+            "read CD",
+            &[0xbe, sector_type, a, b, c, d, e, f, g, fields, 0, 0],
+            Direction::In(count as usize * RAW_SECTOR),
+            READ_TIMEOUT,
+        )
     }
 
     fn read12(&self, lba: u32, count: u32) -> Result<Vec<u8>> {

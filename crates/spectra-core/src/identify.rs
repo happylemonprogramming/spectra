@@ -17,7 +17,7 @@
 //!
 //! Ported from Rainbow Player's `src/lib/game/identify.ts` and extended.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::disc::{Disc, Media, Toc};
 use crate::discid::{MusicBrainzId, musicbrainz};
@@ -25,7 +25,7 @@ use crate::iso9660::{IsoVolume, ReadSectors, read_iso, read_root_file};
 use crate::udf::read_udf;
 use crate::{Result, catalog};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GameSystem {
     Ps1,

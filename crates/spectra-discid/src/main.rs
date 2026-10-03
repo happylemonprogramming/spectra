@@ -4,14 +4,16 @@
 //!   spectra-discid /dev/sr0        a particular drive
 //!   spectra-discid game.cue        an image (.cue, .bin, .iso)
 //!   spectra-discid --list          the drives the kernel knows about
+//!   spectra-discid --keep          copy the drive's disc into the library
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use clap::Parser;
 use spectra_core::drive::{self, Drive};
-use spectra_core::{Disc, DiscKind, Error, Media, Report, SECTOR, identify, image};
+use spectra_core::{Disc, DiscKind, Error, Media, Report, SECTOR, identify, image, library};
 
 #[derive(Parser)]
 #[command(version, about = "Say what disc is in the drive, or in an image")]
@@ -24,6 +26,9 @@ struct Args {
     /// List optical drives and exit.
     #[arg(long)]
     list: bool,
+    /// Copy the disc in the drive into Spectra's library, to play without it.
+    #[arg(long)]
+    keep: bool,
     /// Seconds to wait for a disc that is still spinning up.
     #[arg(long, default_value_t = 25)]
     wait: u64,
@@ -33,6 +38,9 @@ fn main() -> ExitCode {
     let args = Args::parse();
     if args.list {
         return list(args.json);
+    }
+    if args.keep {
+        return keep(&args);
     }
     match run(&args) {
         Ok(report) => {
@@ -64,6 +72,50 @@ fn run(args: &Args) -> Result<Report, Error> {
         None => Box::new(open_drive(Drive::open_first()?, args.wait)?),
     };
     identify(disc.as_mut())
+}
+
+fn keep(args: &Args) -> ExitCode {
+    let result = (|| {
+        let drive = match &args.source {
+            Some(path) => Drive::open(path)?,
+            None => Drive::open_first()?,
+        };
+        let mut drive = open_drive(drive, args.wait)?;
+        let report = identify(&mut drive)?;
+        let started = std::time::Instant::now();
+        let mut last = 0;
+        library::keep(&drive, &report, &AtomicBool::new(false), |p| {
+            let percent = u64::from(p.done) * 100 / u64::from(p.total.max(1));
+            if percent != last {
+                last = percent;
+                eprint!("\rcopying: {percent}%");
+            }
+        })
+        .map(|entry| (entry, started.elapsed()))
+    })();
+    match result {
+        Ok((entry, took)) => {
+            eprintln!();
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&entry.meta).expect("meta serialises")
+                );
+            } else {
+                println!("Kept:    {}", entry.meta.title);
+                println!("Where:   {}", entry.dir.display());
+                println!("Took:    {} s", took.as_secs());
+                if entry.meta.unreadable > 0 {
+                    println!("Missing: {} unreadable sectors", entry.meta.unreadable);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("\nspectra-discid: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn open_drive(drive: Drive, wait: u64) -> Result<Drive, Error> {

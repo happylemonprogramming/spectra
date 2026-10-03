@@ -9,6 +9,7 @@
 //! the same over WebUSB.
 
 pub mod catalog;
+pub mod copy;
 pub mod cue;
 pub mod disc;
 pub mod discid;
@@ -17,6 +18,7 @@ mod error;
 pub mod identify;
 pub mod image;
 pub mod iso9660;
+pub mod library;
 pub mod udf;
 
 #[cfg(test)]
