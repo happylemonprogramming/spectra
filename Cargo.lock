@@ -2728,6 +2728,7 @@ dependencies = [
  "image",
  "serde",
  "serde_json",
+ "spectra-core",
 ]
 
 [[package]]

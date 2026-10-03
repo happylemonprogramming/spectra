@@ -216,10 +216,10 @@ keys, and asks whether the highlight moved.
 
 | Spike | Answer | Evidence |
 | --- | --- | --- |
-| 1. SG_IO as a normal user | pending | |
+| 1. SG_IO as a normal user | **Yes** | `drive-logs/2026-10-03-0816.txt`: `/dev/sg0` and `/dev/sr0` both carry `user:lemon:rw-` and identify a PS1 disc without sudo; no udev rule needed |
 | 2. PCSX2 off the drive | pending | |
 | 3. RetroArch off the drive | pending | |
-| 4. USB bridge | pending | |
+| 4. USB bridge | **BOT, works** | Same log: LG GUD0N slim drive behind an Initio INIC-1618L bridge (`13fd:0840`), `usb-storage` at 480M, subclass 02; came up as BOT, so there was no UAS to force off |
 | 5. UI weight | **Native: iced + wgpu** | Section 5 above: 25 MB vs ~220 MB, all budgets met |
 | 6. VLC for video discs | **Yes so far: through XWayland** | Section 6: lighter than mpv, GPU decoding works; menus wait for a DVD |
 

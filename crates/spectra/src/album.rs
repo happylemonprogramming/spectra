@@ -1,7 +1,7 @@
 //! What is on screen: an album, its tracks and its cover.
 //!
-//! Until Phase 1 wires the drive and MusicBrainz in, an album comes from a
-//! small JSON file; with none, the screen waits for a disc:
+//! An album is whatever disc is in the drive. For working on the screen
+//! without one, it can also come from a small JSON file:
 //!
 //! ```json
 //! { "title": "…", "artist": "…", "year": 1997, "cover": "cover.jpg",
@@ -12,6 +12,12 @@ use std::path::Path;
 
 use image::RgbaImage;
 use serde::Deserialize;
+use spectra_core::{DiscKind, Report};
+
+use crate::watch::DriveState;
+
+/// CD frames per second: one TOC address step.
+const FRAMES_PER_SECOND: u32 = 75;
 
 pub struct Album {
     pub title: String,
@@ -19,6 +25,12 @@ pub struct Album {
     pub year: Option<u16>,
     pub tracks: Vec<Track>,
     pub cover: RgbaImage,
+    /// The line under the artist, where the track count would go.
+    pub details: Option<String>,
+    /// What Spectra can and cannot do with this disc yet.
+    pub note: Option<String>,
+    /// Whether choosing a track plays it.
+    pub playable: bool,
 }
 
 pub struct Track {
@@ -59,23 +71,129 @@ impl Album {
                 .map(|(title, seconds)| Track { title, seconds })
                 .collect(),
             cover,
+            details: None,
+            note: None,
+            playable: true,
         })
     }
 
-    /// Nothing to play yet: a blank disc, and an invitation.
-    pub fn no_disc() -> Self {
+    /// Words on a blank disc: an invitation, or news from the drive.
+    fn message(title: &str, artist: &str) -> Self {
         Self {
-            title: "Insert a disc".into(),
-            artist: "Music, films and games".into(),
+            title: title.into(),
+            artist: artist.into(),
             year: None,
             tracks: Vec::new(),
             cover: placeholder_cover(),
+            details: None,
+            note: None,
+            playable: false,
         }
+    }
+
+    pub fn no_disc() -> Self {
+        Self::message("Insert a disc", "Music, films and games")
+    }
+
+    pub fn from_drive(state: &DriveState) -> Self {
+        match state {
+            DriveState::NoDrive => Self::message("Connect a disc drive", "Music, films and games"),
+            DriveState::Empty => Self::no_disc(),
+            DriveState::Reading => Self::message("Reading the disc…", "One moment"),
+            DriveState::Unreadable(why) => Self::message("Can't read this disc", why),
+            DriveState::Disc(report) => Self::from_report(report),
+        }
+    }
+
+    fn from_report(report: &Report) -> Self {
+        let label = report.label.clone();
+        let (title, artist, details, note) = match &report.kind {
+            DiscKind::Audio { .. } => {
+                let mut album = Self::message("Audio CD", "Unknown artist");
+                album.tracks = report.toc.as_ref().map(cd_tracks).unwrap_or_default();
+                album.note = Some("Playing CDs isn't built yet".into());
+                return album;
+            }
+            DiscKind::Game(game) => (
+                game.title
+                    .clone()
+                    .or(label)
+                    .unwrap_or("Unknown game".into()),
+                game.system.name().to_string(),
+                [game.serial.clone(), game.region.clone()]
+                    .into_iter()
+                    .flatten()
+                    .reduce(|a, b| format!("{a}  ·  {b}")),
+                Some(match game.system.plan() {
+                    Some(_) => "Starting games isn't built yet",
+                    None => "Spectra can't play this console's games",
+                }),
+            ),
+            DiscKind::DvdVideo => film(label, "DVD-Video"),
+            DiscKind::BluRayVideo => film(label, "Blu-ray"),
+            DiscKind::VideoCd { super_vcd } => film(
+                label,
+                if *super_vcd {
+                    "Super Video CD"
+                } else {
+                    "Video CD"
+                },
+            ),
+            DiscKind::Pc => (
+                label.unwrap_or("PC disc".into()),
+                "PC disc".into(),
+                None,
+                Some("PC discs come later"),
+            ),
+            DiscKind::Data => (
+                label.unwrap_or("Data disc".into()),
+                "Data disc".into(),
+                None,
+                Some("Not a kind of disc Spectra plays"),
+            ),
+        };
+        let mut album = Self::message(&title, &artist);
+        album.details = details;
+        album.note = note.map(Into::into);
+        album
     }
 
     pub fn total_seconds(&self) -> u32 {
         self.tracks.iter().map(|t| t.seconds).sum()
     }
+}
+
+fn film(
+    label: Option<String>,
+    format: &str,
+) -> (String, String, Option<String>, Option<&'static str>) {
+    (
+        label.unwrap_or(format.into()),
+        format.into(),
+        None,
+        Some("Playing films isn't built yet"),
+    )
+}
+
+/// An audio CD's tracks, named by number and timed from the TOC: each runs
+/// to the next one's start, the last to the lead-out. Data tracks are not
+/// music, and are left out.
+fn cd_tracks(toc: &spectra_core::Toc) -> Vec<Track> {
+    let ends = toc
+        .tracks
+        .iter()
+        .skip(1)
+        .map(|t| t.lba)
+        .chain([toc.leadout]);
+    toc.tracks
+        .iter()
+        .zip(ends)
+        .filter(|(track, _)| !track.data)
+        .map(|(track, end)| Track {
+            title: format!("Track {}", track.number),
+            seconds: end.saturating_sub(track.lba) / FRAMES_PER_SECOND,
+        })
+        .collect()
 }
 
 /// A cover for an album that has none: a soft diagonal sweep through the
@@ -103,4 +221,31 @@ fn hsv(h: f32, s: f32, v: f32) -> [u8; 3] {
         _ => (v, p, q),
     };
     [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
+}
+
+#[cfg(test)]
+mod tests {
+    use spectra_core::{Toc, Track};
+
+    #[test]
+    fn cd_tracks_run_to_the_next_start_and_skip_data() {
+        let track = |number, lba, data| Track { number, lba, data };
+        // An enhanced CD: two songs, then a data track in its own session.
+        let toc = Toc {
+            first: 1,
+            last: 3,
+            tracks: vec![
+                track(1, 0, false),
+                track(2, 75 * 200, false),
+                track(3, 75 * 500, true),
+            ],
+            leadout: 75 * 900,
+        };
+        let tracks = super::cd_tracks(&toc);
+        let got: Vec<_> = tracks
+            .iter()
+            .map(|t| (t.title.as_str(), t.seconds))
+            .collect();
+        assert_eq!(got, [("Track 1", 200), ("Track 2", 300)]);
+    }
 }

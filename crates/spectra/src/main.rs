@@ -1,9 +1,8 @@
 //! Spectra: put a disc in, and it plays.
 //!
-//! Phase 0's UI spike: one finished screen - the rainbow disc, the album's
-//! blurred cover behind it, and a track list driven by keyboard or gamepad -
-//! to find out whether a native GPU UI can look right while staying within
-//! the budgets in PLAN.md.
+//! One screen - the rainbow disc, the album's blurred cover behind it, and a
+//! track list driven by keyboard or gamepad - showing whatever disc is in the
+//! drive. An album file stands in for the drive while working on the screen.
 //!
 //!   spectra [ALBUM.json] [--play] [--reduced-motion]
 
@@ -12,6 +11,7 @@ mod art;
 mod disc;
 mod gamepad;
 mod motion;
+mod watch;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -34,6 +34,7 @@ use iced::{
 use album::Album;
 use art::Art;
 use motion::Motion;
+use watch::DriveState;
 
 const FONT: Font = Font::with_name("Adwaita Sans");
 const BOLD: Font = Font {
@@ -69,6 +70,7 @@ enum Message {
     /// The track list scrolled or changed size.
     Scrolled(Viewport),
     Frame(Instant),
+    Drive(DriveState),
 }
 
 /// How the screen is arranged, from the most room to the least.
@@ -159,6 +161,8 @@ struct Spectra {
     /// The track list's last reported viewport, while it overflows.
     list: Option<Viewport>,
     last_frame: Option<Instant>,
+    /// Showing the drive's disc, rather than an album file.
+    watching: bool,
 }
 
 struct Options {
@@ -193,29 +197,51 @@ impl Spectra {
             }),
             None => Album::no_disc(),
         };
-        let art = Art::new(&album.cover);
-        let mut glow = vec![0.0; album.tracks.len()];
-        if let Some(first) = glow.first_mut() {
-            *first = 1.0;
-        }
         let mut app = Self {
+            art: Art::new(&album.cover),
             album,
-            art,
             motion: Motion::new(options.reduced_motion),
             focus: 0,
             playing: None,
             paused: false,
-            glow,
+            glow: Vec::new(),
             list: None,
             last_frame: None,
+            watching: options.album.is_none(),
         };
+        app.rewind();
         if options.play {
             app.play(0);
         }
         (app, Task::none())
     }
 
+    /// Put an album on screen, from the top, with nothing playing.
+    fn show(&mut self, album: Album) {
+        // Blurring a cover is the costly part, and every state of the drive
+        // shows the same placeholder one.
+        if album.cover != self.album.cover {
+            self.art = Art::new(&album.cover);
+        }
+        self.album = album;
+        self.rewind();
+    }
+
+    fn rewind(&mut self) {
+        self.glow = vec![0.0; self.album.tracks.len()];
+        if let Some(first) = self.glow.first_mut() {
+            *first = 1.0;
+        }
+        self.focus = 0;
+        self.playing = None;
+        self.paused = false;
+        self.motion.set_spinning(false);
+    }
+
     fn play(&mut self, track: usize) {
+        if !self.album.playable {
+            return;
+        }
         self.playing = Some(track);
         self.paused = false;
         self.motion.set_spinning(true);
@@ -253,6 +279,16 @@ impl Spectra {
                 } else {
                     Task::none()
                 }
+            }
+            Message::Drive(state) => {
+                self.show(Album::from_drive(&state));
+                operation::scroll_to(
+                    Id::from(TRACKS),
+                    AbsoluteOffset {
+                        x: None,
+                        y: Some(0.0),
+                    },
+                )
             }
             Message::Pick(track) => {
                 self.focus = track;
@@ -342,6 +378,11 @@ impl Spectra {
         let remote =
             Subscription::batch([keyboard::listen().filter_map(key), gamepad::subscription()])
                 .map(Message::Remote);
+        let remote = if self.watching {
+            Subscription::batch([remote, watch::subscription().map(Message::Drive)])
+        } else {
+            remote
+        };
         // Frames are only asked for while something moves. At rest, nothing
         // is drawn and the GPU sleeps.
         if self.animating() {
@@ -437,7 +478,7 @@ impl Spectra {
 
     fn header(&self, scale: Scale) -> Element<'_, Message> {
         let album = &self.album;
-        let details = (!album.tracks.is_empty()).then(|| {
+        let summary = (!album.tracks.is_empty()).then(|| {
             [
                 album.year.map(|y| y.to_string()),
                 Some(format!("{} tracks", album.tracks.len())),
@@ -448,6 +489,13 @@ impl Spectra {
             .collect::<Vec<_>>()
             .join("  ·  ")
         });
+        let details = album.details.clone().or(summary);
+        let dim = |line: &str, alpha: f32| {
+            text(line.to_string())
+                .font(FONT)
+                .size(scale.detail)
+                .color(Color::from_rgba(1.0, 1.0, 1.0, alpha))
+        };
         container(
             column![
                 text(&album.title)
@@ -459,12 +507,8 @@ impl Spectra {
                     .size(scale.artist)
                     .color(Color::from_rgba(1.0, 1.0, 1.0, 0.78)),
             ]
-            .push(details.map(|details| {
-                text(details)
-                    .font(FONT)
-                    .size(scale.detail)
-                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5))
-            }))
+            .push(details.map(|details| dim(&details, 0.5)))
+            .push(album.note.as_deref().map(|note| dim(note, 0.38)))
             .spacing(scale.gap / 4.0),
         )
         .padding([0.0, LIST_PAD])
@@ -548,7 +592,7 @@ impl Spectra {
     }
 
     fn hints(&self, scale: Scale) -> Element<'_, Message> {
-        if scale.gap < 20.0 || self.album.tracks.is_empty() {
+        if scale.gap < 20.0 || !self.album.playable || self.album.tracks.is_empty() {
             return space().into();
         }
         container(
