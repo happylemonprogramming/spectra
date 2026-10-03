@@ -73,6 +73,8 @@ pub enum Remote {
     Back,
     /// Keep a copy of the disc, to play without it.
     Keep,
+    /// Over to the kept copies, and back to the disc in the drive.
+    Library,
     Quit,
 }
 
@@ -206,6 +208,11 @@ struct Spectra {
     /// The album on screen is a copy opened from the shelf, which Back
     /// returns to.
     opened: bool,
+    /// What the drive last said, kept while the library is on screen so
+    /// that Back can return to the disc.
+    drive_state: Option<DriveState>,
+    /// There are kept copies to go to.
+    kept: bool,
 }
 
 struct Launch {
@@ -288,6 +295,8 @@ impl Spectra {
             elapsed: 0,
             disc_id: None,
             opened: false,
+            drive_state: None,
+            kept: !library::list().is_empty(),
         };
         app.rewind();
         if options.play {
@@ -366,103 +375,29 @@ impl Spectra {
                 }
             }
             Message::Drive(state) => {
-                let mut album = Album::from_drive(&state);
-                let idle = matches!(state, DriveState::NoDrive | DriveState::Empty);
-                // A new disc, or none: whatever was playing stops.
-                self.player = None;
-                self.disc_id = None;
-                self.opened = false;
-                let mut audio_tasks = Vec::new();
-                if let DriveState::Disc { report, drive } = &state
-                    && let DiscKind::Audio { musicbrainz, .. } = &report.kind
-                    && let Some(toc) = &report.toc
-                {
-                    // A kept CD plays from its copy, named as it was kept:
-                    // the drive can rest, and nothing is looked up.
-                    let kept = library::id(report)
-                        .and_then(|id| library::find(&id))
-                        .and_then(|entry| Some((entry.toc()?, entry)));
-                    let look_up = kept.is_none();
-                    if let Some((toc, entry)) = kept {
-                        album = Album::from_copy(&entry, &toc);
-                        if let Some(cover) = artwork::for_copy(&entry).cover {
-                            album.cover = cover;
+                self.drive_state = Some(state.clone());
+                // A kept album is playing: the drive waits until Back.
+                if self.opened {
+                    return Task::none();
+                }
+                // On the shelf, only a disc that has been read takes over the
+                // screen; until then the shelf stays, and says so.
+                if !self.shelf.is_empty() {
+                    match state {
+                        DriveState::Reading => {
+                            self.album.note = Some("Reading the disc in the drive…".into());
+                            return Task::none();
                         }
-                        audio_tasks.push(
-                            self.start_player(
-                                audio::Source::Image(entry.bin()),
-                                audio::spans(&toc),
-                            ),
-                        );
-                    } else {
-                        audio_tasks.push(
-                            self.start_player(
-                                audio::Source::Drive(drive.clone()),
-                                audio::spans(toc),
-                            ),
-                        );
-                    }
-                    if look_up && let Some(id) = musicbrainz.clone() {
-                        self.disc_id = Some(id.disc_id.clone());
-                        audio_tasks.push(Task::perform(
-                            blocking(move || Box::new(musicbrainz::look_up(&id))),
-                            {
-                                let disc_id = self.disc_id.clone().unwrap_or_default();
-                                move |found| Message::Release(disc_id.clone(), found)
-                            },
-                        ));
+                        DriveState::NoDrive | DriveState::Empty => {
+                            self.album.note = Some(self.ready_note());
+                            return Task::none();
+                        }
+                        DriveState::Disc { .. } | DriveState::Unreadable(_) => {}
                     }
                 }
-                self.disc = match state {
-                    DriveState::Disc { report, drive } => match &report.kind {
-                        DiscKind::Game(game) => Some(Inserted {
-                            game: Some(game.clone()),
-                            report,
-                            drive,
-                        }),
-                        DiscKind::Audio { .. } => Some(Inserted {
-                            game: None,
-                            report,
-                            drive,
-                        }),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                self.shelf.clear();
-                self.shelf_art = None;
-                if idle && let Some(shelf) = self.shelf_album() {
-                    album = shelf;
-                }
-                self.launch = self.disc_launch();
-                let music = self.disc.as_ref().is_some_and(|d| d.game.is_none());
-                let emulator = self
-                    .disc
-                    .as_ref()
-                    .and_then(|d| d.game.as_ref())
-                    .is_some_and(|g| game::find(g.system).is_some());
-                if self.launch.is_some() || music || emulator {
-                    album.note = Some(self.ready_note());
-                }
-                self.show(album);
-                self.serial = self
-                    .disc
-                    .as_ref()
-                    .and_then(|d| d.game.as_ref()?.serial.clone());
-                self.show_shelf_art();
-                // The disc goes on screen now; its pictures follow when they
-                // arrive, from the cache or the network.
-                let pictures = self.disc.as_ref().and_then(|disc| {
-                    let game = disc.game.clone()?;
-                    let serial = game.serial.clone()?;
-                    Some(Task::perform(
-                        blocking(move || artwork::for_game(&game)),
-                        move |pictures| Message::Pictures(serial.clone(), pictures),
-                    ))
-                });
-                let top = self.scroll_to_top();
-                Task::batch([top].into_iter().chain(pictures).chain(audio_tasks))
+                self.show_drive(state)
             }
+            Message::Audio(_) if !self.shelf.is_empty() => Task::none(),
             Message::Audio(event) => {
                 match event {
                     audio::Event::At { track, seconds } => {
@@ -526,6 +461,7 @@ impl Spectra {
                     .is_some_and(|c| c.cancel.load(Ordering::Relaxed));
                 self.motion.set_spinning(false);
                 self.launch = self.disc_launch();
+                self.kept |= result.is_ok();
                 // A kept CD plays from its copy from now on.
                 let mut task = Task::none();
                 if let Ok(entry) = &result
@@ -591,12 +527,16 @@ impl Spectra {
                 }
                 Task::none()
             }
-            Message::Remote(Remote::Select | Remote::PlayPause | Remote::Keep)
-                if self.copying.is_some() =>
-            {
-                Task::none()
-            }
+            Message::Remote(
+                Remote::Select | Remote::PlayPause | Remote::Keep | Remote::Library,
+            ) if self.copying.is_some() => Task::none(),
+            Message::Remote(Remote::Library) => self.toggle_library(),
+            // Only the disc in the drive can be kept.
+            Message::Remote(Remote::Keep) if !self.shelf.is_empty() || self.opened => Task::none(),
             Message::Remote(Remote::Keep) => self.keep_copy(),
+            Message::Remote(Remote::Back) if !self.shelf.is_empty() && self.disc_in_drive() => {
+                self.return_to_drive()
+            }
             Message::Remote(Remote::Select | Remote::PlayPause) if !self.shelf.is_empty() => {
                 self.play_kept()
             }
@@ -650,13 +590,108 @@ impl Spectra {
                             player.stop();
                         }
                     }
-                    Remote::Keep => {}
+                    Remote::Keep | Remote::Library => {}
                     Remote::Quit => return iced::exit(),
                 }
                 self.show_shelf_art();
                 self.reveal_focus()
             }
         }
+    }
+
+    /// Put the drive's disc on screen, or the shelf when there is none,
+    /// with whatever it needs started: its player, its names, its pictures.
+    fn show_drive(&mut self, state: DriveState) -> Task<Message> {
+        let mut album = Album::from_drive(&state);
+        let idle = matches!(state, DriveState::NoDrive | DriveState::Empty);
+        // A new disc, or none: whatever was playing stops.
+        self.player = None;
+        self.disc_id = None;
+        self.opened = false;
+        self.kept = !library::list().is_empty();
+        let mut audio_tasks = Vec::new();
+        if let DriveState::Disc { report, drive } = &state
+            && let DiscKind::Audio { musicbrainz, .. } = &report.kind
+            && let Some(toc) = &report.toc
+        {
+            // A kept CD plays from its copy, named as it was kept:
+            // the drive can rest, and nothing is looked up.
+            let kept = library::id(report)
+                .and_then(|id| library::find(&id))
+                .and_then(|entry| Some((entry.toc()?, entry)));
+            let look_up = kept.is_none();
+            if let Some((toc, entry)) = kept {
+                album = Album::from_copy(&entry, &toc);
+                if let Some(cover) = artwork::for_copy(&entry).cover {
+                    album.cover = cover;
+                }
+                audio_tasks
+                    .push(self.start_player(audio::Source::Image(entry.bin()), audio::spans(&toc)));
+            } else {
+                audio_tasks.push(
+                    self.start_player(audio::Source::Drive(drive.clone()), audio::spans(toc)),
+                );
+            }
+            if look_up && let Some(id) = musicbrainz.clone() {
+                self.disc_id = Some(id.disc_id.clone());
+                audio_tasks.push(Task::perform(
+                    blocking(move || Box::new(musicbrainz::look_up(&id))),
+                    {
+                        let disc_id = self.disc_id.clone().unwrap_or_default();
+                        move |found| Message::Release(disc_id.clone(), found)
+                    },
+                ));
+            }
+        }
+        self.disc = match state {
+            DriveState::Disc { report, drive } => match &report.kind {
+                DiscKind::Game(game) => Some(Inserted {
+                    game: Some(game.clone()),
+                    report,
+                    drive,
+                }),
+                DiscKind::Audio { .. } => Some(Inserted {
+                    game: None,
+                    report,
+                    drive,
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
+        self.shelf.clear();
+        self.shelf_art = None;
+        if idle && let Some(shelf) = self.shelf_album() {
+            album = shelf;
+        }
+        self.launch = self.disc_launch();
+        let music = self.disc.as_ref().is_some_and(|d| d.game.is_none());
+        let emulator = self
+            .disc
+            .as_ref()
+            .and_then(|d| d.game.as_ref())
+            .is_some_and(|g| game::find(g.system).is_some());
+        if self.launch.is_some() || music || emulator {
+            album.note = Some(self.ready_note());
+        }
+        self.show(album);
+        self.serial = self
+            .disc
+            .as_ref()
+            .and_then(|d| d.game.as_ref()?.serial.clone());
+        self.show_shelf_art();
+        // The disc goes on screen now; its pictures follow when they
+        // arrive, from the cache or the network.
+        let pictures = self.disc.as_ref().and_then(|disc| {
+            let game = disc.game.clone()?;
+            let serial = game.serial.clone()?;
+            Some(Task::perform(
+                blocking(move || artwork::for_game(&game)),
+                move |pictures| Message::Pictures(serial.clone(), pictures),
+            ))
+        });
+        let top = self.scroll_to_top();
+        Task::batch([top].into_iter().chain(pictures).chain(audio_tasks))
     }
 
     /// How the disc in the drive would be played: from its kept copy if
@@ -679,27 +714,36 @@ impl Spectra {
     /// What can be done now, for the line under a game.
     fn ready_note(&self) -> String {
         if !self.shelf.is_empty() {
-            return "✕ or Enter to play".into();
+            return if self.disc_in_drive() {
+                "✕ or Enter to play  ·  ○ or Backspace for the disc in the drive".into()
+            } else {
+                "✕ or Enter to play".into()
+            };
         }
         let Some(disc) = &self.disc else {
             return String::new();
         };
-        if let Some(game) = &disc.game
+        let mut note: String = if let Some(game) = &disc.game
             && self.launch.is_none()
         {
             // An emulator that only plays copies.
-            return match (game::find(game.system), library::id(&disc.report)) {
+            match (game::find(game.system), library::id(&disc.report)) {
                 (Some(_), Some(_)) => "△ or C to keep a copy, then play it from the copy".into(),
                 _ => "No emulator for this console is installed".into(),
-            };
-        }
-        match library::id(&disc.report) {
-            Some(id) if library::find(&id).is_some() => {
-                "✕ or Enter to play  ·  Kept: plays without the disc".into()
             }
-            Some(_) => "✕ or Enter to play  ·  △ or C to keep a copy".into(),
-            None => "✕ or Enter to play".into(),
+        } else {
+            match library::id(&disc.report) {
+                Some(id) if library::find(&id).is_some() => {
+                    "✕ or Enter to play  ·  Kept: plays without the disc".into()
+                }
+                Some(_) => "✕ or Enter to play  ·  △ or C to keep a copy".into(),
+                None => "✕ or Enter to play".into(),
+            }
+        };
+        if self.kept {
+            note.push_str("  ·  L or View for your discs");
         }
+        note
     }
 
     /// Play the kept copy in focus on the shelf.
@@ -753,15 +797,67 @@ impl Spectra {
         self.scroll_to_top()
     }
 
+    /// A disc is in the drive, read or not, for the library to go back to.
+    fn disc_in_drive(&self) -> bool {
+        matches!(
+            self.drive_state,
+            Some(DriveState::Disc { .. } | DriveState::Unreadable(_))
+        )
+    }
+
+    /// The library button: from the disc to the shelf, from a kept album
+    /// back to the shelf, and from the shelf back to the disc.
+    fn toggle_library(&mut self) -> Task<Message> {
+        if self.opened {
+            self.back_to_shelf()
+        } else if !self.shelf.is_empty() {
+            if self.disc_in_drive() {
+                self.return_to_drive()
+            } else {
+                Task::none()
+            }
+        } else {
+            self.open_library()
+        }
+    }
+
+    /// The shelf of kept copies, over the disc in the drive. The disc stays
+    /// in, and Back returns to it.
+    fn open_library(&mut self) -> Task<Message> {
+        let Some(album) = self.shelf_album() else {
+            self.album.note = Some("Nothing kept yet  ·  △ or C keeps a copy of a disc".into());
+            return Task::none();
+        };
+        // The shelf has the screen, and its own sound: the disc goes quiet.
+        self.player = None;
+        self.serial = None;
+        self.disc_id = None;
+        self.show(album);
+        self.show_shelf_art();
+        self.scroll_to_top()
+    }
+
+    /// Put the disc in the drive back on the screen, as it is now.
+    fn return_to_drive(&mut self) -> Task<Message> {
+        let Some(state) = self.drive_state.clone() else {
+            return Task::none();
+        };
+        self.show_drive(state)
+    }
+
     /// The shelf of kept copies, if there are any.
     fn shelf_album(&mut self) -> Option<Album> {
         let entries = library::list();
         if entries.is_empty() {
             return None;
         }
-        let album = Album::shelf(&entries);
+        let mut album = Album::shelf(&entries);
         self.shelf = entries;
         self.shelf_art = None;
+        if self.disc_in_drive() {
+            album.artist = "Play one you've kept".into();
+        }
+        album.note = Some(self.ready_note());
         Some(album)
     }
 
@@ -1162,8 +1258,13 @@ impl Spectra {
         if scale.gap < 20.0 || !self.album.playable || self.album.tracks.is_empty() {
             return space().into();
         }
+        let hints = if self.kept && !self.opened {
+            "↑↓ Choose    ✕ Play    L1 R1 Skip    Start Pause    ○ Stop    View Your discs"
+        } else {
+            "↑↓ Choose    ✕ Play    L1 R1 Skip    Start Pause    ○ Stop"
+        };
         container(
-            text("↑↓ Choose    ✕ Play    L1 R1 Skip    Start Pause    ○ Stop")
+            text(hints)
                 .font(FONT)
                 .size(13)
                 .color(Color::from_rgba(1.0, 1.0, 1.0, 0.4)),
@@ -1272,6 +1373,7 @@ fn key(event: keyboard::Event) -> Option<Remote> {
         Key::Named(Named::Backspace) => Some(Remote::Back),
         Key::Named(Named::Escape) => Some(Remote::Quit),
         Key::Character("c") => Some(Remote::Keep),
+        Key::Character("l") => Some(Remote::Library),
         _ => None,
     }
 }
