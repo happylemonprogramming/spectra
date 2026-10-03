@@ -30,6 +30,7 @@ pub fn subscription() -> Subscription<Remote> {
                             Button::DPadDown => Some(Remote::Down),
                             Button::South => Some(Remote::Select),
                             Button::East => Some(Remote::Back),
+                            Button::North => Some(Remote::Keep),
                             Button::Start => Some(Remote::PlayPause),
                             Button::LeftTrigger => Some(Remote::Previous),
                             Button::RightTrigger => Some(Remote::Next),

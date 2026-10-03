@@ -37,7 +37,12 @@ use iced::{
 use album::Album;
 use art::Art;
 use motion::Motion;
-use spectra_core::DiscKind;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use iced::futures::SinkExt;
+use spectra_core::drive::Drive;
+use spectra_core::{DiscKind, GameIdentity, Report, library};
 use watch::DriveState;
 
 const FONT: Font = Font::with_name("Adwaita Sans");
@@ -63,6 +68,8 @@ pub enum Remote {
     Previous,
     Next,
     Back,
+    /// Keep a copy of the disc, to play without it.
+    Keep,
     Quit,
 }
 
@@ -79,6 +86,7 @@ enum Message {
     GameOver(Option<String>),
     /// Pictures for the game with this serial arrived.
     Pictures(String, artwork::Pictures),
+    Keeping(Keeping),
 }
 
 /// How the screen is arranged, from the most room to the least.
@@ -177,11 +185,37 @@ struct Spectra {
     in_game: bool,
     /// The serial of the game disc on screen, which its pictures are for.
     serial: Option<String>,
+    disc: Option<Inserted>,
+    copying: Option<Copying>,
+    /// The kept copies on screen, row for row, when there is no disc.
+    shelf: Vec<library::Entry>,
+    /// The row whose copy the disc on screen is wearing.
+    shelf_art: Option<usize>,
 }
 
 struct Launch {
     emulator: game::Emulator,
-    uri: String,
+    /// What the emulator opens: the drive, or a kept copy's cue sheet.
+    content: String,
+}
+
+/// The game disc in the drive.
+struct Inserted {
+    report: Box<Report>,
+    drive: PathBuf,
+    game: GameIdentity,
+}
+
+/// A copy of the disc being kept.
+struct Copying {
+    cancel: Arc<AtomicBool>,
+    started: Instant,
+}
+
+#[derive(Debug, Clone)]
+enum Keeping {
+    Progress(u32, u32),
+    Done(Result<Box<library::Entry>, String>),
 }
 
 struct Options {
@@ -230,6 +264,10 @@ impl Spectra {
             launch: None,
             in_game: false,
             serial: None,
+            disc: None,
+            copying: None,
+            shelf: Vec::new(),
+            shelf_art: None,
         };
         app.rewind();
         if options.play {
@@ -305,26 +343,39 @@ impl Spectra {
             }
             Message::Drive(state) => {
                 let mut album = Album::from_drive(&state);
-                let game = match &state {
+                let idle = matches!(state, DriveState::NoDrive | DriveState::Empty);
+                self.disc = match state {
                     DriveState::Disc { report, drive } => match &report.kind {
-                        DiscKind::Game(game) => Some((game.clone(), drive)),
+                        DiscKind::Game(game) => Some(Inserted {
+                            game: game.clone(),
+                            report,
+                            drive,
+                        }),
                         _ => None,
                     },
                     _ => None,
                 };
-                self.launch = game
-                    .as_ref()
-                    .and_then(|(game, drive)| game::find(game.system).zip(game::cdrom_uri(drive)))
-                    .map(|(emulator, uri)| Launch { emulator, uri });
+                self.shelf.clear();
+                self.shelf_art = None;
+                if idle {
+                    let entries = library::list();
+                    if !entries.is_empty() {
+                        album = Album::shelf(&entries);
+                        self.shelf = entries;
+                    }
+                }
+                self.launch = self.disc_launch();
                 if self.launch.is_some() {
-                    album.note = Some("✕ or Enter to play".into());
+                    album.note = Some(self.ready_note());
                 }
                 self.show(album);
-                self.serial = game.as_ref().and_then(|(game, _)| game.serial.clone());
+                self.serial = self.disc.as_ref().and_then(|d| d.game.serial.clone());
+                self.show_shelf_art();
                 // The disc goes on screen now; its pictures follow when they
                 // arrive, from the cache or the network.
-                let pictures = game.and_then(|(game, _)| {
-                    let serial = game.serial.clone()?;
+                let pictures = self.disc.as_ref().and_then(|disc| {
+                    let serial = disc.game.serial.clone()?;
+                    let game = disc.game.clone();
                     Some(Task::perform(
                         blocking(move || artwork::for_game(&game)),
                         move |pictures| Message::Pictures(serial.clone(), pictures),
@@ -338,6 +389,43 @@ impl Spectra {
                     },
                 );
                 Task::batch([top].into_iter().chain(pictures))
+            }
+            Message::Keeping(Keeping::Progress(done, total)) => {
+                if let Some(copying) = &self.copying {
+                    let fraction = f64::from(done) / f64::from(total.max(1));
+                    let elapsed = copying.started.elapsed().as_secs_f64();
+                    let left = (fraction > 0.02).then(|| elapsed / fraction - elapsed);
+                    let mut note = format!("Keeping a copy  ·  {:.0}%", fraction * 100.0);
+                    if let Some(left) = left {
+                        note.push_str(&match (left / 60.0).round() as u32 {
+                            0 => "  ·  under a minute left".into(),
+                            1 => "  ·  about a minute left".into(),
+                            m => format!("  ·  about {m} minutes left"),
+                        });
+                    }
+                    note.push_str("  ·  ○ or Backspace to stop");
+                    self.album.note = Some(note);
+                }
+                Task::none()
+            }
+            Message::Keeping(Keeping::Done(result)) => {
+                let cancelled = self
+                    .copying
+                    .take()
+                    .is_some_and(|c| c.cancel.load(Ordering::Relaxed));
+                self.motion.set_spinning(false);
+                self.launch = self.disc_launch();
+                let ready = self.ready_note();
+                self.album.note = Some(match result {
+                    Ok(entry) if entry.meta.unreadable > 0 => format!(
+                        "Kept, but {} sectors could not be read  ·  {ready}",
+                        entry.meta.unreadable
+                    ),
+                    Ok(_) => ready,
+                    Err(_) if cancelled => format!("Stopped keeping a copy  ·  {ready}"),
+                    Err(e) => format!("Couldn't keep a copy: {e}"),
+                });
+                Task::none()
             }
             Message::Pictures(serial, pictures) => {
                 // Only if that disc is still the one on screen.
@@ -356,10 +444,16 @@ impl Spectra {
             Message::GameOver(trouble) => {
                 self.in_game = false;
                 self.motion.set_spinning(false);
-                self.album.note = Some(trouble.map_or("✕ or Enter to play".into(), |why| {
+                let ready = self.ready_note();
+                self.album.note = Some(trouble.map_or(ready, |why| {
                     format!("{why} - see ~/.cache/spectra/game.log")
                 }));
                 Task::none()
+            }
+            Message::Pick(track) if !self.shelf.is_empty() && !self.in_game => {
+                self.focus = track;
+                self.show_shelf_art();
+                self.play_kept()
             }
             Message::Pick(track) => {
                 self.focus = track;
@@ -369,6 +463,22 @@ impl Spectra {
             // Gamepads reach every program at once: while a game runs, the
             // buttons are the game's.
             Message::Remote(_) if self.in_game => Task::none(),
+            // The drive is busy copying: a game would only fight it for reads.
+            Message::Remote(Remote::Back) if self.copying.is_some() => {
+                if let Some(copying) = &self.copying {
+                    copying.cancel.store(true, Ordering::Relaxed);
+                }
+                Task::none()
+            }
+            Message::Remote(Remote::Select | Remote::PlayPause | Remote::Keep)
+                if self.copying.is_some() =>
+            {
+                Task::none()
+            }
+            Message::Remote(Remote::Keep) => self.keep_copy(),
+            Message::Remote(Remote::Select | Remote::PlayPause) if !self.shelf.is_empty() => {
+                self.play_kept()
+            }
             Message::Remote(Remote::Select | Remote::PlayPause) if self.launch.is_some() => {
                 self.start_game()
             }
@@ -406,18 +516,140 @@ impl Spectra {
                         self.playing = None;
                         self.motion.set_spinning(false);
                     }
+                    Remote::Keep => {}
                     Remote::Quit => return iced::exit(),
                 }
+                self.show_shelf_art();
                 self.reveal_focus()
             }
         }
+    }
+
+    /// How the disc in the drive would be played: from its kept copy if
+    /// there is one, which is quicker and quieter, or else from the drive.
+    fn disc_launch(&self) -> Option<Launch> {
+        let disc = self.disc.as_ref()?;
+        let emulator = game::find(disc.game.system)?;
+        let kept = library::id(&disc.report)
+            .and_then(|id| library::find(&id))
+            .map(|entry| entry.cue().to_string_lossy().into_owned());
+        let content = kept.or_else(|| game::cdrom_uri(&disc.drive))?;
+        Some(Launch { emulator, content })
+    }
+
+    /// What can be done now, for the line under a game.
+    fn ready_note(&self) -> String {
+        if !self.shelf.is_empty() {
+            return "✕ or Enter to play".into();
+        }
+        let Some(disc) = &self.disc else {
+            return String::new();
+        };
+        if self.launch.is_none() {
+            return "No emulator for this console is installed".into();
+        }
+        match library::id(&disc.report) {
+            Some(id) if library::find(&id).is_some() => {
+                "✕ or Enter to play  ·  Kept: plays without the disc".into()
+            }
+            Some(_) => "✕ or Enter to play  ·  △ or C to keep a copy".into(),
+            None => "✕ or Enter to play".into(),
+        }
+    }
+
+    /// Play the kept copy in focus on the shelf.
+    fn play_kept(&mut self) -> Task<Message> {
+        let Some(entry) = self.shelf.get(self.focus) else {
+            return Task::none();
+        };
+        self.launch = entry
+            .meta
+            .system
+            .and_then(game::find)
+            .map(|emulator| Launch {
+                emulator,
+                content: entry.cue().to_string_lossy().into_owned(),
+            });
+        if self.launch.is_none() {
+            self.album.note = Some("No emulator for this console is installed".into());
+        }
+        self.start_game()
+    }
+
+    /// On the shelf, the disc on screen is the copy in focus.
+    fn show_shelf_art(&mut self) {
+        let Some(entry) = self.shelf.get(self.focus) else {
+            return;
+        };
+        if self.shelf_art == Some(self.focus) {
+            return;
+        }
+        self.shelf_art = Some(self.focus);
+        let pictures = artwork::for_copy(entry);
+        if let Some(cover) = pictures.cover.or_else(|| pictures.face.clone()) {
+            self.album.cover = cover;
+        }
+        self.album.face = pictures.face;
+        self.art = Art::new(&self.album.cover, self.album.face.as_ref());
+        platform::release_memory();
+    }
+
+    fn keep_copy(&mut self) -> Task<Message> {
+        let Some(disc) = &self.disc else {
+            return Task::none();
+        };
+        let Some(id) = library::id(&disc.report) else {
+            return Task::none();
+        };
+        if library::find(&id).is_some() {
+            return Task::none();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.copying = Some(Copying {
+            cancel: cancel.clone(),
+            started: Instant::now(),
+        });
+        self.motion.set_spinning(true);
+        self.album.note = Some("Keeping a copy  ·  ○ or Backspace to stop".into());
+        let (report, drive, game) = (disc.report.clone(), disc.drive.clone(), disc.game.clone());
+        Task::run(
+            iced::stream::channel(4, async move |mut output| {
+                let (tx, mut rx) = iced::futures::channel::mpsc::unbounded();
+                std::thread::spawn(move || {
+                    let mut last = u64::MAX;
+                    let result = Drive::open(&drive).and_then(|drive| {
+                        library::keep(&drive, &report, &cancel, |p| {
+                            // A message per percent, not per read.
+                            let percent = u64::from(p.done) * 100 / u64::from(p.total.max(1));
+                            if percent != last {
+                                last = percent;
+                                let _ = tx.unbounded_send(Keeping::Progress(p.done, p.total));
+                            }
+                        })
+                    });
+                    if let Ok(entry) = &result {
+                        artwork::store(&entry.dir, &game);
+                    }
+                    let _ = tx.unbounded_send(Keeping::Done(
+                        result.map(Box::new).map_err(|e| e.to_string()),
+                    ));
+                });
+                use iced::futures::StreamExt;
+                while let Some(event) = rx.next().await {
+                    if output.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            }),
+            Message::Keeping,
+        )
     }
 
     fn start_game(&mut self) -> Task<Message> {
         let Some(launch) = &self.launch else {
             return Task::none();
         };
-        let mut child = match launch.emulator.launch(&launch.uri) {
+        let mut child = match launch.emulator.launch(&launch.content) {
             Ok(child) => child,
             Err(e) => {
                 self.album.note = Some(format!("Couldn't start RetroArch: {e}"));
@@ -645,10 +877,12 @@ impl Spectra {
                 )
                 .width(Fill)
                 .clip(true),
-                text(format!("{}:{:02}", track.seconds / 60, track.seconds % 60))
-                    .font(FONT)
-                    .size(scale.track - 3.0)
-                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5)),
+                text(track.detail.clone().unwrap_or_else(|| {
+                    format!("{}:{:02}", track.seconds / 60, track.seconds % 60)
+                }))
+                .font(FONT)
+                .size(scale.track - 3.0)
+                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5)),
             ]
             .spacing(8)
             .align_y(Vertical::Center);
@@ -807,6 +1041,7 @@ fn key(event: keyboard::Event) -> Option<Remote> {
         Key::Named(Named::Space) => Some(Remote::PlayPause),
         Key::Named(Named::Backspace) => Some(Remote::Back),
         Key::Named(Named::Escape) => Some(Remote::Quit),
+        Key::Character("c") => Some(Remote::Keep),
         _ => None,
     }
 }

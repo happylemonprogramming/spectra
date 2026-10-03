@@ -12,7 +12,8 @@ use std::path::Path;
 
 use image::RgbaImage;
 use serde::Deserialize;
-use spectra_core::{DiscKind, Report};
+use spectra_core::library::Entry;
+use spectra_core::{DiscKind, GameSystem, Report};
 
 use crate::watch::DriveState;
 
@@ -38,6 +39,8 @@ pub struct Album {
 pub struct Track {
     pub title: String,
     pub seconds: u32,
+    /// Said at the end of the row instead of the track's length.
+    pub detail: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -70,7 +73,11 @@ impl Album {
             tracks: file
                 .tracks
                 .into_iter()
-                .map(|(title, seconds)| Track { title, seconds })
+                .map(|(title, seconds)| Track {
+                    title,
+                    seconds,
+                    detail: None,
+                })
                 .collect(),
             cover,
             face: None,
@@ -93,6 +100,25 @@ impl Album {
             note: None,
             playable: false,
         }
+    }
+
+    /// The discs kept as copies, to pick one and play it.
+    pub fn shelf(entries: &[Entry]) -> Self {
+        let mut album = Self::message("Your discs", "Insert a disc, or play one you've kept");
+        album.details = Some(match entries.len() {
+            1 => "1 copy".into(),
+            n => format!("{n} copies"),
+        });
+        album.note = Some("✕ or Enter to play".into());
+        album.tracks = entries
+            .iter()
+            .map(|e| Track {
+                title: e.meta.title.clone(),
+                seconds: 0,
+                detail: Some(e.meta.system.map_or("Disc", GameSystem::name).to_string()),
+            })
+            .collect();
+        album
     }
 
     pub fn no_disc() -> Self {
@@ -205,6 +231,7 @@ fn cd_tracks(toc: &spectra_core::Toc) -> Vec<Track> {
         .map(|(track, end)| Track {
             title: format!("Track {}", track.number),
             seconds: end.saturating_sub(track.lba) / FRAMES_PER_SECOND,
+            detail: None,
         })
         .collect()
 }

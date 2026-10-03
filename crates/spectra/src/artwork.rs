@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use image::RgbaImage;
+use spectra_core::library::Entry;
 use spectra_core::{GameIdentity, GameSystem};
 
 const COVERS_PS1: &str =
@@ -51,6 +52,47 @@ pub fn for_game(game: &GameIdentity) -> Pictures {
         face: face.and_then(|path| decode(&path)),
     }
 }
+
+/// Keep a game's pictures with its copy in the library, so the copy keeps
+/// its face if the cache is cleared.
+pub fn store(dir: &Path, game: &GameIdentity) {
+    let Some(cache) = cache_dir() else { return };
+    if let Some((name, _)) = cover_url(game) {
+        let _ = std::fs::copy(cache.join(name), dir.join(COVER));
+    }
+    if let Some(file) = game.disc_art.as_deref().filter(|f| is_file_name(f)) {
+        let _ = std::fs::copy(cache.join(format!("disc-{file}")), dir.join(FACE));
+    }
+}
+
+/// The pictures kept with a copy, or failing that - a copy made from the
+/// command line - whatever the cache has for its game. Never the network:
+/// this runs as the shelf is browsed.
+pub fn for_copy(entry: &Entry) -> Pictures {
+    let mut game = GameIdentity::new(entry.meta.system.unwrap_or(GameSystem::Ps1));
+    game.serial = entry.meta.serial.clone();
+    game.disc_art = entry.meta.disc_art.clone();
+    let cache = cache_dir();
+    let cached = |name: Option<String>| cache.as_ref().zip(name).map(|(dir, n)| dir.join(n));
+    let cover_name = entry
+        .meta
+        .system
+        .and(cover_url(&game))
+        .map(|(name, _)| name);
+    let face_name = game
+        .disc_art
+        .as_deref()
+        .filter(|f| is_file_name(f))
+        .map(|f| format!("disc-{f}"));
+    Pictures {
+        cover: decode(&entry.dir.join(COVER))
+            .or_else(|| cached(cover_name).and_then(|p| decode(&p))),
+        face: decode(&entry.dir.join(FACE)).or_else(|| cached(face_name).and_then(|p| decode(&p))),
+    }
+}
+
+const COVER: &str = "cover.jpg";
+const FACE: &str = "face.png";
 
 fn cover_url(game: &GameIdentity) -> Option<(String, String)> {
     let (system, base) = match game.system {
@@ -124,8 +166,14 @@ fn fetch(dir: &Path, name: &str, url: &str) -> Option<PathBuf> {
     }
 }
 
+/// By what the file holds rather than its name: a scan kept as `face.png`
+/// may be a JPEG.
 fn decode(path: &Path) -> Option<RgbaImage> {
-    image::open(path).ok().map(|image| image.to_rgba8())
+    let reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    reader.decode().ok().map(|image| image.to_rgba8())
 }
 
 fn cache_dir() -> Option<PathBuf> {
