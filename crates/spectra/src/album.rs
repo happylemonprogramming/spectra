@@ -12,8 +12,8 @@ use std::path::Path;
 
 use image::RgbaImage;
 use serde::Deserialize;
-use spectra_core::library::Entry;
-use spectra_core::{DiscKind, GameSystem, Report};
+use spectra_core::library::{Entry, Names};
+use spectra_core::{DiscKind, GameSystem, Report, Toc};
 
 use crate::watch::DriveState;
 
@@ -113,12 +113,54 @@ impl Album {
         album.tracks = entries
             .iter()
             .map(|e| Track {
-                title: e.meta.title.clone(),
+                title: match (&e.meta.artist, e.is_album()) {
+                    (Some(artist), true) => format!("{}  ·  {artist}", e.meta.title),
+                    _ => e.meta.title.clone(),
+                },
                 seconds: 0,
-                detail: Some(e.meta.system.map_or("Disc", GameSystem::name).to_string()),
+                detail: Some(
+                    if e.is_album() {
+                        "Music"
+                    } else {
+                        e.meta.system.map_or("Disc", GameSystem::name)
+                    }
+                    .to_string(),
+                ),
             })
             .collect();
         album
+    }
+
+    /// A kept audio CD, timed by its copy's table of contents.
+    pub fn from_copy(entry: &Entry, toc: &Toc) -> Self {
+        let mut album = Self::message("Audio CD", "Unknown artist");
+        album.tracks = cd_tracks(toc);
+        album.playable = !album.tracks.is_empty();
+        album.name(&Names {
+            title: entry.meta.title.clone(),
+            artist: entry.meta.artist.clone().unwrap_or(album.artist.clone()),
+            year: entry.meta.year.clone(),
+            tracks: entry.meta.tracks.clone(),
+        });
+        album
+    }
+
+    /// Call an audio CD by its names, from MusicBrainz or a copy. The names
+    /// are only the audio tracks'; the TOC already timed them.
+    pub fn name(&mut self, names: &Names) {
+        self.title.clone_from(&names.title);
+        self.artist.clone_from(&names.artist);
+        self.year = names
+            .year
+            .as_deref()
+            .and_then(|d| d.get(..4))
+            .and_then(|y| y.parse().ok());
+        for (track, named) in self.tracks.iter_mut().zip(&names.tracks) {
+            track.title = match &named.artist {
+                Some(artist) => format!("{}  ·  {artist}", named.title),
+                None => named.title.clone(),
+            };
+        }
     }
 
     pub fn no_disc() -> Self {

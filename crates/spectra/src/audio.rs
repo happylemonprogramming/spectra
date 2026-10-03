@@ -11,10 +11,12 @@
 //! playing follows from how far the sound card has got.
 //!
 //! The player lives on a thread of its own, which owns the sound card's
-//! stream (it may not leave the thread that made it) and the drive. A kept
-//! game's soundtrack, read from its copy, is the next source to add.
+//! stream (it may not leave the thread that made it) and what it reads from:
+//! the drive, or a kept copy's `.bin`, which holds the same raw sectors.
 
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -26,6 +28,7 @@ use iced::futures::channel::mpsc::UnboundedSender;
 use spectra_core::drive::Drive;
 
 const RATE: u32 = 44_100;
+const RAW_SECTOR: usize = spectra_core::disc::RAW_SECTOR;
 /// Stereo frames in a sector.
 const FRAMES_PER_SECTOR: u64 = 588;
 const SECTORS_PER_SECOND: u32 = 75;
@@ -33,6 +36,56 @@ const SECTORS_PER_SECOND: u32 = 75;
 const READ: u32 = 27;
 /// Samples kept queued: two seconds.
 const AHEAD: usize = 2 * RATE as usize * 2;
+
+/// Where the sound comes from.
+#[derive(Debug, Clone)]
+pub enum Source {
+    /// The disc in this drive.
+    Drive(PathBuf),
+    /// A copy: every sector raw, sector N at N × 2352 bytes.
+    Image(PathBuf),
+}
+
+/// A source, opened.
+enum Reader {
+    Drive(Drive),
+    Image(File),
+}
+
+impl Reader {
+    fn open(source: &Source) -> Result<Self, String> {
+        match source {
+            Source::Drive(path) => Drive::open(path).map(Self::Drive),
+            Source::Image(path) => File::open(path).map(Self::Image).map_err(Into::into),
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    /// Raw audio sectors, giving a drive a couple more tries: a read that
+    /// fails once often goes through when asked again.
+    fn read(&mut self, lba: u32, count: u32) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Drive(drive) => {
+                let mut last = String::new();
+                for _ in 0..3 {
+                    match drive.read_raw(lba, count, true) {
+                        Ok(data) => return Ok(data),
+                        Err(e) if e.medium_not_present() => return Err(e.to_string()),
+                        Err(e) => last = e.to_string(),
+                    }
+                }
+                Err(last)
+            }
+            Self::Image(file) => {
+                let mut data = vec![0; count as usize * RAW_SECTOR];
+                file.seek(SeekFrom::Start(u64::from(lba) * RAW_SECTOR as u64))
+                    .and_then(|_| file.read_exact(&mut data))
+                    .map_err(|e| e.to_string())?;
+                Ok(data)
+            }
+        }
+    }
+}
 
 /// A track, as the sectors it spans: index 1 to the next track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +120,9 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(drive: PathBuf, spans: Vec<Span>, events: UnboundedSender<Event>) -> Self {
+    pub fn new(source: Source, spans: Vec<Span>, events: UnboundedSender<Event>) -> Self {
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || run(drive, spans, rx, events));
+        std::thread::spawn(move || run(source, spans, rx, events));
         Self { commands: tx }
     }
 
@@ -96,20 +149,6 @@ struct Shared {
     queue: Mutex<VecDeque<i16>>,
     /// Frames the sound card has taken since the last Play.
     played: AtomicU64,
-}
-
-/// Read audio sectors, giving a drive a couple more tries: a read that
-/// fails once often goes through when asked again.
-fn read(drive: &Drive, lba: u32, count: u32) -> Result<Vec<u8>, String> {
-    let mut last = String::new();
-    for _ in 0..3 {
-        match drive.read_raw(lba, count, true) {
-            Ok(data) => return Ok(data),
-            Err(e) if e.medium_not_present() => return Err(e.to_string()),
-            Err(e) => last = e.to_string(),
-        }
-    }
-    Err(last)
 }
 
 fn output(shared: Arc<Shared>) -> Result<cpal::Stream, String> {
@@ -164,14 +203,14 @@ fn locate(spans: &[Span], lba: u32) -> Option<(usize, u32)> {
 }
 
 fn run(
-    path: PathBuf,
+    source: Source,
     spans: Vec<Span>,
     commands: mpsc::Receiver<Command>,
     events: UnboundedSender<Event>,
 ) {
     let shared = Arc::new(Shared::default());
     let mut stream: Option<cpal::Stream> = None;
-    let mut drive: Option<Drive> = None;
+    let mut reader: Option<Reader> = None;
     // Where playing started, where the next read goes, and where it stops.
     let mut end = 0;
     let mut origin = 0;
@@ -194,11 +233,11 @@ fn run(
                 let Some(span) = spans.get(track) else {
                     continue;
                 };
-                if drive.is_none() {
-                    match Drive::open(&path) {
-                        Ok(d) => drive = Some(d),
+                if reader.is_none() {
+                    match Reader::open(&source) {
+                        Ok(r) => reader = Some(r),
                         Err(e) => {
-                            fail(e.to_string());
+                            fail(e);
                             continue;
                         }
                     }
@@ -253,7 +292,7 @@ fn run(
         let queued = shared.queue.lock().expect("queue").len();
         if queued < AHEAD && cursor < end {
             let count = READ.min(end - cursor);
-            match read(drive.as_ref().expect("opened at play"), cursor, count) {
+            match reader.as_mut().expect("opened at play").read(cursor, count) {
                 Ok(data) => {
                     let samples = data
                         .as_chunks::<2>()
@@ -320,6 +359,19 @@ mod tests {
         assert_eq!(locate(&spans, 0), Some((0, 0)));
         assert_eq!(locate(&spans, 749), Some((0, 9)));
         assert_eq!(locate(&spans, 900), Some((1, 2)));
+    }
+
+    #[test]
+    fn a_copy_reads_by_sector() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("disc.bin");
+        let sectors: Vec<u8> = (0..4u8).flat_map(|n| [n; RAW_SECTOR]).collect();
+        std::fs::write(&bin, sectors).unwrap();
+        let mut reader = Reader::open(&Source::Image(bin)).unwrap();
+        let data = reader.read(2, 2).unwrap();
+        assert_eq!(data.len(), 2 * RAW_SECTOR);
+        assert_eq!((data[0], data[RAW_SECTOR]), (2, 3));
+        assert!(reader.read(3, 2).is_err(), "read past the end");
     }
 
     #[test]

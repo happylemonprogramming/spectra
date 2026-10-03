@@ -88,7 +88,7 @@ pub fn for_copy(entry: &Entry) -> Pictures {
     }
 }
 
-const COVER: &str = "cover.jpg";
+pub const COVER: &str = "cover.jpg";
 const FACE: &str = "face.png";
 
 fn cover_url(game: &GameIdentity) -> Option<(String, String)> {

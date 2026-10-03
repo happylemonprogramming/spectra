@@ -10,6 +10,9 @@ pub const RAW_SECTOR: usize = 2352;
 /// The two-second gap before track 1. Drives count logical blocks from after
 /// it; the CD standard, and MusicBrainz, count from before it.
 pub const PREGAP: u32 = 150;
+/// Between an enhanced CD's audio session and its data session: 60 seconds of
+/// lead-out plus 90 of lead-in and pre-gap.
+pub const SESSION_GAP: u32 = 11_400;
 
 /// Something a disc can be read from: a drive, or an image of one.
 ///
@@ -98,6 +101,22 @@ impl Toc {
         let last = self.tracks.last()?;
         let first = self.tracks.first()?;
         (last.data && !first.data && self.tracks.len() > 1).then_some(last)
+    }
+
+    /// The disc's first session alone: an enhanced CD without its data
+    /// track, ending where its audio does. Any other disc as it is. None if
+    /// the gap the data track leaves does not add up.
+    pub fn audio_session(&self) -> Option<Toc> {
+        let Some(data) = self.enhanced_data_track() else {
+            return Some(self.clone());
+        };
+        let tracks = self.tracks[..self.tracks.len() - 1].to_vec();
+        Some(Toc {
+            first: self.first,
+            last: tracks.last()?.number,
+            leadout: data.lba.checked_sub(SESSION_GAP)?,
+            tracks,
+        })
     }
 
     /// Sectors per track, index 1 to the next track or the lead-out.

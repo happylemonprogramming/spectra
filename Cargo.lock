@@ -2878,6 +2878,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spectra-core",
+ "tempfile",
 ]
 
 [[package]]

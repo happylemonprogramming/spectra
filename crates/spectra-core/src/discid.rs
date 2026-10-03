@@ -16,10 +16,6 @@ use sha1::{Digest, Sha1};
 
 use crate::disc::{PREGAP, Toc};
 
-/// Between an enhanced CD's audio session and its data session: 60 seconds of
-/// lead-out plus 90 of lead-in and pre-gap.
-const SESSION_GAP: u32 = 11_400;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MusicBrainzId {
     pub disc_id: String,
@@ -33,13 +29,8 @@ pub struct MusicBrainzId {
 /// where the audio session ended, which is how libdiscid - and so every
 /// MusicBrainz submission - computes it.
 pub fn musicbrainz(toc: &Toc) -> Option<MusicBrainzId> {
-    let (tracks, leadout) = match toc.enhanced_data_track() {
-        Some(data) => (
-            &toc.tracks[..toc.tracks.len() - 1],
-            data.lba.checked_sub(SESSION_GAP)?,
-        ),
-        None => (&toc.tracks[..], toc.leadout),
-    };
+    let session = toc.audio_session()?;
+    let (tracks, leadout) = (&session.tracks[..], session.leadout);
     if !tracks.iter().any(|t| !t.data) {
         return None;
     }

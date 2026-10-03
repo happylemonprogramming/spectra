@@ -54,10 +54,12 @@ pub fn copy_cd(
     let total = toc.leadout;
     let mut unreadable = 0;
     let mut modes = Vec::with_capacity(toc.tracks.len());
-    for (track, sectors) in toc.tracks.iter().zip(toc.track_sectors()) {
+    for (i, (track, sectors)) in toc.tracks.iter().zip(toc.track_sectors()).enumerate() {
         let audio = !track.data;
         let end = track.lba + sectors;
-        let mut lba = track.lba;
+        // From sector 0, so sector N is always at N × 2352 in the copy: some
+        // CDs start their first track a little way in, after a gap.
+        let mut lba = if i == 0 { 0 } else { track.lba };
         let mut mode = None;
         while lba < end {
             if cancel.load(Ordering::Relaxed) {
@@ -273,6 +275,33 @@ mod tests {
         // Sector 7's user data, through the image's mode 2 reader.
         assert_eq!(disc.read(7, 1).unwrap()[..4], 7u32.to_be_bytes()[..]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_late_first_track_keeps_its_gap() {
+        let toc = Toc {
+            first: 1,
+            last: 1,
+            tracks: vec![Track {
+                number: 1,
+                lba: 32,
+                data: false,
+            }],
+            leadout: 100,
+        };
+        let mut out = Vec::new();
+        let copied = copy_cd(
+            &toc,
+            |lba, count, audio| Ok(fake(lba, count, audio)),
+            &mut out,
+            "disc.bin",
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(out.len(), 100 * RAW_SECTOR);
+        assert_eq!(out[32 * RAW_SECTOR..][..4], 32u32.to_le_bytes());
+        assert!(copied.cue.contains("INDEX 01 00:00:32"));
     }
 
     #[test]

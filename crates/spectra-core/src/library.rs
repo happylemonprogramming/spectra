@@ -1,13 +1,17 @@
 //! Discs kept as copies, to play without the disc.
 //!
 //! Each copy is a folder under `~/.local/share/spectra/library`, named by the
-//! disc's own ID - a game's serial:
+//! disc's own ID - a game's serial, or `cd-` and an audio CD's MusicBrainz
+//! disc ID:
 //!
 //! ```text
 //! SLUS-00152/disc.bin    every sector, raw
 //! SLUS-00152/disc.cue    where the tracks start; what an emulator opens
 //! SLUS-00152/meta.json   what the disc is, written last
 //! ```
+//!
+//! An audio CD's copy is the same raw audio the disc holds, nothing lost; an
+//! enhanced CD's is its music alone, without the data session after it.
 //!
 //! A copy is made in a folder with `.part` on the end and renamed when it is
 //! whole, so a folder without it is always a finished copy; an unfinished one
@@ -23,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::copy::{self, Progress};
 use crate::disc::RAW_SECTOR;
+use crate::disc::Toc;
 use crate::drive::Drive;
 use crate::{DiscKind, Error, GameSystem, Report, Result};
 
@@ -40,11 +45,33 @@ pub struct Meta {
     pub year: Option<String>,
     pub region: Option<String>,
     pub disc_art: Option<String>,
+    /// An album's artist.
+    #[serde(default)]
+    pub artist: Option<String>,
+    /// An album's track names, in track-list order.
+    #[serde(default)]
+    pub tracks: Vec<TrackName>,
     pub sectors: u32,
     /// Sectors the drive could not read, kept as zeros.
     pub unreadable: u32,
     /// Seconds since 1970.
     pub created: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackName {
+    pub title: String,
+    /// Only where it differs from the album's: a compilation's.
+    pub artist: Option<String>,
+}
+
+/// What an audio CD is called, as found elsewhere: the disc does not say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Names {
+    pub title: String,
+    pub artist: String,
+    pub year: Option<String>,
+    pub tracks: Vec<TrackName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +84,24 @@ impl Entry {
     pub fn cue(&self) -> PathBuf {
         self.dir.join(CUE)
     }
+
+    pub fn bin(&self) -> PathBuf {
+        self.dir.join(BIN)
+    }
+
+    /// The copy's table of contents, from its cue sheet.
+    pub fn toc(&self) -> Option<Toc> {
+        crate::image::open(&self.cue()).ok()?.toc().ok()?
+    }
+
+    /// Music, rather than a game.
+    pub fn is_album(&self) -> bool {
+        self.meta.system.is_none() && self.meta.id.starts_with(CD)
+    }
 }
+
+/// What an audio CD's ID starts with.
+const CD: &str = "cd-";
 
 /// Where copies are kept: `$XDG_DATA_HOME/spectra/library`.
 pub fn root() -> Option<PathBuf> {
@@ -67,19 +111,42 @@ pub fn root() -> Option<PathBuf> {
     Some(data.join("spectra/library"))
 }
 
-/// The ID a copy is kept under, if this disc can be kept: for now, CD games
-/// with a serial.
+/// The ID a copy is kept under, if this disc can be kept: CD games with a
+/// serial, and audio CDs.
 pub fn id(report: &Report) -> Option<String> {
-    let DiscKind::Game(game) = &report.kind else {
-        return None;
-    };
     report.toc.as_ref()?;
-    let serial = game.serial.as_deref()?;
-    let plain = !serial.is_empty()
-        && serial
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    plain.then(|| serial.to_string())
+    match &report.kind {
+        DiscKind::Game(game) => {
+            let serial = game.serial.as_deref()?;
+            let plain = !serial.is_empty()
+                && serial
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            plain.then(|| serial.to_string())
+        }
+        // Base64 with `.`, `_` and `-`: nothing that leaves a directory.
+        DiscKind::Audio {
+            musicbrainz: Some(mb),
+            ..
+        } => {
+            let plain = !mb.disc_id.is_empty()
+                && mb
+                    .disc_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+            plain.then(|| format!("{CD}{}", mb.disc_id))
+        }
+        _ => None,
+    }
+}
+
+/// The part of the disc a copy holds.
+fn to_copy(report: &Report) -> Option<Toc> {
+    let toc = report.toc.as_ref()?;
+    match report.kind {
+        DiscKind::Audio { .. } => toc.audio_session(),
+        _ => Some(toc.clone()),
+    }
 }
 
 /// Every finished copy, newest first.
@@ -108,10 +175,12 @@ pub fn find(id: &str) -> Option<Entry> {
     list().into_iter().find(|e| e.meta.id == id)
 }
 
-/// Copy the disc in `drive` into the library, as `report` describes it.
+/// Copy the disc in `drive` into the library, as `report` describes it, and
+/// an audio CD by `names` where they are known.
 pub fn keep(
     drive: &Drive,
     report: &Report,
+    names: Option<&Names>,
     cancel: &AtomicBool,
     progress: impl FnMut(Progress),
 ) -> Result<Entry> {
@@ -119,6 +188,7 @@ pub fn keep(
     keep_in(
         &root,
         report,
+        names,
         |lba, count, audio| drive.read_raw(lba, count, audio),
         cancel,
         progress,
@@ -128,12 +198,14 @@ pub fn keep(
 pub fn keep_in(
     root: &Path,
     report: &Report,
+    names: Option<&Names>,
     read: impl FnMut(u32, u32, bool) -> Result<Vec<u8>>,
     cancel: &AtomicBool,
     progress: impl FnMut(Progress),
 ) -> Result<Entry> {
     let id = id(report).ok_or_else(|| Error::Unsupported("keeping a copy of this disc".into()))?;
-    let toc = report.toc.as_ref().expect("id() checked for a TOC");
+    let toc =
+        &to_copy(report).ok_or_else(|| Error::Unsupported("keeping a copy of this disc".into()))?;
     let needed = u64::from(toc.leadout) * RAW_SECTOR as u64;
     std::fs::create_dir_all(root)?;
     if let Some(free) = free_space(root)
@@ -160,16 +232,24 @@ pub fn keep_in(
         };
         let meta = Meta {
             id: id.clone(),
-            title: game
-                .and_then(|g| g.title.clone())
+            title: names
+                .map(|n| n.title.clone())
+                .or_else(|| game.and_then(|g| g.title.clone()))
                 .or_else(|| report.label.clone())
-                .unwrap_or_else(|| id.clone()),
+                .unwrap_or_else(|| match game {
+                    Some(_) => id.clone(),
+                    None => "Audio CD".into(),
+                }),
             system: game.map(|g| g.system),
             serial: game.and_then(|g| g.serial.clone()),
             publisher: game.and_then(|g| g.publisher.clone()),
-            year: game.and_then(|g| g.year.clone()),
+            year: names
+                .and_then(|n| n.year.clone())
+                .or_else(|| game.and_then(|g| g.year.clone())),
             region: game.and_then(|g| g.region.clone()),
             disc_art: game.and_then(|g| g.disc_art.clone()),
+            artist: names.map(|n| n.artist.clone()),
+            tracks: names.map(|n| n.tracks.clone()).unwrap_or_default(),
             sectors: copied.sectors,
             unreadable: copied.unreadable,
             created: SystemTime::now()
@@ -260,6 +340,7 @@ mod tests {
         let entry = keep_in(
             root.path(),
             &report(),
+            None,
             sectors,
             &AtomicBool::new(false),
             |_| {},
@@ -286,6 +367,7 @@ mod tests {
         let result = keep_in(
             root.path(),
             &report(),
+            None,
             sectors,
             &AtomicBool::new(true),
             |_| {},
@@ -305,5 +387,83 @@ mod tests {
         assert_eq!(id(&r), None);
         r.kind = DiscKind::Data;
         assert_eq!(id(&r), None);
+    }
+
+    fn album() -> Report {
+        // Two songs, then an enhanced CD's data session.
+        let toc = Toc {
+            first: 1,
+            last: 3,
+            tracks: vec![
+                Track {
+                    number: 1,
+                    lba: 0,
+                    data: false,
+                },
+                Track {
+                    number: 2,
+                    lba: 100,
+                    data: false,
+                },
+                Track {
+                    number: 3,
+                    lba: 300 + crate::disc::SESSION_GAP,
+                    data: true,
+                },
+            ],
+            leadout: 20_000,
+        };
+        Report {
+            source: "test".into(),
+            media: Media::Cd,
+            kind: DiscKind::Audio {
+                tracks: 2,
+                enhanced: true,
+                musicbrainz: crate::discid::musicbrainz(&toc),
+            },
+            label: None,
+            sectors: None,
+            toc: Some(toc),
+        }
+    }
+
+    #[test]
+    fn an_audio_cd_is_kept_as_its_music_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let names = Names {
+            title: "Blue".into(),
+            artist: "A Band".into(),
+            year: Some("1999".into()),
+            tracks: vec![TrackName {
+                title: "One".into(),
+                artist: None,
+            }],
+        };
+        let entry = keep_in(
+            root.path(),
+            &album(),
+            Some(&names),
+            |lba, count, audio| {
+                assert!(audio && lba + count <= 300, "read past the music");
+                sectors(lba, count, audio)
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert!(entry.meta.id.starts_with("cd-"));
+        assert!(entry.is_album());
+        assert_eq!(entry.meta.title, "Blue");
+        assert_eq!(entry.meta.artist.as_deref(), Some("A Band"));
+        assert_eq!(entry.meta.tracks, names.tracks);
+        assert_eq!(
+            std::fs::metadata(entry.bin()).unwrap().len(),
+            300 * RAW_SECTOR as u64
+        );
+        let mut disc = crate::image::open(&entry.cue()).unwrap();
+        let toc = disc.toc().unwrap().unwrap();
+        assert_eq!(toc.tracks.len(), 2);
+        assert_eq!(toc.leadout, 300);
+        assert_eq!(list_in(root.path())[0].meta.title, "Blue");
     }
 }

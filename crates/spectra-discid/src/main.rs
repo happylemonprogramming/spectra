@@ -84,7 +84,7 @@ fn keep(args: &Args) -> ExitCode {
         let report = identify(&mut drive)?;
         let started = std::time::Instant::now();
         let mut last = 0;
-        library::keep(&drive, &report, &AtomicBool::new(false), |p| {
+        library::keep(&drive, &report, None, &AtomicBool::new(false), |p| {
             let percent = u64::from(p.done) * 100 / u64::from(p.total.max(1));
             if percent != last {
                 last = percent;

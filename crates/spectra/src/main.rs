@@ -203,6 +203,9 @@ struct Spectra {
     elapsed: u32,
     /// The audio CD on screen, which a MusicBrainz answer is for.
     disc_id: Option<String>,
+    /// The album on screen is a copy opened from the shelf, which Back
+    /// returns to.
+    opened: bool,
 }
 
 struct Launch {
@@ -211,11 +214,12 @@ struct Launch {
     content: String,
 }
 
-/// The game disc in the drive.
+/// The game or audio CD in the drive.
 struct Inserted {
     report: Box<Report>,
     drive: PathBuf,
-    game: GameIdentity,
+    /// None for music.
+    game: Option<GameIdentity>,
 }
 
 /// A copy of the disc being kept.
@@ -283,6 +287,7 @@ impl Spectra {
             player: None,
             elapsed: 0,
             disc_id: None,
+            opened: false,
         };
         app.rewind();
         if options.play {
@@ -366,15 +371,38 @@ impl Spectra {
                 // A new disc, or none: whatever was playing stops.
                 self.player = None;
                 self.disc_id = None;
+                self.opened = false;
                 let mut audio_tasks = Vec::new();
                 if let DriveState::Disc { report, drive } = &state
                     && let DiscKind::Audio { musicbrainz, .. } = &report.kind
                     && let Some(toc) = &report.toc
                 {
-                    let (tx, rx) = iced::futures::channel::mpsc::unbounded();
-                    self.player = Some(audio::Player::new(drive.clone(), audio::spans(toc), tx));
-                    audio_tasks.push(Task::run(rx, Message::Audio));
-                    if let Some(id) = musicbrainz.clone() {
+                    // A kept CD plays from its copy, named as it was kept:
+                    // the drive can rest, and nothing is looked up.
+                    let kept = library::id(report)
+                        .and_then(|id| library::find(&id))
+                        .and_then(|entry| Some((entry.toc()?, entry)));
+                    let look_up = kept.is_none();
+                    if let Some((toc, entry)) = kept {
+                        album = Album::from_copy(&entry, &toc);
+                        if let Some(cover) = artwork::for_copy(&entry).cover {
+                            album.cover = cover;
+                        }
+                        audio_tasks.push(
+                            self.start_player(
+                                audio::Source::Image(entry.bin()),
+                                audio::spans(&toc),
+                            ),
+                        );
+                    } else {
+                        audio_tasks.push(
+                            self.start_player(
+                                audio::Source::Drive(drive.clone()),
+                                audio::spans(toc),
+                            ),
+                        );
+                    }
+                    if look_up && let Some(id) = musicbrainz.clone() {
                         self.disc_id = Some(id.disc_id.clone());
                         audio_tasks.push(Task::perform(
                             blocking(move || Box::new(musicbrainz::look_up(&id))),
@@ -388,7 +416,12 @@ impl Spectra {
                 self.disc = match state {
                     DriveState::Disc { report, drive } => match &report.kind {
                         DiscKind::Game(game) => Some(Inserted {
-                            game: game.clone(),
+                            game: Some(game.clone()),
+                            report,
+                            drive,
+                        }),
+                        DiscKind::Audio { .. } => Some(Inserted {
+                            game: None,
                             report,
                             drive,
                         }),
@@ -398,37 +431,31 @@ impl Spectra {
                 };
                 self.shelf.clear();
                 self.shelf_art = None;
-                if idle {
-                    let entries = library::list();
-                    if !entries.is_empty() {
-                        album = Album::shelf(&entries);
-                        self.shelf = entries;
-                    }
+                if idle && let Some(shelf) = self.shelf_album() {
+                    album = shelf;
                 }
                 self.launch = self.disc_launch();
-                if self.launch.is_some() {
+                let music = self.disc.as_ref().is_some_and(|d| d.game.is_none());
+                if self.launch.is_some() || music {
                     album.note = Some(self.ready_note());
                 }
                 self.show(album);
-                self.serial = self.disc.as_ref().and_then(|d| d.game.serial.clone());
+                self.serial = self
+                    .disc
+                    .as_ref()
+                    .and_then(|d| d.game.as_ref()?.serial.clone());
                 self.show_shelf_art();
                 // The disc goes on screen now; its pictures follow when they
                 // arrive, from the cache or the network.
                 let pictures = self.disc.as_ref().and_then(|disc| {
-                    let serial = disc.game.serial.clone()?;
-                    let game = disc.game.clone();
+                    let game = disc.game.clone()?;
+                    let serial = game.serial.clone()?;
                     Some(Task::perform(
                         blocking(move || artwork::for_game(&game)),
                         move |pictures| Message::Pictures(serial.clone(), pictures),
                     ))
                 });
-                let top = operation::scroll_to(
-                    Id::from(TRACKS),
-                    AbsoluteOffset {
-                        x: None,
-                        y: Some(0.0),
-                    },
-                );
+                let top = self.scroll_to_top();
                 Task::batch([top].into_iter().chain(pictures).chain(audio_tasks))
             }
             Message::Audio(event) => {
@@ -460,20 +487,7 @@ impl Spectra {
                 }
                 let musicbrainz::Found { release, cover } = *found;
                 if let Some(release) = release {
-                    self.album.title = release.title;
-                    self.album.artist = release.artist;
-                    self.album.year = release
-                        .date
-                        .as_deref()
-                        .and_then(|d| d.get(..4))
-                        .and_then(|y| y.parse().ok());
-                    // MusicBrainz lists the audio tracks; the TOC timed them.
-                    for (track, named) in self.album.tracks.iter_mut().zip(release.tracks) {
-                        track.title = match named.artist {
-                            Some(artist) => format!("{}  ·  {artist}", named.title),
-                            None => named.title,
-                        };
-                    }
+                    self.album.name(&release.names());
                 }
                 if let Some(cover) = cover {
                     self.album.cover = cover;
@@ -507,6 +521,14 @@ impl Spectra {
                     .is_some_and(|c| c.cancel.load(Ordering::Relaxed));
                 self.motion.set_spinning(false);
                 self.launch = self.disc_launch();
+                // A kept CD plays from its copy from now on.
+                let mut task = Task::none();
+                if let Ok(entry) = &result
+                    && entry.is_album()
+                    && let Some(toc) = entry.toc()
+                {
+                    task = self.start_player(audio::Source::Image(entry.bin()), audio::spans(&toc));
+                }
                 let ready = self.ready_note();
                 self.album.note = Some(match result {
                     Ok(entry) if entry.meta.unreadable > 0 => format!(
@@ -517,7 +539,7 @@ impl Spectra {
                     Err(_) if cancelled => format!("Stopped keeping a copy  ·  {ready}"),
                     Err(e) => format!("Couldn't keep a copy: {e}"),
                 });
-                Task::none()
+                task
             }
             Message::Pictures(serial, pictures) => {
                 // Only if that disc is still the one on screen.
@@ -542,6 +564,8 @@ impl Spectra {
                 }));
                 Task::none()
             }
+            // The drive is busy copying.
+            Message::Pick(_) if self.copying.is_some() => Task::none(),
             Message::Pick(track) if !self.shelf.is_empty() && !self.in_game => {
                 self.focus = track;
                 self.show_shelf_art();
@@ -611,6 +635,9 @@ impl Spectra {
                             self.play(self.focus);
                         }
                     }
+                    Remote::Back if self.playing.is_none() && self.opened => {
+                        return self.back_to_shelf();
+                    }
                     Remote::Back => {
                         self.playing = None;
                         self.motion.set_spinning(false);
@@ -631,7 +658,7 @@ impl Spectra {
     /// there is one, which is quicker and quieter, or else from the drive.
     fn disc_launch(&self) -> Option<Launch> {
         let disc = self.disc.as_ref()?;
-        let emulator = game::find(disc.game.system)?;
+        let emulator = game::find(disc.game.as_ref()?.system)?;
         let kept = library::id(&disc.report)
             .and_then(|id| library::find(&id))
             .map(|entry| entry.cue().to_string_lossy().into_owned());
@@ -647,7 +674,7 @@ impl Spectra {
         let Some(disc) = &self.disc else {
             return String::new();
         };
-        if self.launch.is_none() {
+        if disc.game.is_some() && self.launch.is_none() {
             return "No emulator for this console is installed".into();
         }
         match library::id(&disc.report) {
@@ -664,6 +691,9 @@ impl Spectra {
         let Some(entry) = self.shelf.get(self.focus) else {
             return Task::none();
         };
+        if entry.is_album() {
+            return self.open_album(entry.clone());
+        }
         self.launch = entry
             .meta
             .system
@@ -676,6 +706,63 @@ impl Spectra {
             self.album.note = Some("No emulator for this console is installed".into());
         }
         self.start_game()
+    }
+
+    /// Open a kept album from the shelf, and play it from the top.
+    fn open_album(&mut self, entry: library::Entry) -> Task<Message> {
+        let Some(toc) = entry.toc() else {
+            self.album.note = Some("Couldn't open this copy".into());
+            return Task::none();
+        };
+        let mut album = Album::from_copy(&entry, &toc);
+        album.cover = self.album.cover.clone();
+        album.face = self.album.face.take();
+        album.note = Some("○ or Backspace to stop, and again for your discs".into());
+        self.shelf.clear();
+        self.shelf_art = None;
+        self.opened = true;
+        self.show(album);
+        let player = self.start_player(audio::Source::Image(entry.bin()), audio::spans(&toc));
+        self.play(0);
+        Task::batch([player, self.scroll_to_top()])
+    }
+
+    /// From an opened album back to the shelf it came from.
+    fn back_to_shelf(&mut self) -> Task<Message> {
+        self.player = None;
+        self.opened = false;
+        let album = self.shelf_album().unwrap_or_else(Album::no_disc);
+        self.show(album);
+        self.show_shelf_art();
+        self.scroll_to_top()
+    }
+
+    /// The shelf of kept copies, if there are any.
+    fn shelf_album(&mut self) -> Option<Album> {
+        let entries = library::list();
+        if entries.is_empty() {
+            return None;
+        }
+        let album = Album::shelf(&entries);
+        self.shelf = entries;
+        self.shelf_art = None;
+        Some(album)
+    }
+
+    fn start_player(&mut self, source: audio::Source, spans: Vec<audio::Span>) -> Task<Message> {
+        let (tx, rx) = iced::futures::channel::mpsc::unbounded();
+        self.player = Some(audio::Player::new(source, spans, tx));
+        Task::run(rx, Message::Audio)
+    }
+
+    fn scroll_to_top(&self) -> Task<Message> {
+        operation::scroll_to(
+            Id::from(TRACKS),
+            AbsoluteOffset {
+                x: None,
+                y: Some(0.0),
+            },
+        )
     }
 
     /// On the shelf, the disc on screen is the copy in focus.
@@ -706,6 +793,12 @@ impl Spectra {
         if library::find(&id).is_some() {
             return Task::none();
         }
+        // Reading the disc for two things at once would make both stutter.
+        if let Some(player) = &self.player {
+            player.stop();
+            self.playing = None;
+            self.paused = false;
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         self.copying = Some(Copying {
             cancel: cancel.clone(),
@@ -719,8 +812,18 @@ impl Spectra {
                 let (tx, mut rx) = iced::futures::channel::mpsc::unbounded();
                 std::thread::spawn(move || {
                     let mut last = u64::MAX;
+                    // An album is kept by its names, which are cached from
+                    // when it went in.
+                    let release = match &report.kind {
+                        DiscKind::Audio {
+                            musicbrainz: Some(id),
+                            ..
+                        } => musicbrainz::names(id),
+                        _ => None,
+                    };
+                    let names = release.as_ref().map(musicbrainz::Release::names);
                     let result = Drive::open(&drive).and_then(|drive| {
-                        library::keep(&drive, &report, &cancel, |p| {
+                        library::keep(&drive, &report, names.as_ref(), &cancel, |p| {
                             // A message per percent, not per read.
                             let percent = u64::from(p.done) * 100 / u64::from(p.total.max(1));
                             if percent != last {
@@ -730,7 +833,11 @@ impl Spectra {
                         })
                     });
                     if let Ok(entry) = &result {
-                        artwork::store(&entry.dir, &game);
+                        match (&game, &release) {
+                            (Some(game), _) => artwork::store(&entry.dir, game),
+                            (None, Some(release)) => musicbrainz::store(&entry.dir, release),
+                            (None, None) => {}
+                        }
                     }
                     let _ = tx.unbounded_send(Keeping::Done(
                         result.map(Box::new).map_err(|e| e.to_string()),

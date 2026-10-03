@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 use spectra_core::discid::MusicBrainzId;
+use spectra_core::library::{Names, TrackName};
 
 use crate::artwork;
 use crate::net::{self, Get};
@@ -27,14 +28,23 @@ pub struct Release {
     pub artist: String,
     /// "1997-05-21", or as much of it as is known.
     pub date: Option<String>,
-    pub tracks: Vec<ReleaseTrack>,
+    pub tracks: Vec<TrackName>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReleaseTrack {
-    pub title: String,
-    /// Only where it differs from the album's: a compilation's.
-    pub artist: Option<String>,
+impl Release {
+    pub fn names(&self) -> Names {
+        Names {
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            year: self.date.clone(),
+            tracks: self.tracks.clone(),
+        }
+    }
+
+    /// The cover's file in the picture cache, fetched or not.
+    fn cover_name(&self) -> String {
+        format!("cover-mb-{}.jpg", self.id)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,7 +66,7 @@ pub fn look_up(id: &MusicBrainzId) -> Found {
         .and_then(|art| {
             artwork::fetch(
                 &art,
-                &format!("cover-mb-{}.jpg", release.id),
+                &release.cover_name(),
                 &format!("{CAA}/release/{}/front-500", release.id),
             )
         })
@@ -64,6 +74,18 @@ pub fn look_up(id: &MusicBrainzId) -> Found {
     Found {
         release: Some(release),
         cover,
+    }
+}
+
+/// The names alone, without the cover. Blocks.
+pub fn names(id: &MusicBrainzId) -> Option<Release> {
+    release(&cache_dir()?, id)
+}
+
+/// Keep an album's cover with its copy, if the cache has it.
+pub fn store(dir: &Path, release: &Release) {
+    if let Some(art) = artwork::cache_dir() {
+        let _ = std::fs::copy(art.join(release.cover_name()), dir.join(artwork::COVER));
     }
 }
 
@@ -184,7 +206,7 @@ fn pick(lookup: Lookup, disc_id: &str) -> Option<Release> {
         .into_iter()
         .map(|t| {
             let by = credit(&t.artist_credit);
-            ReleaseTrack {
+            TrackName {
                 title: t.title,
                 artist: (!by.is_empty() && by != artist).then_some(by),
             }

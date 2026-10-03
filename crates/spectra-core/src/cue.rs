@@ -15,10 +15,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::disc::{Disc, Media, RAW_SECTOR, SECTOR, Toc, Track};
+use crate::disc::{Disc, Media, RAW_SECTOR, SECTOR, SESSION_GAP, Toc, Track};
 use crate::{Error, Result};
-
-const SESSION_GAP: u32 = 11_400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
