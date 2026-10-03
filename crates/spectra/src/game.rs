@@ -5,6 +5,9 @@
 //! first. Cores are looked for where RetroArch's own core updater puts them,
 //! then where Arch's packages do. A core that needs no BIOS comes first, so a
 //! disc plays without anything else to set up.
+//!
+//! The user's own RetroArch settings are left as they are. What Spectra needs
+//! goes in a file of its own, passed with `--appendconfig`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -65,10 +68,18 @@ impl Emulator {
     /// Start the game full screen. Its output goes to Spectra's cache, for
     /// when a game will not start.
     pub fn launch(&self, uri: &str) -> std::io::Result<Child> {
-        let log = log_file()
-            .and_then(|path| std::fs::File::create(path).ok())
+        let cache = cache_dir();
+        let log = cache
+            .as_ref()
+            .and_then(|dir| std::fs::File::create(dir.join("game.log")).ok())
             .map_or_else(Stdio::null, Stdio::from);
-        Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        if let Some(dir) = &cache {
+            let settings = dir.join("retroarch.cfg");
+            std::fs::write(&settings, settings_text(&user_profiles(), SYSTEM_PROFILES))?;
+            command.arg("--appendconfig").arg(settings);
+        }
+        command
             .arg("--verbose")
             .arg("--fullscreen")
             .arg("--libretro")
@@ -81,18 +92,80 @@ impl Emulator {
     }
 }
 
-fn log_file() -> Option<PathBuf> {
+/// Where `retroarch-joypad-autoconfig` puts its gamepad profiles.
+const SYSTEM_PROFILES: &str = "/usr/share/libretro/autoconfig";
+
+/// RetroArch's own gamepad profile folder, as it is out of the box.
+fn user_profiles() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
+        .unwrap_or_default()
+        .join("retroarch/autoconfig")
+}
+
+fn has_files(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.path().is_file() || has_files(&e.path()))
+    })
+}
+
+/// Spectra's settings for RetroArch:
+///
+///   - Holding Start quits, for a player with only a gamepad. RetroArch
+///     fires the combo after two seconds of holding, and its usual "press
+///     again to quit" makes that four.
+///   - Gamepads are recognised from the packaged profiles, unless the user
+///     has profiles of their own (RetroArch's online updater puts them in its
+///     own folder).
+///   - None of this is saved into the user's retroarch.cfg on exit, which
+///     RetroArch would otherwise do with appended settings.
+fn settings_text(user: &Path, system: &str) -> String {
+    let mut text = String::from(
+        "# Written by Spectra for the games it starts; yours are in retroarch.cfg.\n\
+         config_save_on_exit = \"false\"\n\
+         input_quit_gamepad_combo = \"7\"\n",
+    );
+    if !has_files(user) && Path::new(system).is_dir() {
+        text.push_str(&format!("joypad_autoconfig_dir = \"{system}\"\n"));
+    }
+    text
+}
+
+fn cache_dir() -> Option<PathBuf> {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".cache")))?
         .join("spectra");
     std::fs::create_dir_all(&cache).ok()?;
-    Some(cache.join("game.log"))
+    Some(cache)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_gamepad_profiles_only_when_the_user_has_none() {
+        let dir = std::env::temp_dir().join(format!("spectra-profiles-{}", std::process::id()));
+        let user = dir.join("user");
+        let system = dir.join("system");
+        std::fs::create_dir_all(user.join("udev")).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        let system = system.to_str().unwrap();
+
+        let text = settings_text(&user, system);
+        assert!(text.contains("config_save_on_exit = \"false\""));
+        assert!(text.contains("input_quit_gamepad_combo = \"7\""));
+        assert!(text.contains(&format!("joypad_autoconfig_dir = \"{system}\"")));
+
+        std::fs::write(user.join("udev/pad.cfg"), "").unwrap();
+        assert!(!settings_text(&user, system).contains("joypad_autoconfig_dir"));
+        assert!(!settings_text(&dir.join("none"), "/nowhere").contains("joypad_autoconfig_dir"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn retroarch_names_drives_by_sg_number() {
