@@ -352,7 +352,7 @@ on Linux, so an Apple TV without Moonlight cannot be reached.
 
 ## Experiment: a game's music
 
-On trial, on the `game-music` branch: a kept game's soundtrack, as a disc
+On trial, merged from the `game-music` branch: a kept game's soundtrack, as a disc
 of its own on the shelf beside the game - "Tomb Raider (Soundtrack)" - that
 plays like an album, from the game's copy. The game is as it was. The shelf
 listens to each game once a session, in the background, and the soundtrack
