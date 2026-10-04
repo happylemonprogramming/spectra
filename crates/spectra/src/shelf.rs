@@ -286,6 +286,13 @@ fn slot(id: &str) -> u64 {
 
 /// "PlayStation · Eidos Interactive · 1996", or an album's artist.
 pub fn byline(entry: &Entry) -> String {
+    if entry.is_film() {
+        return [Some("DVD-Video".into()), entry.meta.year.clone()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+    }
     if entry.is_album() {
         return [entry.meta.artist.clone(), Some("Music".into())]
             .into_iter()

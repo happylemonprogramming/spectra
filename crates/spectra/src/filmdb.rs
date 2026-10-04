@@ -23,6 +23,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use spectra_core::library::Names;
+
 use crate::artwork::{self, Pictures};
 use crate::net::{self, Get};
 
@@ -345,6 +347,43 @@ pub fn look_up(label: &str, feature: Option<u32>) -> Found {
             cover: picture("poster", &found.poster),
             face: picture("disc", &found.disc),
         },
+    }
+}
+
+/// What the lookup found, from the cache alone, without asking anyone.
+fn cached(label: &str, feature: Option<u32>) -> Option<Match> {
+    let path = artwork::cache_dir()?.join(match_name(label, feature));
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// The film's name, for a copy of the disc.
+pub fn names(label: &str, feature: Option<u32>) -> Option<Names> {
+    let found = cached(label, feature)?;
+    Some(Names {
+        title: found.title?,
+        artist: String::new(),
+        year: found.year.map(|y| y.to_string()),
+        tracks: Vec::new(),
+    })
+}
+
+/// Keep the film's pictures with its copy in the library, so the copy keeps
+/// its face if the cache is cleared.
+pub fn store(dir: &std::path::Path, label: &str, feature: Option<u32>) {
+    let (Some(cache), Some(found)) = (artwork::cache_dir(), cached(label, feature)) else {
+        return;
+    };
+    let Some(id) = &found.id else { return };
+    for (kind, url, name) in [
+        ("poster", &found.poster, artwork::COVER),
+        ("disc", &found.disc, artwork::FACE),
+    ] {
+        if let Some(ext) = url.as_ref().and_then(|u| u.rsplit('.').next()) {
+            let _ = std::fs::copy(
+                cache.join(format!("film-{kind}-{id}.{ext}")),
+                dir.join(name),
+            );
+        }
     }
 }
 

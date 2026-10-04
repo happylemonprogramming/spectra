@@ -129,6 +129,13 @@ impl Album {
         album
     }
 
+    /// A kept film.
+    pub fn from_kept_film(entry: &Entry) -> Self {
+        let mut album = Self::message(&entry.meta.title, "DVD-Video");
+        album.details = entry.meta.year.clone();
+        album
+    }
+
     /// A kept audio CD, timed by its copy's table of contents.
     pub fn from_copy(entry: &Entry, toc: &Toc) -> Self {
         let mut album = Self::message("Audio CD", "Unknown artist");

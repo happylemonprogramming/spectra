@@ -1,5 +1,6 @@
 //! Copying a CD into an image: one raw `.bin` for the whole disc, and a cue
-//! sheet that says where its tracks start.
+//! sheet that says where its tracks start. A DVD is simpler, an `.iso` of
+//! its 2048-byte sectors, but each of its VOB files may need decrypting.
 //!
 //! Every sector is read raw, 2352 bytes, so the copy keeps what a game needs
 //! beyond its files: XA audio and video in mode 2 sectors, and CD audio
@@ -98,6 +99,78 @@ pub fn copy_cd(
         sectors: total,
         unreadable,
         cue: cue_sheet(toc, &modes, bin),
+    })
+}
+
+/// Where a DVD's sectors come from: the drive through libdvdcss, or a test's
+/// fake.
+pub trait DvdSectors {
+    /// Get the title key for the VOB file that starts at `lba`.
+    fn key(&mut self, lba: u32) -> Result<()>;
+    /// `count` 2048-byte sectors, decrypted with the last key if `decrypt`.
+    fn read(&mut self, lba: u32, count: u32, decrypt: bool) -> Result<Vec<u8>>;
+}
+
+/// Sectors per DVD read: 64 KB.
+const DVD_BATCH: u32 = 32;
+const DVD_SECTOR: usize = 2048;
+
+/// Copy a DVD's every sector, `total` of them, in the clear. `vobs` are the
+/// VOB files' sectors, start and end, in order: each is read with its own
+/// key, and a read never crosses from one into another or out of one.
+pub fn copy_dvd(
+    disc: &mut impl DvdSectors,
+    vobs: &[(u32, u32)],
+    total: u32,
+    out: &mut impl Write,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(Progress),
+) -> Result<Copied> {
+    let mut unreadable = 0;
+    let mut lba = 0;
+    while lba < total {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Unsupported("the copy was cancelled".into()));
+        }
+        let vob = vobs.iter().find(|&&(start, end)| start <= lba && lba < end);
+        let (end, decrypt) = match vob {
+            Some(&(start, end)) => {
+                if lba == start {
+                    disc.key(start)?;
+                }
+                (end, true)
+            }
+            None => {
+                let next = vobs.iter().map(|&(start, _)| start).filter(|&s| s > lba);
+                (next.min().unwrap_or(total), false)
+            }
+        };
+        let count = DVD_BATCH.min(end.min(total) - lba);
+        let data = match retry(|| disc.read(lba, count, decrypt)) {
+            Ok(data) if data.len() == count as usize * DVD_SECTOR => data,
+            _ => {
+                let mut data = Vec::with_capacity(count as usize * DVD_SECTOR);
+                for n in lba..lba + count {
+                    match retry(|| disc.read(n, 1, decrypt)) {
+                        Ok(sector) if sector.len() == DVD_SECTOR => data.extend(sector),
+                        _ => {
+                            unreadable += 1;
+                            data.resize(data.len() + DVD_SECTOR, 0);
+                        }
+                    }
+                }
+                data
+            }
+        };
+        out.write_all(&data)?;
+        lba += count;
+        progress(Progress { done: lba, total });
+    }
+    out.flush()?;
+    Ok(Copied {
+        sectors: total,
+        unreadable,
+        cue: String::new(),
     })
 }
 
@@ -317,5 +390,76 @@ mod tests {
             |_| {},
         );
         assert!(result.is_err());
+    }
+
+    /// A scrambled DVD: each sector holds its number, XORed with the key of
+    /// the VOB it is in, which only reads with that key undo.
+    struct FakeDvd {
+        vobs: Vec<(u32, u32)>,
+        key: Option<u32>,
+        keys_asked: Vec<u32>,
+        reads: Vec<(u32, u32, bool)>,
+        bad: u32,
+    }
+
+    impl DvdSectors for FakeDvd {
+        fn key(&mut self, lba: u32) -> Result<()> {
+            self.keys_asked.push(lba);
+            self.key = Some(lba);
+            Ok(())
+        }
+
+        fn read(&mut self, lba: u32, count: u32, decrypt: bool) -> Result<Vec<u8>> {
+            self.reads.push((lba, count, decrypt));
+            if (lba..lba + count).contains(&self.bad) {
+                return Err(Error::Unsupported("a scratch".into()));
+            }
+            let mut out = Vec::new();
+            for n in lba..lba + count {
+                let vob = self.vobs.iter().find(|&&(s, e)| s <= n && n < e);
+                let scrambled = vob.map_or(0, |&(s, _)| s);
+                let undone = if decrypt { self.key.unwrap_or(0) } else { 0 };
+                let mut sector = vec![0; DVD_SECTOR];
+                sector[..4].copy_from_slice(&(n ^ scrambled ^ undone).to_le_bytes());
+                out.extend(sector);
+            }
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn a_dvd_copies_in_the_clear_vob_by_vob() {
+        let vobs = vec![(10, 50), (50, 60), (90, 100)];
+        let mut disc = FakeDvd {
+            vobs: vobs.clone(),
+            key: None,
+            keys_asked: Vec::new(),
+            reads: Vec::new(),
+            bad: 95,
+        };
+        let mut out = Vec::new();
+        let copied = copy_dvd(
+            &mut disc,
+            &vobs,
+            120,
+            &mut out,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(out.len(), 120 * DVD_SECTOR);
+        for n in (0..120u32).filter(|&n| n != 95) {
+            let at = n as usize * DVD_SECTOR;
+            assert_eq!(out[at..at + 4], n.to_le_bytes(), "sector {n}");
+        }
+        assert_eq!(out[95 * DVD_SECTOR..][..4], [0; 4]);
+        assert_eq!(copied.unreadable, 1);
+        assert_eq!(disc.keys_asked, [10, 50, 90]);
+        // No read crosses into or out of a VOB.
+        for &(lba, count, decrypt) in &disc.reads {
+            let inside = vobs.iter().any(|&(s, e)| s <= lba && lba + count <= e);
+            let outside = vobs.iter().all(|&(s, e)| lba + count <= s || e <= lba);
+            assert!(if decrypt { inside } else { outside }, "{lba}+{count}");
+        }
     }
 }

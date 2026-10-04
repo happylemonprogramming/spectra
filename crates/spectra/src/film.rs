@@ -111,7 +111,7 @@ pub fn uri(kind: &DiscKind, drive: &Path) -> Option<String> {
 }
 
 /// VLC reads `/dev/srN`; Spectra talks to the drive through `/dev/sgN`.
-fn block_node(drive: &Path) -> Option<PathBuf> {
+pub fn block_node(drive: &Path) -> Option<PathBuf> {
     if drive.to_str()?.starts_with("/dev/sr") {
         return Some(drive.to_path_buf());
     }

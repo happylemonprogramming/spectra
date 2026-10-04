@@ -15,6 +15,7 @@ pub mod disc;
 pub mod discid;
 pub mod drive;
 pub mod dvd;
+pub mod dvdcss;
 mod error;
 pub mod identify;
 pub mod image;

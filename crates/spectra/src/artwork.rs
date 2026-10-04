@@ -89,7 +89,7 @@ pub fn for_copy(entry: &Entry) -> Pictures {
 }
 
 pub const COVER: &str = "cover.jpg";
-const FACE: &str = "face.png";
+pub const FACE: &str = "face.png";
 
 fn cover_url(game: &GameIdentity) -> Option<(String, String)> {
     let (system, base) = match game.system {

@@ -146,6 +146,7 @@ Credit it in anything that is ported.
 | `src/lib/game/catalog.ts`, `scripts/ps2-titles.mjs` | Reuse for serial → title and cover lookups |
 | `src/lib/discScene.ts` | Ported: the shaders to WGSL (`crates/spectra/src/disc.wgsl`), the motion to `motion.rs`. Bloom not yet |
 | `src/lib/discArt.ts` | Port to Rust: finding the disc in a Cover Art Archive scan |
+| `src/lib/library/backup.ts` (DVDs) | Ported: a DVD kept in the clear as `disc.iso`, VOB by VOB with each one's title key - through the system's libdvdcss, loaded only to copy, rather than CSS code of Spectra's own |
 | `src/lib/dvd/art.ts`, `src/lib/dvdLabel.ts`, `src/lib/dvd/disc.ts` | Ported: a DVD's title and pictures from its label, Wikidata and fanart.tv (`filmdb.rs`), told apart by the feature's length (`spectra-core::dvd`). Uses Rainbow Player's fanart.tv key until Spectra has its own |
 | `components/player/*` | Reference for the layout |
 | `components/player/LibraryShelf.tsx`, `src/lib/shelfScene.ts`, `hooks/useWheelStep.ts` | Ported: the library below the stage (`shelf.rs`) - a grid of 3D discs, the focused one turning, the slide between the two, wheel steps, delete pressed twice |

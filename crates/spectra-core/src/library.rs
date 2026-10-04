@@ -1,17 +1,20 @@
 //! Discs kept as copies, to play without the disc.
 //!
 //! Each copy is a folder under `~/.local/share/spectra/library`, named by the
-//! disc's own ID - a game's serial, or `cd-` and an audio CD's MusicBrainz
-//! disc ID:
+//! disc's own ID - a game's serial, `cd-` and an audio CD's MusicBrainz disc
+//! ID, or `dvd-` and a DVD's label and size:
 //!
 //! ```text
 //! SLUS-00152/disc.bin    every sector, raw
 //! SLUS-00152/disc.cue    where the tracks start; what an emulator opens
 //! SLUS-00152/meta.json   what the disc is, written last
+//! dvd-DUDE-3456810/disc.iso   every sector, in the clear
 //! ```
 //!
 //! An audio CD's copy is the same raw audio the disc holds, nothing lost; an
-//! enhanced CD's is its music alone, without the data session after it.
+//! enhanced CD's is its music alone, without the data session after it. A
+//! DVD's is decrypted on the way in, through the system's libdvdcss, so it
+//! plays anywhere without the drive (see `dvdcss`).
 //!
 //! A copy is made in a folder with `.part` on the end and renamed when it is
 //! whole, so a folder without it is always a finished copy; an unfinished one
@@ -25,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::copy::{self, Progress};
+use crate::copy::{self, DvdSectors, Progress};
 use crate::disc::RAW_SECTOR;
 use crate::disc::Toc;
 use crate::drive::Drive;
@@ -33,6 +36,7 @@ use crate::{DiscKind, Error, GameSystem, Report, Result};
 
 pub const BIN: &str = "disc.bin";
 pub const CUE: &str = "disc.cue";
+pub const ISO: &str = "disc.iso";
 const META: &str = "meta.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,14 +98,25 @@ impl Entry {
         crate::image::open(&self.cue()).ok()?.toc().ok()?
     }
 
+    pub fn iso(&self) -> PathBuf {
+        self.dir.join(ISO)
+    }
+
     /// Music, rather than a game.
     pub fn is_album(&self) -> bool {
         self.meta.system.is_none() && self.meta.id.starts_with(CD)
+    }
+
+    /// A DVD's film.
+    pub fn is_film(&self) -> bool {
+        self.meta.system.is_none() && self.meta.id.starts_with(DVD)
     }
 }
 
 /// What an audio CD's ID starts with.
 const CD: &str = "cd-";
+/// And a DVD's.
+const DVD: &str = "dvd-";
 
 /// Where copies are kept: `$XDG_DATA_HOME/spectra/library`.
 pub fn root() -> Option<PathBuf> {
@@ -112,8 +127,18 @@ pub fn root() -> Option<PathBuf> {
 }
 
 /// The ID a copy is kept under, if this disc can be kept: CD games with a
-/// serial, and audio CDs.
+/// serial, audio CDs, and DVDs. A DVD has no ID of its own, so its label and
+/// size stand in: the same film pressed again may differ in size, which only
+/// means a second copy.
 pub fn id(report: &Report) -> Option<String> {
+    if let DiscKind::DvdVideo { .. } = report.kind {
+        let label = report.label.as_deref().filter(|l| !l.is_empty())?;
+        let plain: String = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        return Some(format!("{DVD}{plain}-{}", report.sectors?));
+    }
     report.toc.as_ref()?;
     match &report.kind {
         DiscKind::Game(game) => {
@@ -230,21 +255,7 @@ pub fn keep_in(
     let toc =
         &to_copy(report).ok_or_else(|| Error::Unsupported("keeping a copy of this disc".into()))?;
     let needed = u64::from(toc.leadout) * RAW_SECTOR as u64;
-    std::fs::create_dir_all(root)?;
-    if let Some(free) = free_space(root)
-        && free < needed + needed / 20
-    {
-        return Err(Error::Unsupported(format!(
-            "not enough space: the copy needs {} MB and {} MB is free",
-            needed >> 20,
-            free >> 20
-        )));
-    }
-
-    let part = root.join(format!("{id}.part"));
-    let _ = std::fs::remove_dir_all(&part);
-    std::fs::create_dir_all(&part)?;
-    let result = (|| {
+    make(root, &id, needed, |part| {
         let mut bin = BufWriter::with_capacity(1 << 20, File::create(part.join(BIN))?);
         let copied = copy::copy_cd(toc, read, &mut bin, BIN, cancel, progress)?;
         drop(bin);
@@ -253,7 +264,7 @@ pub fn keep_in(
             DiscKind::Game(game) => Some(game),
             _ => None,
         };
-        let meta = Meta {
+        Ok(Meta {
             id: id.clone(),
             title: names
                 .map(|n| n.title.clone())
@@ -275,24 +286,120 @@ pub fn keep_in(
             tracks: names.map(|n| n.tracks.clone()).unwrap_or_default(),
             sectors: copied.sectors,
             unreadable: copied.unreadable,
-            created: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
-        };
+            created: now(),
+        })
+    })
+}
+
+/// Copy the DVD in `drive`, a `/dev/srN`, into the library in the clear,
+/// named by `names` where they are known.
+pub fn keep_dvd(
+    drive: &Path,
+    report: &Report,
+    names: Option<&Names>,
+    cancel: &AtomicBool,
+    progress: impl FnMut(Progress),
+) -> Result<Entry> {
+    let root = root().ok_or_else(|| Error::Unsupported("no home folder".into()))?;
+    let mut disc = crate::dvdcss::Dvdcss::open(drive)?;
+    keep_dvd_in(&root, report, names, &mut disc, cancel, progress)
+}
+
+pub fn keep_dvd_in(
+    root: &Path,
+    report: &Report,
+    names: Option<&Names>,
+    disc: &mut impl DvdSectors,
+    cancel: &AtomicBool,
+    progress: impl FnMut(Progress),
+) -> Result<Entry> {
+    let unsupported = || Error::Unsupported("keeping a copy of this disc".into());
+    let id = id(report).ok_or_else(unsupported)?;
+    let total = report.sectors.ok_or_else(unsupported)?;
+    let vobs = vob_sectors(disc)?;
+    make(root, &id, u64::from(total) * 2048, |part| {
+        let mut iso = BufWriter::with_capacity(1 << 20, File::create(part.join(ISO))?);
+        let copied = copy::copy_dvd(disc, &vobs, total, &mut iso, cancel, progress)?;
+        drop(iso);
+        Ok(Meta {
+            id: id.clone(),
+            title: names
+                .map(|n| n.title.clone())
+                .or_else(|| report.label.clone())
+                .unwrap_or_else(|| "DVD".into()),
+            system: None,
+            serial: None,
+            publisher: None,
+            year: names.and_then(|n| n.year.clone()),
+            region: None,
+            disc_art: None,
+            artist: None,
+            tracks: Vec::new(),
+            sectors: copied.sectors,
+            unreadable: copied.unreadable,
+            created: now(),
+        })
+    })
+}
+
+/// Where each VOB file is, start and end, in order: the parts of a DVD
+/// that may be scrambled, each with a key of its own.
+fn vob_sectors(disc: &mut impl DvdSectors) -> Result<Vec<(u32, u32)>> {
+    let mut read = |lba: u32, count: u32| disc.read(lba, count, false);
+    let missing = || Error::Unsupported("the DVD's files could not be found".into());
+    let iso = crate::iso9660::read_iso(&mut read)?.ok_or_else(missing)?;
+    let files = crate::iso9660::read_root_dir(&mut read, &iso, "VIDEO_TS")?.ok_or_else(missing)?;
+    let mut vobs: Vec<(u32, u32)> = files
+        .iter()
+        .filter(|f| !f.directory && f.name.ends_with(".VOB") && f.size > 0)
+        .map(|f| (f.lba, f.lba + f.size.div_ceil(2048)))
+        .collect();
+    vobs.sort_unstable();
+    Ok(vobs)
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Make a copy: in a `.part` folder that `write` fills and describes, renamed
+/// once it is whole. Refused up front if the copy, and a little over, would
+/// not fit.
+fn make(
+    root: &Path,
+    id: &str,
+    needed: u64,
+    write: impl FnOnce(&Path) -> Result<Meta>,
+) -> Result<Entry> {
+    std::fs::create_dir_all(root)?;
+    if let Some(free) = free_space(root)
+        && free < needed + needed / 20
+    {
+        return Err(Error::Unsupported(format!(
+            "not enough space: the copy needs {} MB and {} MB is free",
+            needed >> 20,
+            free >> 20
+        )));
+    }
+    let part = root.join(format!("{id}.part"));
+    let _ = std::fs::remove_dir_all(&part);
+    std::fs::create_dir_all(&part)?;
+    let meta = match write(&part).and_then(|meta| {
         std::fs::write(
             part.join(META),
             serde_json::to_vec_pretty(&meta).expect("meta serialises"),
         )?;
         Ok(meta)
-    })();
-    let meta = match result {
+    }) {
         Ok(meta) => meta,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&part);
             return Err(e);
         }
     };
-    let dir = root.join(&id);
+    let dir = root.join(id);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::rename(&part, &dir)?;
     Ok(Entry { dir, meta })
@@ -344,6 +451,23 @@ mod tests {
                 leadout: 300,
             }),
         }
+    }
+
+    #[test]
+    fn a_dvd_is_kept_by_its_label_and_size() {
+        let mut dvd = report();
+        dvd.media = Media::Dvd;
+        dvd.kind = DiscKind::DvdVideo {
+            feature_seconds: Some(4981),
+        };
+        dvd.label = Some("DUDE".into());
+        dvd.sectors = Some(3_456_810);
+        dvd.toc = None;
+        assert_eq!(id(&dvd).as_deref(), Some("dvd-DUDE-3456810"));
+        dvd.label = Some("../ME".into());
+        assert_eq!(id(&dvd).as_deref(), Some("dvd-___ME-3456810"));
+        dvd.label = None;
+        assert_eq!(id(&dvd), None);
     }
 
     fn sectors(lba: u32, count: u32, audio: bool) -> Result<Vec<u8>> {

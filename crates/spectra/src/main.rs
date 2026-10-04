@@ -336,7 +336,7 @@ struct Launch {
     content: String,
 }
 
-/// The game or audio CD in the drive.
+/// The game, audio CD or DVD in the drive.
 struct Inserted {
     report: Box<Report>,
     drive: PathBuf,
@@ -578,6 +578,9 @@ impl Spectra {
                     .is_some_and(|c| c.cancel.load(Ordering::Relaxed));
                 self.motion.set_spinning(false);
                 self.launch = self.disc_launch();
+                if self.picked.is_none() {
+                    self.film_uri = self.drive_state.as_ref().and_then(film_uri);
+                }
                 // A kept CD plays from its copy from now on.
                 let mut task = Task::none();
                 if let Ok(entry) = &result
@@ -967,6 +970,19 @@ impl Spectra {
             self.play(0);
             return Task::batch([close, player, self.scroll_to_top()]);
         }
+        if entry.is_film() {
+            let mut album = Album::from_kept_film(&entry);
+            if let Some(cover) = pictures.cover.or_else(|| pictures.face.clone()) {
+                album.cover = cover;
+            }
+            album.face = pictures.face;
+            self.picked = Some(entry.clone());
+            self.launch = None;
+            self.film_uri = Some(format!("dvd://{}", entry.iso().display()));
+            album.note = Some(self.ready_note());
+            self.show(album);
+            return Task::batch([close, self.start_film()]);
+        }
         let mut album = Album::from_kept_game(&entry);
         if let Some(cover) = pictures.cover.or_else(|| pictures.face.clone()) {
             album.cover = cover;
@@ -1016,6 +1032,7 @@ impl Spectra {
             // The disc in the drive may have been the copy: it plays from the
             // drive again.
             self.launch = self.disc_launch();
+            self.film_uri = self.drive_state.as_ref().and_then(film_uri);
             self.album.note = Some(self.ready_note());
         }
         let _ = self.shelf.load(library::list());
@@ -1065,10 +1082,7 @@ impl Spectra {
                 ));
             }
         }
-        self.film_uri = match &state {
-            DriveState::Disc { report, drive } => film::uri(&report.kind, drive),
-            _ => None,
-        };
+        self.film_uri = film_uri(&state);
         // A DVD's name and pictures follow, from the cache or the network.
         let mut film_task = None;
         self.film_label = None;
@@ -1092,7 +1106,7 @@ impl Spectra {
                     report,
                     drive,
                 }),
-                DiscKind::Audio { .. } => Some(Inserted {
+                DiscKind::Audio { .. } | DiscKind::DvdVideo { .. } => Some(Inserted {
                     game: None,
                     report,
                     drive,
@@ -1102,7 +1116,10 @@ impl Spectra {
             _ => None,
         };
         self.launch = self.disc_launch();
-        let music = self.disc.as_ref().is_some_and(|d| d.game.is_none());
+        let music = self
+            .disc
+            .as_ref()
+            .is_some_and(|d| matches!(d.report.kind, DiscKind::Audio { .. }));
         let emulator = self
             .disc
             .as_ref()
@@ -1164,6 +1181,8 @@ impl Spectra {
             };
             return if entry.is_album() {
                 format!("Your copy  ·  {{back}} Stop, then {{back}} again {back}")
+            } else if entry.is_film() {
+                format!("Your copy  ·  {{accept}} Play in VLC  ·  {{back}} Back {back}")
             } else if self.launch.is_none() {
                 format!("No emulator for this console is installed  ·  {{back}} Back {back}")
             } else {
@@ -1171,10 +1190,14 @@ impl Spectra {
             };
         }
         if self.film_uri.is_some() {
-            return if film::installed() {
-                "{accept} Play in VLC  ·  Esc to come back".into()
-            } else {
-                "Films play in VLC, which isn't installed".into()
+            if !film::installed() {
+                return "Films play in VLC, which isn't installed".into();
+            }
+            let id = self.disc.as_ref().and_then(|d| library::id(&d.report));
+            return match id.map(|id| library::find(&id).is_some()) {
+                Some(true) => "{accept} Play in VLC  ·  Kept: plays without the disc".into(),
+                Some(false) => "{accept} Play in VLC  ·  {alt} Keep a copy".into(),
+                None => "{accept} Play in VLC".into(),
             };
         }
         let Some(disc) = &self.disc else {
@@ -1280,22 +1303,52 @@ impl Spectra {
                         } => musicbrainz::names(id),
                         _ => None,
                     };
-                    let names = release.as_ref().map(musicbrainz::Release::names);
-                    let result = Drive::open(&drive).and_then(|drive| {
-                        library::keep(&drive, &report, names.as_ref(), &cancel, |p| {
-                            // A message per percent, not per read.
-                            let percent = u64::from(p.done) * 100 / u64::from(p.total.max(1));
-                            if percent != last {
-                                last = percent;
-                                let _ = tx.unbounded_send(Keeping::Progress(p.done, p.total));
-                            }
+                    // A film by what the lookup found when it went in.
+                    let film = match (&report.kind, &report.label) {
+                        (DiscKind::DvdVideo { feature_seconds }, Some(label)) => {
+                            Some((label.clone(), *feature_seconds))
+                        }
+                        _ => None,
+                    };
+                    let names = match &film {
+                        Some((label, feature)) => filmdb::names(label, *feature),
+                        None => release.as_ref().map(musicbrainz::Release::names),
+                    };
+                    let progress = |p: spectra_core::copy::Progress| {
+                        // A message per percent, not per read.
+                        let percent = u64::from(p.done) * 100 / u64::from(p.total.max(1));
+                        if percent != last {
+                            last = percent;
+                            let _ = tx.unbounded_send(Keeping::Progress(p.done, p.total));
+                        }
+                    };
+                    let result = if film.is_some() {
+                        film::block_node(&drive)
+                            .ok_or_else(|| {
+                                spectra_core::Error::Unsupported("no /dev/sr for the drive".into())
+                            })
+                            .and_then(|block| {
+                                library::keep_dvd(
+                                    &block,
+                                    &report,
+                                    names.as_ref(),
+                                    &cancel,
+                                    progress,
+                                )
+                            })
+                    } else {
+                        Drive::open(&drive).and_then(|drive| {
+                            library::keep(&drive, &report, names.as_ref(), &cancel, progress)
                         })
-                    });
+                    };
                     if let Ok(entry) = &result {
-                        match (&game, &release) {
-                            (Some(game), _) => artwork::store(&entry.dir, game),
-                            (None, Some(release)) => musicbrainz::store(&entry.dir, release),
-                            (None, None) => {}
+                        match (&game, &release, &film) {
+                            (Some(game), _, _) => artwork::store(&entry.dir, game),
+                            (None, Some(release), _) => musicbrainz::store(&entry.dir, release),
+                            (None, None, Some((label, feature))) => {
+                                filmdb::store(&entry.dir, label, *feature);
+                            }
+                            (None, None, None) => {}
                         }
                     }
                     let _ = tx.unbounded_send(Keeping::Done(
@@ -1850,6 +1903,21 @@ fn blocking<T: Default + Send + 'static>(
         let _ = tx.send(work());
     });
     async move { rx.await.unwrap_or_default() }
+}
+
+/// What VLC opens for the film in the drive: its kept copy if there is one,
+/// which is quicker and quieter, or else the disc.
+fn film_uri(state: &DriveState) -> Option<String> {
+    let DriveState::Disc { report, drive } = state else {
+        return None;
+    };
+    let kept = library::id(report)
+        .and_then(|id| library::find(&id))
+        .filter(library::Entry::is_film);
+    match kept {
+        Some(entry) => Some(format!("dvd://{}", entry.iso().display())),
+        None => film::uri(&report.kind, drive),
+    }
 }
 
 fn key(event: keyboard::Event) -> Option<Remote> {
