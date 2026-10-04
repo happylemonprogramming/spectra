@@ -21,6 +21,7 @@ pub mod identify;
 pub mod image;
 pub mod iso9660;
 pub mod library;
+pub mod soundtrack;
 pub mod udf;
 
 #[cfg(test)]

@@ -36,6 +36,7 @@ pub struct Album {
     pub playable: bool,
 }
 
+#[derive(Debug, Clone)]
 pub struct Track {
     pub title: String,
     pub seconds: u32,
@@ -268,7 +269,7 @@ fn film(
 /// An audio CD's tracks, named by number and timed from the TOC: each runs
 /// to the next one's start, the last to the lead-out. Data tracks are not
 /// music, and are left out.
-fn cd_tracks(toc: &spectra_core::Toc) -> Vec<Track> {
+pub fn cd_tracks(toc: &spectra_core::Toc) -> Vec<Track> {
     let ends = toc
         .tracks
         .iter()

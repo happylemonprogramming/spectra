@@ -350,6 +350,21 @@ on Linux, so an Apple TV without Moonlight cannot be reached.
 - [ ] While streaming, keep the machine awake: hold a systemd inhibitor so
       the computer does not suspend mid-film
 
+## Experiment: a game's music
+
+On trial, on the `game-music` branch: a kept game's soundtrack as its track
+list, played like an album. A, as before, starts the game; Start plays the
+music. If it does not earn its place, `soundtrack.rs` in both crates and the
+calls to them come out together.
+
+- PS1: the CD audio tracks after the data, sorted by listening
+  (`spectra_core::soundtrack`): silence and mono speech are dropped, stereo
+  under 20 seconds is a sting and dropped, the rest is music. Tomb Raider:
+  18 pieces of music, 6 stings, 31 lines of speech, one silent track
+- Not tried: naming the pieces from a published soundtrack, through
+  AcoustID; matching by length is too loose, as soundtracks re-edit
+- Out: films. A DVD's music is mixed in with the dialogue
+
 ## Later: macOS and Windows
 
 Shelved, not ruled out: Omarchy comes first, and the

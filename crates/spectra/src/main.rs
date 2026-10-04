@@ -24,6 +24,7 @@ mod musicbrainz;
 mod net;
 mod platform;
 mod shelf;
+mod soundtrack;
 mod ui;
 mod watch;
 
@@ -130,6 +131,8 @@ enum Message {
     Audio(audio::Event),
     /// MusicBrainz's answer for the audio CD with this disc ID.
     Release(String, Box<musicbrainz::Found>),
+    /// The music on the kept game with this ID, if it has any.
+    Soundtrack(String, Option<Box<soundtrack::Soundtrack>>),
     OpenLibrary,
     CloseLibrary,
     /// From a copy on the stage back to the disc in the drive.
@@ -553,6 +556,27 @@ impl Spectra {
                 }
                 Task::none()
             }
+            Message::Soundtrack(id, soundtrack) => {
+                // Only if that game is still the one on the stage.
+                let Some(soundtrack) = soundtrack else {
+                    return Task::none();
+                };
+                if self.kept_game_on_stage().as_deref() != Some(id.as_str()) {
+                    return Task::none();
+                }
+                let soundtrack::Soundtrack {
+                    tracks,
+                    source,
+                    spans,
+                } = *soundtrack;
+                self.album.tracks = tracks;
+                self.album.playable = true;
+                // Not a rewind: the game may be running, and the disc with it.
+                self.glow = vec![0.0; self.album.tracks.len()];
+                self.glow[0] = 1.0;
+                self.focus = 0;
+                self.start_player(source, spans)
+            }
             Message::Keeping(Keeping::Progress(done, total)) => {
                 if let Some(copying) = &self.copying {
                     let fraction = f64::from(done) / f64::from(total.max(1));
@@ -588,6 +612,10 @@ impl Spectra {
                     && let Some(toc) = entry.toc()
                 {
                     task = self.start_player(audio::Source::Image(entry.bin()), audio::spans(&toc));
+                } else if let Ok(entry) = &result
+                    && entry.meta.system.is_some()
+                {
+                    task = load_soundtrack(entry);
                 }
                 let ready = self.ready_note();
                 self.album.note = Some(match result {
@@ -803,7 +831,9 @@ impl Spectra {
             Remote::Back if self.playing.is_none() && self.picked.is_some() => {
                 return self.return_to_drive();
             }
-            Remote::Select | Remote::PlayPause if self.launch.is_some() => {
+            // A game with music listed keeps Start for the music.
+            Remote::Select if self.launch.is_some() => return self.start_game(),
+            Remote::PlayPause if self.launch.is_some() && self.album.tracks.is_empty() => {
                 return self.start_game();
             }
             Remote::Select | Remote::PlayPause if self.film_uri.is_some() => {
@@ -999,10 +1029,11 @@ impl Spectra {
             });
         album.note = Some(self.ready_note());
         self.show(album);
+        let music = load_soundtrack(&entry);
         if self.launch.is_none() {
-            return close;
+            return Task::batch([close, music]);
         }
-        Task::batch([close, self.start_game()])
+        Task::batch([close, music, self.start_game()])
     }
 
     /// Delete pressed on a copy: the first press arms it, the second
@@ -1143,13 +1174,19 @@ impl Spectra {
                 move |pictures| Message::Pictures(serial.clone(), pictures),
             ))
         });
+        // A kept game's music, from its copy.
+        let music = self
+            .kept_game_on_stage()
+            .and_then(|id| library::find(&id))
+            .map(|entry| load_soundtrack(&entry));
         let top = self.scroll_to_top();
         Task::batch(
             [top]
                 .into_iter()
                 .chain(pictures)
                 .chain(film_task)
-                .chain(audio_tasks),
+                .chain(audio_tasks)
+                .chain(music),
         )
     }
 
@@ -1218,6 +1255,18 @@ impl Spectra {
             }
             Some(_) => "{accept} Play  ·  {alt} Keep a copy".into(),
             None => "{accept} Play".into(),
+        }
+    }
+
+    /// The library ID of the kept game on the stage: picked from the
+    /// library, or in the drive with a copy kept.
+    fn kept_game_on_stage(&self) -> Option<String> {
+        match &self.picked {
+            Some(entry) => entry.meta.system.is_some().then(|| entry.meta.id.clone()),
+            None => {
+                let disc = self.disc.as_ref().filter(|d| d.game.is_some())?;
+                library::id(&disc.report).filter(|id| library::find(id).is_some())
+            }
         }
     }
 
@@ -1377,6 +1426,12 @@ impl Spectra {
                 return Task::none();
             }
         };
+        // The game has its own music.
+        if let Some(player) = &self.player {
+            player.stop();
+            self.playing = None;
+            self.paused = false;
+        }
         self.in_game = true;
         self.motion.set_spinning(true);
         self.album.note = Some("Playing in RetroArch  ·  Esc twice to quit".into());
@@ -1809,8 +1864,13 @@ impl Spectra {
         if scale.gap < 20.0 || !self.album.playable || self.album.tracks.is_empty() {
             return space().into();
         }
+        let hints = if self.launch.is_some() {
+            "{up}{down} Choose    {start} Play music    {prev}{next} Skip    {back} Stop"
+        } else {
+            "{up}{down} Choose    {accept} Play    {prev}{next} Skip    {start} Pause    {back} Stop"
+        };
         container(ui::prompt(
-            "{up}{down} Choose    {accept} Play    {prev}{next} Skip    {start} Pause    {back} Stop",
+            hints,
             self.style,
             13.0,
             Color::from_rgba(1.0, 1.0, 1.0, 0.4),
@@ -1903,6 +1963,16 @@ fn blocking<T: Default + Send + 'static>(
         let _ = tx.send(work());
     });
     async move { rx.await.unwrap_or_default() }
+}
+
+/// Listen through a kept game's copy for its music, off the UI thread.
+fn load_soundtrack(entry: &library::Entry) -> Task<Message> {
+    let id = entry.meta.id.clone();
+    let entry = entry.clone();
+    Task::perform(
+        blocking(move || soundtrack::load(&entry).map(Box::new)),
+        move |found| Message::Soundtrack(id.clone(), found),
+    )
 }
 
 /// What VLC opens for the film in the drive: its kept copy if there is one,
