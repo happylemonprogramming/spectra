@@ -165,7 +165,7 @@ fn fid(name: &str, directory: bool, parent: bool) -> Vec<u8> {
     f
 }
 
-fn record(lba: u32, size: u32, directory: bool, name: &[u8]) -> Vec<u8> {
+pub fn record(lba: u32, size: u32, directory: bool, name: &[u8]) -> Vec<u8> {
     let mut r = vec![0u8; 33];
     r[2..6].copy_from_slice(&lba.to_le_bytes());
     r[10..14].copy_from_slice(&size.to_le_bytes());
