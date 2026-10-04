@@ -18,13 +18,14 @@ out to let the user decide. The binary goes to `~/.local/bin/spectra`.
 
 | Command | Does |
 | --- | --- |
-| `spectra open` | Open the window in the background and return. Does nothing if it is open |
-| `spectra library [--json]` | List kept copies. Reads files only: works without the window |
-| `spectra play [disc \| ID \| TITLE] [--track N]` | Put something on the stage and play it. Opens the window first if needed |
+| `spectra open [--new]` | Open a window in the background and return. Does nothing if one is open, unless `--new` |
+| `spectra library [--json]` | List kept copies. Reads files only: works without a window |
+| `spectra play [disc \| ID \| TITLE] [--track N] [--new]` | Put something on the stage and play it. Opens a window first if none is open; `--new` opens another for it |
 | `spectra pause` / `resume` / `toggle` | Pause and resume what plays |
 | `spectra next` / `previous` | The next or previous track (a chapter, for a film) |
 | `spectra stop` | Stop the music, or close the film |
 | `spectra status [--json]` | What is on the stage, what plays, the drive |
+| `spectra windows [--json]` | Every open window and what it plays; the current one marked `*` |
 | `spectra quit` | Close the window |
 
 `play` takes:
@@ -40,6 +41,25 @@ out to let the user decide. The binary goes to `~/.local/bin/spectra`.
 
 `--track N` (or `-t N`) counts from 1. Every control command takes `--json`.
 
+### More than one window
+
+Spectra can have several windows open, a film in each, say. Each is named
+by its process ID. A command goes to the **current** window - the one last
+focused (or whose film was), or the last to start something - unless
+`--window PID` (or `-w PID`) names another; `spectra windows` lists them.
+Only the current window hears the gamepad.
+
+```sh
+spectra play "dude, where's my car"     # in the current window, or a new one
+spectra play "blue lines" --new         # another window beside it
+spectra windows                         # "* 4242  Playing 1/12: …"
+spectra pause --window 4242
+```
+
+One drive is one drive: while a window plays a film, game or CD from it, or
+keeps a copy of it, another window is refused with the reason ("The disc is
+playing in another Spectra window"). Kept copies have no such limit.
+
 ### Exit status
 
 | Code | Meaning |
@@ -47,14 +67,15 @@ out to let the user decide. The binary goes to `~/.local/bin/spectra`.
 | 0 | Done |
 | 1 | Refused or failed: the reason is on stderr, or in `error` with `--json` |
 | 2 | Bad usage, or `play` named nothing in the library |
-| 3 | Spectra is not running (every command but `open`, `library` and `play`) |
+| 3 | Spectra is not running, or no window has the `--window` given (every command but `open`, `library` and `play`) |
 
 `play` waits a moment after the window answers and checks the sound really
 started, so exit 0 means the music is playing.
 
 ## JSON
 
-`spectra library --json`: an array, newest first.
+`spectra library --json`: an array, newest first. `kind` is `music`, `film`
+or `game`.
 
 ```json
 [{ "id": "cd-Pz1GkG9FBzjSGqgRz2EMHCW1qT4-", "kind": "music",
@@ -70,6 +91,8 @@ Every control command with `--json`:
 ```json
 { "ok": true, "running": true,
   "status": {
+    "window": 4242,             // the window's process ID, for --window
+    "current": true,            // the window unaddressed commands and the gamepad go to
     "screen": "stage",          // or "library"
     "source": "copy",           // "drive", "copy", or "file" (an album file)
     "drive": "empty",           // "no-drive", "empty", "reading", "disc", "unreadable", "not-watched"
@@ -86,6 +109,8 @@ Every control command with `--json`:
 
 On failure `ok` is false and `error` says why; `status` is still there when
 the window answered. Not running: `{"ok":false,"running":false,"error":…}`.
+
+`spectra windows --json`: an array of `status` objects, oldest window first.
 
 ## Recipes
 
@@ -121,13 +146,14 @@ every couple of seconds until `drive` is `disc` (or `empty` /
   CD; while `copying` is true commands are refused. Keeping and deleting
   copies are the user's choices: `spectra-discid --keep` keeps one from a
   terminal, but ask before running it, and never delete from the library.
-- **One window.** Commands go to the running window over a Unix socket,
-  `$XDG_RUNTIME_DIR/spectra.sock`, which only the user can reach.
+- **Sockets.** Each window takes commands on a Unix socket of its own,
+  `$XDG_RUNTIME_DIR/spectra-<pid>.sock`, which only the user can reach.
+  `$XDG_RUNTIME_DIR/spectra-current` holds the current window's ID.
 - **A display is needed.** `open` and `play` start a window, so they need
   `WAYLAND_DISPLAY` or `DISPLAY` from the user's session. A window started
   by a command logs to `~/.cache/spectra/spectra.log`.
 - **Where things are.** Kept copies: `~/.local/share/spectra/library/<id>/`
-  (`disc.bin`, `disc.cue`, `meta.json`). Caches and logs: `~/.cache/spectra/`
+  (`disc.bin` and `disc.cue` for CDs, `disc.iso` for DVDs, `meta.json`). Caches and logs: `~/.cache/spectra/`
   (`game.log` for RetroArch, `film.log` for VLC).
 - **What a disc is**, without the window: `spectra-discid` (`--list` for the
   drives, `--json` for detail).
@@ -137,12 +163,14 @@ every couple of seconds until `drive` is `disc` (or `empty` /
 Rust workspace, pinned by `mise.toml`:
 
 ```
-crates/spectra-core/    reading and identifying discs: SG_IO drive, cue/bin images, the library
+crates/spectra-core/    reading and identifying discs: SG_IO drive, cue/bin images, the library,
+                        and locks between windows (lock.rs)
 crates/spectra-discid/  command line: what disc is this?
 crates/spectra/         the app (iced on wgpu)
   src/main.rs           the window: state, the remote, the stage and the library
   src/cli.rs            the command line above
   src/control.rs        the socket the command line talks to; Request and Status
+  src/windows.rs        several windows: which is current, finding them, the drive lock
   src/audio.rs          CD audio through cpal; game.rs RetroArch; film.rs VLC
 scripts/check.sh        fmt, clippy -D warnings, tests: run before calling work done
 scripts/install.sh      the installer

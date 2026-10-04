@@ -1,8 +1,9 @@
 //! A running Spectra, driven from outside: `spectra play`, `spectra pause`
 //! and the rest, for scripts and agents.
 //!
-//! The window listens on a Unix socket in `$XDG_RUNTIME_DIR`, which only its
-//! own user can reach. A command is one line of JSON and so is the answer:
+//! Each window listens on a Unix socket of its own in `$XDG_RUNTIME_DIR`,
+//! `spectra-<pid>.sock`, which only its user can reach (see `windows` for
+//! more than one). A command is one line of JSON and so is the answer:
 //! what is on the stage afterwards, or why the command could not be done.
 //! Commands do what the remote does, so the window always shows the result.
 //!
@@ -16,7 +17,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -61,6 +61,10 @@ pub enum Target {
 /// What is on the stage, as an agent would want to read it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
+    /// The window's process ID, which `--window` takes.
+    pub window: u32,
+    /// The window the gamepad and unaddressed commands go to.
+    pub current: bool,
     /// `stage` or `library`: which screen the window shows.
     pub screen: String,
     /// `drive`, `copy` (a kept copy from the library) or `file` (an album
@@ -142,16 +146,6 @@ impl std::fmt::Debug for Responder {
     }
 }
 
-/// The socket: `$XDG_RUNTIME_DIR/spectra.sock`, or one named for the user
-/// in the temporary folder where there is no runtime folder.
-pub fn socket() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) => PathBuf::from(dir).join("spectra.sock"),
-        // SAFETY: getuid cannot fail.
-        None => std::env::temp_dir().join(format!("spectra-{}.sock", unsafe { libc::getuid() })),
-    }
-}
-
 /// Commands from outside, each with where to send its answer.
 pub fn subscription() -> Subscription<(Request, Responder)> {
     Subscription::run(|| {
@@ -180,18 +174,17 @@ fn serve(tx: &UnboundedSender<(Request, Responder)>) {
         if tx.is_closed() {
             return;
         }
-        // One at a time: commands are rare, and each is answered quickly.
-        answer(stream, tx);
+        // A thread each, so a caller that connects and says nothing holds
+        // up nobody else.
+        let tx = tx.clone();
+        std::thread::spawn(move || answer(stream, &tx));
     }
 }
 
-/// Take the socket over, unless another Spectra still answers on it.
+/// This window's socket. One left by a window that had this process ID
+/// before is cleared away.
 fn listen() -> std::io::Result<UnixListener> {
-    let path = socket();
-    if UnixStream::connect(&path).is_ok() {
-        return Err(std::io::Error::other("another Spectra already listens"));
-    }
-    // Left behind by a Spectra that has gone.
+    let path = crate::windows::socket(std::process::id());
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
@@ -205,7 +198,8 @@ fn answer(stream: UnixStream, tx: &UnboundedSender<(Request, Responder)>) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
-    if BufReader::new(stream).read_line(&mut line).is_err() {
+    // Nothing said: a caller seeing whether this window is open.
+    if BufReader::new(stream).read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
     }
     let reply = match serde_json::from_str::<Request>(&line) {
@@ -232,9 +226,10 @@ fn answer(stream: UnixStream, tx: &UnboundedSender<(Request, Responder)>) {
     let _ = writer.write_all(text.as_bytes());
 }
 
-/// Send a command to the running Spectra. None if no Spectra is running.
-pub fn send(request: &Request) -> Option<Result<Reply, String>> {
-    let stream = UnixStream::connect(socket()).ok()?;
+/// Send a command to the window with this process ID. None if it is not
+/// running.
+pub fn send(window: u32, request: &Request) -> Option<Result<Reply, String>> {
+    let stream = UnixStream::connect(crate::windows::socket(window)).ok()?;
     Some(exchange(stream, request).map_err(|e| e.to_string()))
 }
 

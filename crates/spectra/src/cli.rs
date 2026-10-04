@@ -11,27 +11,35 @@ use serde::Serialize;
 use spectra_core::library::{self, Entry};
 
 use crate::control::{self, Reply, Request, Status, Target, TrackStatus};
+use crate::windows;
 
 const USAGE: &str = "\
 Spectra: put a disc in, and it plays.
 
 Usage:
   spectra [ALBUM.json] [--play] [--reduced-motion]
-                          Open the window here, watching the drive
+                          Open a window here, watching the drive
                           (or showing an album file instead)
-  spectra open [--reduced-motion]
-                          Open the window in the background and return
+  spectra open [--new] [--reduced-motion]
+                          Open the window in the background and return;
+                          --new opens another beside one already open
   spectra library [--json]
-                          List kept copies: music and games
-  spectra play [disc | ID | TITLE] [--track N] [--json]
+                          List kept copies: music, films and games
+  spectra play [disc | ID | TITLE] [--track N] [--new] [--json]
                           Put something on the stage and play it: the disc in
                           the drive, a kept copy by ID, or by (part of) its
                           title or artist. Nothing named: what is on the stage.
-                          Opens the window first if it is not open
+                          Opens a window first if none is open; --new always
+                          opens another for it
   spectra pause | resume | toggle | next | previous | stop [--json]
                           The transport, for what is on the stage
   spectra status [--json] What is on the stage, the drive, and what plays
+  spectra windows [--json]
+                          Every open window, the current one marked *
   spectra quit [--json]   Close the window
+
+Commands go to the current window - the one last looked at - or to the
+one named with --window PID (from `spectra windows`).
 
 Exit status: 0 done, 1 refused or failed, 2 bad usage, 3 Spectra not running.
 ";
@@ -40,42 +48,165 @@ const NOT_RUNNING: i32 = 3;
 /// How long a window started in the background has to start listening.
 const STARTUP: Duration = Duration::from_secs(20);
 
+/// Which window, and how to answer: options any command takes.
+#[derive(Debug, Default, PartialEq)]
+struct Options {
+    json: bool,
+    window: Option<u32>,
+    new: bool,
+}
+
+/// Take the options every command shares out of the arguments, wherever
+/// they are, leaving the command and its own.
+fn options(args: &[String]) -> Result<(Options, Vec<String>), String> {
+    let mut options = Options::default();
+    let mut rest = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--window" | "-w" => {
+                let pid = args.next().ok_or("--window needs a window's number")?;
+                options.window = Some(
+                    pid.parse()
+                        .map_err(|_| format!("--window {pid}: `spectra windows` lists them"))?,
+                );
+            }
+            "--new" => options.new = true,
+            "--json" => {
+                options.json = true;
+                rest.push(arg.clone());
+            }
+            _ => rest.push(arg.clone()),
+        }
+    }
+    Ok((options, rest))
+}
+
+const COMMANDS: &[&str] = &[
+    "help", "--help", "-h", "open", "library", "play", "pause", "resume", "toggle", "next",
+    "previous", "prev", "stop", "status", "windows", "quit",
+];
+
 /// Run a command. None when the arguments are for opening the window in
 /// this process.
 pub fn run(args: &[String]) -> Option<i32> {
-    let (command, rest) = args.split_first()?;
-    let json = rest.iter().any(|a| a == "--json");
+    let (options, args) = match options(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("spectra: {e}");
+            return Some(2);
+        }
+    };
+    let Some((command, rest)) = args
+        .split_first()
+        .filter(|(command, _)| COMMANDS.contains(&command.as_str()))
+    else {
+        if options.window.is_some() || options.new {
+            eprintln!("spectra: --window and --new go with a command; see spectra --help");
+            return Some(2);
+        }
+        return None;
+    };
+    // Piped into `head` and the like, end quietly when the reader does, as
+    // command-line tools do. Only here: the window writes to callers that
+    // may have hung up, and must not die of it.
+    // SAFETY: restoring a signal's default, before any thread is started.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    let json = options.json;
     Some(match command.as_str() {
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             0
         }
-        "open" => open(rest.iter().any(|a| a == "--reduced-motion")),
+        "open" => open(&options, rest.iter().any(|a| a == "--reduced-motion")),
         "library" => list(json),
+        "windows" => list_windows(json),
         "play" => match play_request(rest) {
             Ok(request) => {
-                if control::send(&Request::Status).is_none()
-                    && let Err(e) = start(false)
-                {
-                    return Some(fail(&e, json));
+                let window = match target(options.window) {
+                    _ if options.new => start(false),
+                    Some(window) => Ok(window),
+                    None if options.window.is_some() => return Some(not_running(&options)),
+                    None => start(false),
+                };
+                match window {
+                    Ok(window) => send(window, &request, json),
+                    Err(e) => fail(&e, json),
                 }
-                send(&request, json)
             }
             Err(e) => {
                 eprintln!("spectra: {e}");
                 2
             }
         },
-        "pause" => send(&Request::Pause, json),
-        "resume" => send(&Request::Resume, json),
-        "toggle" => send(&Request::Toggle, json),
-        "next" => send(&Request::Next, json),
-        "previous" | "prev" => send(&Request::Previous, json),
-        "stop" => send(&Request::Stop, json),
-        "status" => send(&Request::Status, json),
-        "quit" => send(&Request::Quit, json),
-        _ => return None,
+        command => {
+            let request = match command {
+                "pause" => Request::Pause,
+                "resume" => Request::Resume,
+                "toggle" => Request::Toggle,
+                "next" => Request::Next,
+                "previous" | "prev" => Request::Previous,
+                "stop" => Request::Stop,
+                "status" => Request::Status,
+                _ => Request::Quit,
+            };
+            match target(options.window) {
+                Some(window) => send(window, &request, json),
+                None => not_running(&options),
+            }
+        }
     })
+}
+
+/// The window a command goes to: the one named, or the current one, or else
+/// the newest.
+fn target(named: Option<u32>) -> Option<u32> {
+    let running = windows::running();
+    match named {
+        Some(window) => running.contains(&window).then_some(window),
+        None => windows::current()
+            .filter(|window| running.contains(window))
+            .or_else(|| running.last().copied()),
+    }
+}
+
+fn not_running(options: &Options) -> i32 {
+    let error = match options.window {
+        Some(window) => format!("no Spectra window {window} is open; `spectra windows` lists them"),
+        None => "Spectra is not running; `spectra open` starts it".into(),
+    };
+    if options.json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": false, "running": false, "error": error })
+        );
+    } else {
+        eprintln!("spectra: {error}");
+    }
+    NOT_RUNNING
+}
+
+fn list_windows(json: bool) -> i32 {
+    let statuses: Vec<Status> = windows::running()
+        .into_iter()
+        .filter_map(|window| control::send(window, &Request::Status)?.ok()?.status)
+        .collect();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&statuses).expect("statuses serialise")
+        );
+        return 0;
+    }
+    if statuses.is_empty() {
+        println!("No Spectra window is open");
+        return NOT_RUNNING;
+    }
+    for status in &statuses {
+        let mark = if status.current { '*' } else { ' ' };
+        println!("{mark} {:<8} {}", status.window, summary(status));
+    }
+    0
 }
 
 fn play_request(args: &[String]) -> Result<Request, String> {
@@ -183,7 +314,13 @@ fn kept(entry: &Entry) -> Kept {
     };
     Kept {
         id: entry.meta.id.clone(),
-        kind: if music { "music" } else { "game" },
+        kind: if music {
+            "music"
+        } else if entry.is_film() {
+            "film"
+        } else {
+            "game"
+        },
         title: entry.meta.title.clone(),
         artist: entry.meta.artist.clone(),
         system: entry.meta.system.map(|s| s.name()),
@@ -226,22 +363,21 @@ fn list(json: bool) -> i32 {
     0
 }
 
-/// Send a command to the window and say how it went.
-fn send(request: &Request, json: bool) -> i32 {
-    let Some(reply) = control::send(request) else {
-        if json {
-            println!(r#"{{"ok":false,"running":false,"error":"Spectra is not running"}}"#);
-        } else {
-            eprintln!("spectra: Spectra is not running; `spectra open` starts it");
-        }
-        return NOT_RUNNING;
+/// Send a command to a window and say how it went.
+fn send(window: u32, request: &Request, json: bool) -> i32 {
+    let Some(reply) = control::send(window, request) else {
+        return not_running(&Options {
+            json,
+            window: Some(window),
+            new: false,
+        });
     };
     let mut reply = match reply {
         Ok(reply) => reply,
         Err(e) => return fail(&format!("no answer from Spectra: {e}"), json),
     };
     if starts_sound(request) && reply.ok {
-        reply = confirm(reply);
+        reply = confirm(window, reply);
     }
     if json {
         let mut value = serde_json::to_value(&reply).expect("a reply serialises");
@@ -269,12 +405,12 @@ fn starts_sound(request: &Request) -> bool {
 
 /// The window answers before the sound card does, and a track that will
 /// not play only says so a moment later: ask again, so "Playing" is true.
-fn confirm(reply: Reply) -> Reply {
+fn confirm(window: u32, reply: Reply) -> Reply {
     if reply.status.as_ref().is_none_or(|s| s.playing.is_none()) {
         return reply;
     }
     std::thread::sleep(Duration::from_millis(600));
-    match control::send(&Request::Status) {
+    match control::send(window, &Request::Status) {
         Some(Ok(now)) => match now.status {
             Some(status)
                 if status.playing.is_none()
@@ -373,30 +509,38 @@ fn time(seconds: u32) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
-/// Open the window in the background, unless it is open already.
-fn open(reduced_motion: bool) -> i32 {
-    if control::send(&Request::Status).is_some() {
-        println!("Spectra is already open");
+/// Open a window in the background, unless one is open already and
+/// another was not asked for.
+fn open(options: &Options, reduced_motion: bool) -> i32 {
+    if !options.new
+        && let Some(window) = target(None)
+    {
+        println!("Spectra is already open (window {window}); `spectra open --new` opens another");
         return 0;
     }
     match start(reduced_motion) {
-        Ok(()) => {
-            println!("Opened Spectra");
+        Ok(window) => {
+            println!("Opened Spectra (window {window})");
             0
         }
-        Err(e) => fail(&e, false),
+        Err(e) => fail(&e, options.json),
     }
 }
 
-/// Start the window as a process of its own, which outlives this one, and
-/// wait until it takes commands.
-fn start(reduced_motion: bool) -> Result<(), String> {
+/// Start a window as a process of its own, which outlives this one, and
+/// wait until it takes commands. Its process ID names it.
+fn start(reduced_motion: bool) -> Result<u32, String> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let log = log_path();
-    let output = log
-        .as_ref()
-        .and_then(|path| std::fs::File::create(path).ok());
+    // Added to, as other windows may be writing to it too.
+    let output = log.as_ref().and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    });
     let mut command = Command::new(exe);
     if reduced_motion {
         command.arg("--reduced-motion");
@@ -413,11 +557,12 @@ fn start(reduced_motion: bool) -> Result<(), String> {
     let see = log
         .map(|p| format!("; see {}", p.display()))
         .unwrap_or_default();
+    let window = child.id();
     let step = Duration::from_millis(100);
     for _ in 0..STARTUP.as_millis() / step.as_millis() {
         std::thread::sleep(step);
-        if control::send(&Request::Status).is_some() {
-            return Ok(());
+        if control::send(window, &Request::Status).is_some() {
+            return Ok(window);
         }
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!("Spectra stopped as it started ({status}){see}"));
@@ -479,6 +624,29 @@ mod tests {
         assert_eq!(id("tomb"), Ok("SLUS-00152"));
         assert!(id("bl").unwrap_err().contains("more than one"));
         assert!(id("zzz").unwrap_err().contains("nothing"));
+    }
+
+    #[test]
+    fn a_window_can_be_named_anywhere_in_the_line() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (parsed, rest) = options(&args(&["--window", "4242", "pause", "--json"])).unwrap();
+        assert_eq!(
+            parsed,
+            Options {
+                json: true,
+                window: Some(4242),
+                new: false
+            }
+        );
+        assert_eq!(rest, args(&["pause", "--json"]));
+        let (parsed, rest) = options(&args(&["play", "dude", "--new", "-w", "7"])).unwrap();
+        assert!(parsed.new);
+        assert_eq!(parsed.window, Some(7));
+        assert_eq!(rest, args(&["play", "dude"]));
+        assert!(options(&args(&["pause", "--window", "the-big-one"])).is_err());
+        // Opening a window with an album file is not a command.
+        assert_eq!(run(&args(&["album.json", "--play"])), None);
+        assert_eq!(run(&args(&["--window", "7"])), Some(2));
     }
 
     #[test]

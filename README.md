@@ -63,8 +63,13 @@ spectra library                  # what is kept
 spectra play "semi-charmed" -t 3 # by title or artist, from track 3
 spectra play disc                # whatever is in the drive
 spectra pause; spectra next; spectra status
+spectra play "blue lines" --new  # a second window, playing beside the first
+spectra windows                  # every window; commands take --window PID
 spectra quit
 ```
+
+Several windows can be open at once, a film in each. Only the one last
+looked at hears the gamepad, and the drive serves one window at a time.
 
 ## Develop
 

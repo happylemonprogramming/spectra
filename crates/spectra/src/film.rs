@@ -130,9 +130,9 @@ impl Film {
     ) -> std::io::Result<Self> {
         let program =
             game::on_path("vlc").ok_or_else(|| std::io::Error::other("VLC isn't installed"))?;
-        let socket = std::env::var_os("XDG_RUNTIME_DIR")
-            .map_or_else(std::env::temp_dir, PathBuf::from)
-            .join("spectra-vlc.sock");
+        // Named for this window: another window's film has a VLC of its own.
+        let socket =
+            crate::windows::runtime_dir().join(format!("spectra-vlc-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket);
         let log = game::cache_dir()
             .and_then(|dir| std::fs::File::create(dir.join("film.log")).ok())
@@ -230,6 +230,12 @@ fn supervise(
                 {
                     window = None;
                     closed = Some(Instant::now());
+                } else if let Some(address) = line.strip_prefix("activewindowv2>>")
+                    && window.as_deref() == Some(hyprland::plain(address))
+                {
+                    // The film was looked at: the gamepad is for it, and so
+                    // for this window, whichever other films are open.
+                    crate::windows::claim();
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}

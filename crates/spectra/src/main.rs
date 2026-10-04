@@ -32,6 +32,7 @@ mod shelf;
 mod soundtrack;
 mod ui;
 mod watch;
+mod windows;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -159,6 +160,8 @@ enum Message {
     Pointer(Point),
     /// A command from outside, and where its answer goes.
     Control(control::Request, control::Responder),
+    /// The window was focused: the gamepad is its now.
+    Focused,
 }
 
 /// How the screen is arranged, from the most room to the least.
@@ -255,6 +258,9 @@ struct Spectra {
     launch: Option<Launch>,
     /// A game is running, and has the gamepad.
     in_game: bool,
+    /// The drive, held while a game or film plays from it, so that another
+    /// Spectra window does not read it too.
+    drive_lock: Option<spectra_core::lock::Lock>,
     /// What VLC would open for the film in the drive.
     film_uri: Option<String>,
     /// A film playing in VLC: the gamepad is its remote.
@@ -415,6 +421,7 @@ impl Spectra {
             watching: options.album.is_none(),
             launch: None,
             in_game: false,
+            drive_lock: None,
             film_uri: None,
             film: None,
             film_label: None,
@@ -441,6 +448,8 @@ impl Spectra {
             reduced_motion: options.reduced_motion,
         };
         app.rewind();
+        // A window just opened is the one its user is looking at.
+        windows::claim();
         if options.play {
             app.play(0);
         }
@@ -638,6 +647,7 @@ impl Spectra {
             }
             Message::GameOver(trouble) => {
                 self.in_game = false;
+                self.drive_lock = None;
                 self.motion.set_spinning(false);
                 let ready = self.ready_note();
                 self.album.note = Some(trouble.map_or(ready, |why| {
@@ -677,6 +687,7 @@ impl Spectra {
             }
             Message::FilmOver(trouble) => {
                 self.film = None;
+                self.drive_lock = None;
                 self.motion.set_spinning(false);
                 let ready = self.ready_note();
                 self.album.note = Some(trouble.map_or(ready, |why| {
@@ -745,10 +756,16 @@ impl Spectra {
                 self.pointing = false;
                 self.remote(remote)
             }
+            // Every Spectra hears every pad: only the current window acts.
+            Message::Pad(..) if !windows::is_current() => Task::none(),
             Message::Pad(pad, remote) => {
                 self.style = ui::Style::Pad(pad);
                 self.pointing = false;
                 self.remote(remote)
+            }
+            Message::Focused => {
+                windows::claim();
+                Task::none()
             }
             Message::Control(request, responder) => {
                 let (result, task) = self.control(request);
@@ -769,7 +786,7 @@ impl Spectra {
         match request {
             Request::Status => return (Ok(()), Task::none()),
             Request::Quit => {
-                let _ = std::fs::remove_file(control::socket());
+                let _ = std::fs::remove_file(windows::socket(std::process::id()));
                 return (Ok(()), iced::exit());
             }
             _ if self.copying.is_some() => {
@@ -848,13 +865,15 @@ impl Spectra {
                     if !film::installed() {
                         return (Err("films play in VLC, which isn't installed".into()), task);
                     }
-                    return (Ok(()), Task::batch([task, self.start_film()]));
+                    let film = self.start_film();
+                    return self.started(Task::batch([task, film]));
                 }
                 if self.disc.is_none() {
                     return (Err("no disc Spectra plays is in the drive".into()), task);
                 }
                 if self.launch.is_some() {
-                    return (Ok(()), Task::batch([task, self.start_game()]));
+                    let game = self.start_game();
+                    return self.started(Task::batch([task, game]));
                 }
                 if self.disc.as_ref().is_some_and(|d| d.game.is_some()) {
                     return (Err(plain(&self.ready_note())), task);
@@ -873,29 +892,46 @@ impl Spectra {
                 {
                     return (Err(format!("{} has no track {n}", entry.meta.title)), faces);
                 }
-                let game = !entry.is_album();
+                // A game's soundtrack is music, though it shares the game's
+                // description.
+                let album = entry.is_album() || soundtrack::is_entry(entry);
+                if entry.is_film() && !film::installed() {
+                    return (
+                        Err("films play in VLC, which isn't installed".into()),
+                        faces,
+                    );
+                }
                 let picked = self.pick(index);
                 if self.picked.as_ref().is_none_or(|p| p.meta.id != id) {
                     return (Err("that copy would not open".into()), faces);
                 }
-                if game && self.launch.is_none() {
-                    return (
-                        Err("no emulator for this console is installed".into()),
-                        Task::batch([faces, picked]),
-                    );
-                }
                 task = Task::batch([faces, picked]);
-                // A copy starts playing as it goes on the stage.
-                if track.is_none() || game {
-                    return (Ok(()), task);
+                // A film or game starts as it goes on the stage. An album
+                // waits there for a track, so one is played below: the one
+                // asked for, or the first.
+                if !album {
+                    if self.film_uri.is_none() && self.launch.is_none() {
+                        return (
+                            Err("no emulator for this console is installed".into()),
+                            task,
+                        );
+                    }
+                    return self.started(task);
+                }
+                if track.is_none() {
+                    self.focus = 0;
+                    self.play(0);
+                    return (Ok(()), Task::batch([task, self.reveal_focus()]));
                 }
             }
         }
         if self.launch.is_some() && track.is_none() && self.playing.is_none() {
-            return (Ok(()), Task::batch([task, self.start_game()]));
+            let game = self.start_game();
+            return self.started(Task::batch([task, game]));
         }
-        if self.film_uri.is_some() && self.picked.is_none() && track.is_none() {
-            return (Ok(()), Task::batch([task, self.start_film()]));
+        if self.film_uri.is_some() && track.is_none() {
+            let film = self.start_film();
+            return self.started(Task::batch([task, film]));
         }
         if !self.album.playable {
             return (Err("nothing on the stage plays".into()), task);
@@ -919,16 +955,27 @@ impl Spectra {
         (Ok(()), Task::batch([task, self.reveal_focus()]))
     }
 
+    /// A game or film was asked to start: whether it did, and if not, why,
+    /// as the note under the title says.
+    fn started(&self, task: Task<Message>) -> (Result<(), String>, Task<Message>) {
+        if self.in_game || self.film.is_some() {
+            return (Ok(()), task);
+        }
+        let why = self.album.note.as_deref().map(plain);
+        (Err(why.unwrap_or_else(|| "it did not start".into())), task)
+    }
+
     /// What is on the stage, for whoever asked from outside.
     fn status(&self) -> control::Status {
-        let (source, id) = match (&self.picked, &self.disc) {
+        let (source, id) = match (&self.picked, &self.drive_state) {
             (Some(entry), _) => ("copy", Some(entry.meta.id.clone())),
             _ if !self.watching => ("file", None),
-            (None, Some(disc)) => ("drive", library::id(&disc.report)),
-            (None, None) => ("drive", None),
+            (None, Some(DriveState::Disc { report, .. })) => ("drive", library::id(report)),
+            (None, _) => ("drive", None),
         };
         let kind = match (&self.picked, &self.disc) {
-            (Some(entry), _) if entry.is_album() => "music",
+            (Some(entry), _) if entry.is_album() || soundtrack::is_entry(entry) => "music",
+            (Some(entry), _) if entry.is_film() => "film",
             (Some(_), _) => "game",
             _ if !self.watching => "music",
             (None, _) if self.film_uri.is_some() => "film",
@@ -945,6 +992,8 @@ impl Spectra {
             Some(DriveState::Unreadable(_)) => "unreadable",
         };
         control::Status {
+            window: std::process::id(),
+            current: windows::is_current(),
             screen: match self.screen {
                 Screen::Stage => "stage",
                 Screen::Library => "library",
@@ -1600,6 +1649,13 @@ impl Spectra {
         if library::find(&id).is_some() {
             return Task::none();
         }
+        let drive_lock = match windows::drive_lock(&disc.drive, "being kept") {
+            Ok(lock) => lock,
+            Err(why) => {
+                self.album.note = Some(why);
+                return Task::none();
+            }
+        };
         // Reading the disc for two things at once would make both stutter.
         if let Some(player) = &self.player {
             player.stop();
@@ -1618,6 +1674,8 @@ impl Spectra {
             iced::stream::channel(4, async move |mut output| {
                 let (tx, mut rx) = iced::futures::channel::mpsc::unbounded();
                 std::thread::spawn(move || {
+                    // Held until the copy is done, kept or not.
+                    let _drive = drive_lock;
                     let mut last = u64::MAX;
                     // An album is kept by its names, which are cached from
                     // when it went in.
@@ -1695,6 +1753,15 @@ impl Spectra {
         let Some(launch) = &self.launch else {
             return Task::none();
         };
+        // Straight from the drive: hold it, so another window does not
+        // read it under the game.
+        let lock = match self.drive_for(launch.content.starts_with("cdrom://")) {
+            Ok(lock) => lock,
+            Err(why) => {
+                self.album.note = Some(why);
+                return Task::none();
+            }
+        };
         let mut child = match launch.emulator.launch(&launch.content) {
             Ok(child) => child,
             Err(e) => {
@@ -1702,6 +1769,8 @@ impl Spectra {
                 return Task::none();
             }
         };
+        self.drive_lock = lock;
+        windows::claim();
         self.in_game = true;
         self.motion.set_spinning(true);
         self.album.note = Some("Playing in RetroArch  ·  Esc twice to quit".into());
@@ -1723,6 +1792,14 @@ impl Spectra {
         let Some(uri) = &self.film_uri else {
             return Task::none();
         };
+        // A kept copy is a file; anything else is read from the drive.
+        let lock = match self.drive_for(!uri.ends_with(".iso")) {
+            Ok(lock) => lock,
+            Err(why) => {
+                self.album.note = Some(why);
+                return Task::none();
+            }
+        };
         let (tx, rx) = iced::futures::channel::oneshot::channel();
         match film::Film::start(uri, move |trouble| {
             let _ = tx.send(trouble);
@@ -1733,6 +1810,8 @@ impl Spectra {
                 return Task::none();
             }
         }
+        self.drive_lock = lock;
+        windows::claim();
         self.motion.set_spinning(true);
         self.album.note = Some("Playing in VLC  ·  Esc to come back".into());
         Task::perform(rx, |trouble| Message::FilmOver(trouble.ok().flatten()))
@@ -1762,6 +1841,17 @@ impl Spectra {
             film.press(key);
         }
         Task::none()
+    }
+
+    /// The drive, held for this window if `reading` it. Refused, in words,
+    /// when another window holds it.
+    fn drive_for(&self, reading: bool) -> Result<Option<spectra_core::lock::Lock>, String> {
+        match &self.drive_state {
+            Some(DriveState::Disc { drive, .. }) if reading => {
+                windows::drive_lock(drive, "playing").map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Scroll the track list just enough to show the focused row, glow
@@ -1814,6 +1904,9 @@ impl Spectra {
             gamepad::subscription().map(|(pad, remote)| Message::Pad(pad, remote)),
             control::subscription()
                 .map(|(request, responder)| Message::Control(request, responder)),
+            window::events().filter_map(|(_, event)| {
+                matches!(event, window::Event::Focused).then_some(Message::Focused)
+            }),
         ]);
         let remote = if self.watching {
             Subscription::batch([remote, watch::subscription().map(Message::Drive)])

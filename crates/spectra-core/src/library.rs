@@ -18,7 +18,9 @@
 //!
 //! A copy is made in a folder with `.part` on the end and renamed when it is
 //! whole, so a folder without it is always a finished copy; an unfinished one
-//! is cleared away by the next attempt.
+//! is cleared away by the next attempt. While it is made, a hidden
+//! `.<id>.lock` beside it keeps a second Spectra window from making the same
+//! one (see `lock`).
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -32,7 +34,7 @@ use crate::copy::{self, DvdSectors, Progress};
 use crate::disc::RAW_SECTOR;
 use crate::disc::Toc;
 use crate::drive::Drive;
-use crate::{DiscKind, Error, GameSystem, Report, Result};
+use crate::{DiscKind, Error, GameSystem, Report, Result, lock};
 
 pub const BIN: &str = "disc.bin";
 pub const CUE: &str = "disc.cue";
@@ -366,7 +368,8 @@ fn now() -> u64 {
 
 /// Make a copy: in a `.part` folder that `write` fills and describes, renamed
 /// once it is whole. Refused up front if the copy, and a little over, would
-/// not fit.
+/// not fit, or if another Spectra window is already making it - the two
+/// would clear away each other's `.part` folder.
 fn make(
     root: &Path,
     id: &str,
@@ -374,6 +377,11 @@ fn make(
     write: impl FnOnce(&Path) -> Result<Meta>,
 ) -> Result<Entry> {
     std::fs::create_dir_all(root)?;
+    let Some(_making) = lock::take(&root.join(format!(".{id}.lock")), "keeping a copy")? else {
+        return Err(Error::Unsupported(
+            "a copy of this disc is already being kept in another Spectra window".into(),
+        ));
+    };
     if let Some(free) = free_space(root)
         && free < needed + needed / 20
     {
@@ -551,7 +559,37 @@ mod tests {
             |_| {},
         );
         assert!(result.is_err());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        // Only the hidden lock file, which costs nothing and is reused.
+        let left: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, [".SLUS-00152.lock"]);
+        assert!(list_in(root.path()).is_empty());
+    }
+
+    #[test]
+    fn a_copy_another_window_is_keeping_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let _other = lock::take(&root.path().join(".SLUS-00152.lock"), "keeping a copy")
+            .unwrap()
+            .unwrap();
+        let mut wrote = false;
+        let result = keep_in(
+            root.path(),
+            &report(),
+            None,
+            |lba, count, audio| {
+                wrote = true;
+                sectors(lba, count, audio)
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("another Spectra window"), "{error}");
+        assert!(!wrote, "the disc was read anyway");
         assert!(list_in(root.path()).is_empty());
     }
 

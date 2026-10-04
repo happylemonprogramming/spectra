@@ -30,6 +30,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iced::futures::channel::mpsc::UnboundedSender;
 use spectra_core::Disc;
 use spectra_core::drive::Drive;
+use spectra_core::lock::Lock;
 use spectra_core::soundtrack::MusicFile;
 
 const CD_RATE: u32 = 44_100;
@@ -59,9 +60,13 @@ impl Source {
     }
 }
 
-/// A source, opened.
+/// A source, opened. The drive is held for this window while it is, so
+/// another Spectra window does not read it at the same time.
 enum Reader {
-    Drive(Drive),
+    Drive {
+        drive: Drive,
+        _held: Lock,
+    },
     Image(File),
     Files {
         disc: Box<dyn Disc>,
@@ -73,10 +78,15 @@ enum Reader {
 impl Reader {
     fn open(source: &Source) -> Result<Self, String> {
         match source {
-            Source::Drive(path) => Drive::open(path).map(Self::Drive),
-            Source::Image(path) => File::open(path).map(Self::Image).map_err(Into::into),
-            Source::Files { cue, files } => {
-                spectra_core::image::open(cue).map(|disc| Self::Files {
+            Source::Drive(path) => {
+                let lock = crate::windows::drive_lock(path, "playing")?;
+                Drive::open(path)
+                    .map(|drive| Self::Drive { drive, _held: lock })
+                    .map_err(|e| e.to_string())
+            }
+            Source::Image(path) => File::open(path).map(Self::Image).map_err(|e| e.to_string()),
+            Source::Files { cue, files } => spectra_core::image::open(cue)
+                .map(|disc| Self::Files {
                     disc,
                     files: file_spans(files)
                         .into_iter()
@@ -84,9 +94,8 @@ impl Reader {
                         .zip(files.iter().cloned())
                         .collect(),
                 })
-            }
+                .map_err(|e| e.to_string()),
         }
-        .map_err(|e| e.to_string())
     }
 
     /// `count` frames from `at`, as 16-bit little-endian samples. A drive
@@ -95,7 +104,7 @@ impl Reader {
     /// every track does.
     fn read(&mut self, at: u32, count: u32) -> Result<Vec<u8>, String> {
         match self {
-            Self::Drive(drive) => {
+            Self::Drive { drive, .. } => {
                 let (lba, sectors) = (at / FRAMES_PER_SECTOR, count / FRAMES_PER_SECTOR);
                 let mut last = String::new();
                 for _ in 0..3 {
@@ -330,8 +339,10 @@ fn run(
                 }
             }
             Ok(Command::Stop) => {
-                // Let go of the sound card, so nothing holds it open.
+                // Let go of the sound card, so nothing holds it open, and of
+                // the drive, for another window.
                 stream = None;
+                reader = None;
                 shared.queue.lock().expect("queue").clear();
                 playing = false;
             }
@@ -358,6 +369,7 @@ fn run(
                 }
                 Err(e) => {
                     stream = None;
+                    reader = None;
                     playing = false;
                     fail(e);
                     continue;
@@ -369,6 +381,7 @@ fn run(
         let at = origin + shared.played.load(Ordering::Relaxed) as u32;
         if at >= end && queued == 0 {
             stream = None;
+            reader = None;
             playing = false;
             let _ = events.unbounded_send(Event::Stopped);
             continue;
