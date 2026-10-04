@@ -176,7 +176,9 @@ notes=()
 ls /dev/sg* >/dev/null 2>&1 ||
 	notes+=("Load the sg module for full drive access: sudo modprobe sg, and to keep it: echo sg | sudo tee /etc/modules-load.d/sg.conf")
 command -v retroarch >/dev/null ||
-	notes+=("For games, install RetroArch, then the pcsx_rearmed (PS1) and play (PS2) cores from its Online Updater")
+	notes+=("For games, install RetroArch, then the pcsx_rearmed (PS1) core from its Online Updater")
+[ -f "$data/spectra/cores/play_libretro.so" ] ||
+	notes+=("For PS2 games, build Play! with Spectra's fixes: $PWD/emulators/play/build.sh (needs cmake and ninja)")
 command -v vlc >/dev/null ||
 	notes+=("For films, install VLC, and libdvdcss for most DVDs")
 if [ ${#notes[@]} -gt 0 ]; then

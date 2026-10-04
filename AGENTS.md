@@ -185,12 +185,14 @@ crates/spectra/         the app (iced on wgpu)
   src/audio.rs          CD audio through cpal; game.rs RetroArch; film.rs VLC
   src/tv.rs             on the TV: a screen of its own, streamed by Sunshine
   src/hyprland.rs       Hyprland's events, windows and screens
+emulators/play/         Play! as Spectra plays it: the upstream commit, our patches, build.sh
 scripts/check.sh        fmt, clippy -D warnings, tests: run before calling work done
 scripts/install.sh      the installer
 ```
 
 - Read [PLAN.md](PLAN.md) first: principles (lean, nothing legally doubtful,
-  emulators hosted not forked), budgets, and the phases.
+  emulators hosted, patched in `emulators/` when upstream lags), budgets, and
+  the phases.
 - A new command: a `Request` variant in `control.rs`, its handling in
   `Spectra::control` in `main.rs`, and its words in `cli.rs` and here.
 - Comments are plain sentences about why, in the voice of the ones around

@@ -2,9 +2,11 @@
 //!
 //! RetroArch plays straight from the drive: `cdrom://driveN.cue` is a cue
 //! sheet it builds from the TOC of `/dev/sgN`, so nothing is copied to disk
-//! first. Cores are looked for where RetroArch's own core updater puts them,
-//! then where Arch's packages do. A core that needs no BIOS comes first, so a
-//! disc plays without anything else to set up.
+//! first. Cores are looked for in Spectra's own folder first, where
+//! `emulators/*/build.sh` puts the ones it builds with fixes upstream has not
+//! merged yet; then where RetroArch's own core updater puts them, then where
+//! Arch's packages do. A core that needs no BIOS comes first, so a disc plays
+//! without anything else to set up.
 //!
 //! Not every core reads through RetroArch's drive: Play!, for the PS2, opens
 //! its files itself, so it plays a kept copy rather than the disc.
@@ -36,13 +38,21 @@ fn cores(system: GameSystem) -> &'static [(&'static str, bool)] {
     }
 }
 
+/// Where Spectra keeps the cores it builds: `$XDG_DATA_HOME/spectra/cores`.
+fn own_cores() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".local/share")))
+        .map(|data| data.join("spectra/cores"))
+}
+
 fn core_dirs() -> Vec<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")));
-    config
-        .map(|config| config.join("retroarch/cores"))
+    own_cores()
         .into_iter()
+        .chain(config.map(|config| config.join("retroarch/cores")))
         .chain([PathBuf::from("/usr/lib/libretro")])
         .collect()
 }
@@ -177,6 +187,15 @@ mod tests {
         assert!(!settings_text(&user, system).contains("joypad_autoconfig_dir"));
         assert!(!settings_text(&dir.join("none"), "/nowhere").contains("joypad_autoconfig_dir"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn spectras_own_cores_come_before_retroarchs() {
+        let dirs = core_dirs();
+        let own = dirs.iter().position(|dir| dir.ends_with("spectra/cores"));
+        let retroarch = dirs.iter().position(|dir| dir.ends_with("retroarch/cores"));
+        assert!(own.is_some() && own < retroarch, "{dirs:?}");
+        assert_eq!(dirs.last(), Some(&PathBuf::from("/usr/lib/libretro")));
     }
 
     #[test]

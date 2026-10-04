@@ -1,0 +1,5 @@
+# The Play! that Spectra builds: this commit of upstream, then patches/ in order.
+# Moving to a newer commit: change it, run build.sh, drop the patches upstream has
+# merged, and play a game of each kind the patches are for.
+PLAY_URL=https://github.com/jpd002/Play-.git
+PLAY_COMMIT=83700b2c31e593bc94e845b4b31b797be84dda59

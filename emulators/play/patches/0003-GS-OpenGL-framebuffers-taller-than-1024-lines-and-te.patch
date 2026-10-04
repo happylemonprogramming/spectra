@@ -1,0 +1,267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lemon <lemonknowsall@gmail.com>
+Date: Sun, 4 Oct 2026 11:58:22 -0700
+Subject: [PATCH 3/3] GS (OpenGL): framebuffers taller than 1024 lines, and
+ textures and displays inside them
+
+- Framebuffers are as tall as the GS memory after them allows (up to 2048 lines,
+  within what CGsCachedArea tracks), as games draw below line 1024.
+- A texture may start at any page inside a framebuffer, not only on its first
+  line of pages, and clamping follows the offset.
+- A displayed buffer that starts inside a taller framebuffer is shown from it.
+
+Midnight Club: its intro video and title screen were black or scrambled.
+---
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp         | 79 +++++++++++++++++++--
+ Source/gs/GSH_OpenGL/GSH_OpenGL.h           |  3 +
+ Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp  |  3 +-
+ Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp | 14 ++--
+ 4 files changed, 90 insertions(+), 9 deletions(-)
+
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 7eb9460f..a5839f26 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -20,6 +20,20 @@
+ 
+ #define NUM_SAMPLES 8
+ #define FRAMEBUFFER_HEIGHT 1024
++#define FRAMEBUFFER_MAX_HEIGHT 2048
++
++//Games may draw below the 1024th line of a buffer, and use what they drew there
++//as a texture (ex.: Midnight Club's video player). Make buffers as tall as the
++//GS memory after their start allows, within what CGsCachedArea can track.
++static uint32 GetFramebufferHeight(uint32 basePtr, uint32 width, uint32 psm)
++{
++	auto pageSize = CGsPixelFormats::GetPsmPageSize(psm);
++	uint32 pagesPerLine = std::max<uint32>((width + pageSize.first - 1) / pageSize.first, 1);
++	uint32 pagesLeft = (basePtr < CGSHandler::RAMSIZE) ? ((CGSHandler::RAMSIZE - basePtr) / CGsPixelFormats::PAGESIZE) : 0;
++	pagesLeft = std::min<uint32>(pagesLeft, CGsCachedArea::MAX_DIRTYPAGES);
++	uint32 height = (pagesLeft / pagesPerLine) * pageSize.second;
++	return std::clamp<uint32>(height, FRAMEBUFFER_HEIGHT, FRAMEBUFFER_MAX_HEIGHT);
++}
+ 
+ // clang-format off
+ const GLenum CGSH_OpenGL::g_nativeClampModes[CGSHandler::CLAMP_MODE_MAX] =
+@@ -142,6 +156,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 	const auto& dispLayer = dispInfo.layers[0];
+ 
+ 	FramebufferPtr framebuffer;
++	uint32 displayOffsetY = 0;
+ 
+ 	if(dispLayer.enabled)
+ 	{
+@@ -158,9 +173,22 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 			}
+ 		}
+ 
++		//The displayed buffer may be the lower part of one drawn as a whole: one tall
++		//buffer holding both halves of a double buffer (ex.: Midnight Club's video player)
+ 		if(!framebuffer && (dispLayer.bufWidth != 0))
+ 		{
+-			framebuffer = FramebufferPtr(new CFramebuffer(dispLayer.bufPtr, dispLayer.bufWidth, FRAMEBUFFER_HEIGHT, dispLayer.psm, m_fbScale, m_multisampleEnabled));
++			uint32 offsetX = 0, offsetY = 0;
++			auto candidateFramebuffer = FindContainingFramebuffer(dispLayer.bufPtr, dispLayer.bufWidth, dispLayer.psm, offsetX, offsetY);
++			if(candidateFramebuffer && (offsetX == 0) && ((offsetY + dispLayer.height) <= candidateFramebuffer->m_height))
++			{
++				framebuffer = candidateFramebuffer;
++				displayOffsetY = offsetY;
++			}
++		}
++
++		if(!framebuffer && (dispLayer.bufWidth != 0))
++		{
++			framebuffer = FramebufferPtr(new CFramebuffer(dispLayer.bufPtr, dispLayer.bufWidth, GetFramebufferHeight(dispLayer.bufPtr, dispLayer.bufWidth, dispLayer.psm), dispLayer.psm, m_fbScale, m_multisampleEnabled));
+ 			m_framebuffers.push_back(framebuffer);
+ 			PopulateFramebuffer(framebuffer);
+ 		}
+@@ -168,7 +196,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 
+ 	if(framebuffer)
+ 	{
+-		CommitFramebufferDirtyPages(framebuffer, 0, dispLayer.height);
++		CommitFramebufferDirtyPages(framebuffer, 0, displayOffsetY + dispLayer.height);
+ 		if(m_multisampleEnabled)
+ 		{
+ 			ResolveFramebufferMultisample(framebuffer, m_fbScale);
+@@ -217,6 +245,9 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 		assert(m_presentTexCoordScaleUniform != -1);
+ 		glUniform2f(m_presentTexCoordScaleUniform, u1, v1);
+ 
++		assert(m_presentTexCoordOffsetUniform != -1);
++		glUniform2f(m_presentTexCoordOffsetUniform, 0, static_cast<float>(displayOffsetY) / static_cast<float>(framebuffer->m_height));
++
+ 		glBindBuffer(GL_ARRAY_BUFFER, m_presentVertexBuffer);
+ 		glBindVertexArray(m_presentVertexArray);
+ 
+@@ -290,6 +321,7 @@ void CGSH_OpenGL::InitializeRC()
+ 	m_presentVertexArray = GeneratePresentVertexArray();
+ 	m_presentTextureUniform = glGetUniformLocation(*m_presentProgram, "g_texture");
+ 	m_presentTexCoordScaleUniform = glGetUniformLocation(*m_presentProgram, "g_texCoordScale");
++	m_presentTexCoordOffsetUniform = glGetUniformLocation(*m_presentProgram, "g_texCoordOffset");
+ 
+ 	m_copyToFbProgram = GenerateCopyToFbProgram();
+ 	m_copyToFbTexture = Framework::OpenGl::CTexture::Create();
+@@ -1016,7 +1048,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+ 	auto framebuffer = FindFramebuffer(frame);
+ 	if(!framebuffer)
+ 	{
+-		framebuffer = FramebufferPtr(new CFramebuffer(frame.GetBasePtr(), frame.GetWidth(), FRAMEBUFFER_HEIGHT, frame.nPsm, m_fbScale, m_multisampleEnabled));
++		framebuffer = FramebufferPtr(new CFramebuffer(frame.GetBasePtr(), frame.GetWidth(), GetFramebufferHeight(frame.GetBasePtr(), frame.GetWidth(), frame.nPsm), frame.nPsm, m_fbScale, m_multisampleEnabled));
+ 		m_framebuffers.push_back(framebuffer);
+ 		PopulateFramebuffer(framebuffer);
+ 	}
+@@ -1026,7 +1058,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+ 	auto depthbuffer = FindDepthbuffer(zbuf, frame);
+ 	if(!depthbuffer)
+ 	{
+-		depthbuffer = DepthbufferPtr(new CDepthbuffer(zbuf.GetBasePtr(), frame.GetWidth(), FRAMEBUFFER_HEIGHT, zbuf.nPsm, m_fbScale, m_multisampleEnabled));
++		depthbuffer = DepthbufferPtr(new CDepthbuffer(zbuf.GetBasePtr(), frame.GetWidth(), framebuffer->m_height, zbuf.nPsm, m_fbScale, m_multisampleEnabled));
+ 		m_depthbuffers.push_back(depthbuffer);
+ 	}
+ 
+@@ -1334,6 +1366,16 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
+ 				clampMin[i] = static_cast<unsigned int>(static_cast<float>(clampMin[i]) * textureScaleRatio[i]);
+ 				clampMax[i] = static_cast<unsigned int>(static_cast<float>(clampMax[i]) * textureScaleRatio[i]);
+ 			}
++
++			//A texture inside a framebuffer is sampled at an offset: so are its edges
++			if((clampMode[i] == TEXTURE_CLAMP_MODE_CLAMP) || (clampMode[i] == TEXTURE_CLAMP_MODE_REGION_CLAMP))
++			{
++				float offset = (i == 0) ? texInfo.offsetX : texInfo.offsetY;
++				uint32 size = (i == 0) ? tex0.GetWidth() : tex0.GetHeight();
++				auto shift = static_cast<unsigned int>(offset * static_cast<float>(size));
++				clampMin[i] += shift;
++				clampMax[i] += shift;
++			}
+ 		}
+ 	}
+ 
+@@ -1355,6 +1397,7 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
+ 	m_vertexParams.texMatrix[1 + (1 * 4)] = texInfo.scaleRatioY;
+ 	m_vertexParams.texMatrix[2 + (2 * 4)] = 1;
+ 	m_vertexParams.texMatrix[0 + (3 * 4)] = texInfo.offsetX;
++	m_vertexParams.texMatrix[1 + (3 * 4)] = texInfo.offsetY;
+ 	m_vertexParams.texMatrix[3 + (3 * 4)] = 1;
+ 	m_validGlState &= ~GLSTATE_VERTEX_PARAMS;
+ 
+@@ -1371,6 +1414,34 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
+ 	m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
+ }
+ 
++//A framebuffer with the same width and format, inside which bufPtr starts on a page
++//boundary; offsetX and offsetY say where, in pixels.
++CGSH_OpenGL::FramebufferPtr CGSH_OpenGL::FindContainingFramebuffer(uint32 bufPtr, uint32 bufWidth, uint32 psm, uint32& offsetX, uint32& offsetY) const
++{
++	for(const auto& candidateFramebuffer : m_framebuffers)
++	{
++		if(candidateFramebuffer->m_basePtr > bufPtr) continue;
++		if(candidateFramebuffer->m_width != bufWidth) continue;
++		if(GetFramebufferBitDepth(candidateFramebuffer->m_psm) != GetFramebufferBitDepth(psm)) continue;
++
++		uint32 framebufferOffset = bufPtr - candidateFramebuffer->m_basePtr;
++		if((framebufferOffset & (CGsPixelFormats::PAGESIZE - 1)) != 0) continue;
++
++		auto pageSize = CGsPixelFormats::GetPsmPageSize(candidateFramebuffer->m_psm);
++		uint32 pageCountX = candidateFramebuffer->m_width / pageSize.first;
++		if(pageCountX == 0) continue;
++		uint32 pageIndex = framebufferOffset / CGsPixelFormats::PAGESIZE;
++		uint32 x = (pageIndex % pageCountX) * pageSize.first;
++		uint32 y = (pageIndex / pageCountX) * pageSize.second;
++		if(y >= candidateFramebuffer->m_height) continue;
++
++		offsetX = x;
++		offsetY = y;
++		return candidateFramebuffer;
++	}
++	return FramebufferPtr();
++}
++
+ CGSH_OpenGL::FramebufferPtr CGSH_OpenGL::FindFramebuffer(const FRAME& frame) const
+ {
+ 	auto framebufferIterator = std::find_if(std::begin(m_framebuffers), std::end(m_framebuffers),
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index 290deb70..38b6e1f1 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -270,6 +270,7 @@ private:
+ 	{
+ 		GLuint textureHandle = 0;
+ 		float offsetX = 0;
++		float offsetY = 0;
+ 		float scaleRatioX = 1;
+ 		float scaleRatioY = 1;
+ 		bool alphaAsIndex = false;
+@@ -369,6 +370,7 @@ private:
+ 	static TEXTUREFORMAT_INFO GetTextureFormatInfo(uint32);
+ 
+ 	FramebufferPtr FindFramebuffer(const FRAME&) const;
++	FramebufferPtr FindContainingFramebuffer(uint32 bufPtr, uint32 bufWidth, uint32 psm, uint32& offsetX, uint32& offsetY) const;
+ 	DepthbufferPtr FindDepthbuffer(const ZBUF&, const FRAME&) const;
+ 
+ 	void DumpTexture(unsigned int, unsigned int, uint32);
+@@ -420,6 +422,7 @@ private:
+ 	Framework::OpenGl::CVertexArray m_presentVertexArray;
+ 	GLint m_presentTextureUniform = -1;
+ 	GLint m_presentTexCoordScaleUniform = -1;
++	GLint m_presentTexCoordOffsetUniform = -1;
+ 
+ 	Framework::OpenGl::ProgramPtr m_copyToFbProgram;
+ 	Framework::OpenGl::CTexture m_copyToFbTexture;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
+index 3f37572a..8b242b3a 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
+@@ -662,9 +662,10 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GeneratePresentProgram()
+ 		shaderBuilder << "in vec2 a_texCoord;" << std::endl;
+ 		shaderBuilder << "out vec2 v_texCoord;" << std::endl;
+ 		shaderBuilder << "uniform vec2 g_texCoordScale;" << std::endl;
++		shaderBuilder << "uniform vec2 g_texCoordOffset;" << std::endl;
+ 		shaderBuilder << "void main()" << std::endl;
+ 		shaderBuilder << "{" << std::endl;
+-		shaderBuilder << "	v_texCoord = a_texCoord * g_texCoordScale;" << std::endl;
++		shaderBuilder << "	v_texCoord = a_texCoord * g_texCoordScale + g_texCoordOffset;" << std::endl;
+ 		shaderBuilder << "	gl_Position = vec4(a_position, 0, 1);" << std::endl;
+ 		shaderBuilder << "}" << std::endl;
+ 
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+index 01a12176..2a8c9456 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+@@ -106,6 +106,7 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
+ {
+ 	TEXTURE_INFO texInfo;
+ 	FramebufferPtr framebuffer;
++	uint32 framebufferOffsetY = 0;
+ 
+ 	//First pass, look for an exact match
+ 	for(const auto& candidateFramebuffer : m_framebuffers)
+@@ -151,11 +152,16 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
+ 				uint32 framebufferPageCountX = candidateFramebuffer->m_width / framebufferPageSize.first;
+ 				uint32 framebufferPageIndex = framebufferOffset / CGsPixelFormats::PAGESIZE;
+ 
+-				//Bail if pointed page isn't on the first line
+-				if(framebufferPageIndex >= framebufferPageCountX) continue;
++				//The page may be on any line: games draw into a part of a tall buffer, then
++				//use it as a texture (ex.: Midnight Club's video player)
++				uint32 pageX = framebufferPageIndex % framebufferPageCountX;
++				uint32 pageY = framebufferPageIndex / framebufferPageCountX;
++				if((pageY * framebufferPageSize.second) >= candidateFramebuffer->m_height) continue;
+ 
+ 				framebuffer = candidateFramebuffer;
+-				texInfo.offsetX = static_cast<float>(framebufferPageIndex * framebufferPageSize.first) / static_cast<float>(candidateFramebuffer->m_width);
++				framebufferOffsetY = pageY * framebufferPageSize.second;
++				texInfo.offsetX = static_cast<float>(pageX * framebufferPageSize.first) / static_cast<float>(candidateFramebuffer->m_width);
++				texInfo.offsetY = static_cast<float>(framebufferOffsetY) / static_cast<float>(candidateFramebuffer->m_height);
+ 				break;
+ 			}
+ 		}
+@@ -163,7 +169,7 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
+ 
+ 	if(framebuffer)
+ 	{
+-		CommitFramebufferDirtyPages(framebuffer, 0, tex0.GetHeight());
++		CommitFramebufferDirtyPages(framebuffer, 0, framebufferOffsetY + tex0.GetHeight());
+ 		if(m_multisampleEnabled)
+ 		{
+ 			ResolveFramebufferMultisample(framebuffer, m_fbScale);

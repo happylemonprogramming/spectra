@@ -17,7 +17,7 @@ can read.
 | Hardware | Phases 0-2 and 4: any name-brand USB DVD drive (about $20). It reads every CD and DVD format Spectra plays except GameCube, Wii and Xbox. Phase 3 and Blu-ray need a drive on LG's MT1959 platform, which OmniDrive runs on - ideally a used internal LG Blu-ray drive in a USB enclosure, checked against the [Redump OmniDrive page](https://wiki.redump.info/OmniDrive). Selling hardware is out of scope |
 | Stack | Rust throughout. The UI is [iced](https://iced.rs) 0.14 on wgpu, with the disc as a wgpu shader. Chosen over Tauri by the UI weight spike (`docs/spikes.md`): a quarter of the memory of an empty WebKitGTK page, with the whole screen built |
 | License | GPL-3.0-or-later, the same as Rainbow Player, so its code can be reused |
-| Emulators | Hosted, not forked. Standalone programs or libretro cores do the emulation; Spectra identifies the disc, routes it, and supplies the UI |
+| Emulators | Hosted, with our own patched build when upstream lags. Standalone programs or libretro cores do the emulation; Spectra identifies the disc, routes it, and supplies the UI. A fix Spectra needs is sent upstream and also kept in `emulators/<name>/patches`, applied to a pinned upstream commit by `emulators/<name>/build.sh`, so users have it whether or not it is merged. A patch is dropped once upstream has it |
 
 ## Principles
 
@@ -50,7 +50,7 @@ build.
 | Spectra's memory while a game runs | < 20 MB | not built yet |
 | GPU while the menu sits idle | 0% | 0% above the desktop's own baseline |
 | CPU while the disc spins | none set | ~14% of one core at 60 Hz: iced lays the whole view out every frame |
-| Emulators bundled | none: installed when a disc first needs them | none |
+| Emulators bundled | none: installed when a disc first needs them | none; Play! is built by `emulators/play/build.sh` (9.9 MB) |
 
 How the design keeps to them:
 
@@ -82,8 +82,10 @@ How the design keeps to them:
   is legally delicate to distribute, and system packages get security
   fixes. The package also loads the `sg` module at boot, if spike 1 shows it
   is needed.
-- **Emulators on demand.** The first PS2 disc offers to install PCSX2;
-  nobody downloads Dolphin to play CDs.
+- **Emulators on demand.** The first PS2 disc offers to fetch Spectra's
+  build of Play! (for now, `emulators/play/build.sh` builds it; a ready-made
+  build to download comes once the repository is public); nobody downloads
+  Dolphin to play CDs.
 - **Old laptops.** Spectra itself, music, films and CD-era consoles should
   run on roughly a 2012-era laptop. PS2, GameCube and Wii need a stronger CPU,
   and original Xbox a modern one; that is the emulators' floor, and Spectra
