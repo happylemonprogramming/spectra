@@ -176,14 +176,19 @@ ported into Spectra with credit.
 ```
 crates/spectra-core/    reading and identifying discs (drive over SG_IO, or images)
 crates/spectra-discid/  command line: what disc is this?
-crates/spectra/         the app: iced UI, the disc shader, motion, gamepads, the library
+crates/spectra/         the app: iced UI, the disc shader, motion, gamepads, the library,
+                        and the command line (`cli.rs`) that drives it over a socket (`control.rs`)
 crates/spectra/assets/  Kenney's Input Prompts (CC0), as small PNGs built into the app
 docs/spikes.md          Phase 0 questions and their answers
 packaging/              the desktop entry and icon
 scripts/check.sh        fmt, clippy, tests
 scripts/measure.sh      a release build against the budgets
 scripts/first-drive.sh  the first evening with a drive: spikes 1, 4 and 6
-scripts/install.sh      install for this user under ~/.local, so the launcher finds it
+scripts/install.sh      the one-line install: builds from source under ~/.local, from a
+                        checkout or piped from curl
+scripts/install.ps1     the Windows one-liner, which for now says Spectra is Linux only
+README.md               install and use
+AGENTS.md               driving Spectra from the command line, for agents
 ```
 
 Rust is pinned per-project by `mise.toml`.
@@ -322,6 +327,38 @@ LCDs, frame blending for sprites that flicker on purpose to look
 transparent, a CRT shader for console games - on without anyone having to
 know the settings exist.
 
+### Idea: a better picture for old games
+
+Researched, not planned. Could PS1, PS2 and GameCube games look better than
+they did, the way DLSS does for new ones, and the same way for every system?
+
+- **DLSS is out.** It needs an NVIDIA RTX card, and the game engine's motion
+  vectors and depth, which an emulator does not produce; the budget laptop's
+  GPU is AMD's anyway. Generating each frame anew with a diffusion model
+  is far too slow on an integrated GPU, and flickers from frame to frame.
+- **Without a BIOS**, which Spectra avoids, each emulator gives less:
+  - PS1, PCSX-ReARMed: 2× rendering (`pcsx_rearmed_neon_enhancement_enable`)
+    and dithering off (`pcsx_rearmed_dithering`), both off today. No PGXP, so
+    polygons still wobble. SwanStation or Beetle PSX HW would add PGXP, 4-8×
+    and widescreen, but want a BIOS; PCSX-Redux's OpenBIOS, a free
+    replacement, might stand in. Untested.
+  - PS2, Play!: `play_res_multi` 2× or 4×. No texture replacement.
+  - GameCube, Dolphin: needs no BIOS. 2-4× rendering, widescreen hacks, and
+    community HD texture packs, some upscaled by AI.
+- **The same for every system: post-processing.** RetroArch's slang shaders
+  work on any core, given `video_driver = "vulkan"` and the shader pack
+  (`libretro-shaders-slang`): `crt-guest-advanced` for the CRT look these
+  games were drawn for, `fsr` (AMD FidelityFX upscaling and sharpening) or
+  `nnedi3` (a small neural upscaler) for a sharper one. Spectra already
+  writes a settings file for RetroArch, so a preset per system goes there.
+- **In the end, Spectra's own.** With the libretro host above, every frame
+  passes through Spectra's wgpu renderer, and one WGSL stage - CRT, FSR, or
+  a small neural upscaler - serves every system at once, tuned per system.
+
+The order, if it is taken up: the PS1 and PS2 options, then Vulkan and a
+shader per system, then an OpenBIOS test, then a shader stage of Spectra's
+own.
+
 ## On the TV
 
 Spectra should play on the living room TV without a cable, from a computer
@@ -384,10 +421,16 @@ could be reached.
 Shelved, not ruled out: Omarchy comes first, and the
 [Portability](#portability) rules keep both a port rather than a rewrite.
 
-- [ ] A one-line install, the way agentic tools ship:
-      `curl -fsSL …/install.sh | sh` on macOS and Linux,
-      `irm …/install.ps1 | iex` on Windows. cargo-dist builds the binaries in
-      CI and writes both scripts; start it on Linux once the repo has CI
+- [x] A one-line install on Linux: `curl -fsSL …/install.sh | bash` builds
+      from source under `~/.local`, installing build packages (asked first)
+      and Rust (rustup) where missing. macOS and Windows get a clear "Linux
+      only for now"
+- [ ] Put the repository's URLs into the scripts, README and AGENTS.md once
+      it has a home: `__SPECTRA_REPO_URL__` (git) and `__SPECTRA_RAW_URL__`
+      (raw files)
+- [ ] Prebuilt binaries instead of a build on every machine: cargo-dist in CI
+      builds them and writes both scripts. Start it on Linux once the repo
+      has CI
 - [ ] Drive backends behind the `Disc` trait: IOKit's
       SCSITaskDeviceInterface on macOS (unmount through DiskArbitration
       first), SPTI on Windows. Repeat the USB bridge spike on each

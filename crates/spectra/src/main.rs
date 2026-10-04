@@ -9,11 +9,16 @@
 //! the drive while working on the screen.
 //!
 //!   spectra [ALBUM.json] [--play] [--reduced-motion]
+//!
+//! The same window can be driven from a terminal or by an agent - `spectra
+//! play`, `spectra pause`, `spectra status` - see `cli` and `control`.
 
 mod album;
 mod art;
 mod artwork;
 mod audio;
+mod cli;
+mod control;
 mod disc;
 mod film;
 mod filmdb;
@@ -152,6 +157,8 @@ enum Message {
     Wheel(Screen, ScrollDelta),
     /// The pointer moved: the mouse is in use, and here.
     Pointer(Point),
+    /// A command from outside, and where its answer goes.
+    Control(control::Request, control::Responder),
 }
 
 /// How the screen is arranged, from the most room to the least.
@@ -743,6 +750,235 @@ impl Spectra {
                 self.pointing = false;
                 self.remote(remote)
             }
+            Message::Control(request, responder) => {
+                let (result, task) = self.control(request);
+                let status = self.status();
+                responder.send(match result {
+                    Ok(()) => control::Reply::done(status),
+                    Err(why) => control::Reply::failed(why, status),
+                });
+                task
+            }
+        }
+    }
+
+    /// A command from outside: what the remote would do, and an error in
+    /// words where the remote would quietly do nothing.
+    fn control(&mut self, request: control::Request) -> (Result<(), String>, Task<Message>) {
+        use control::Request;
+        match request {
+            Request::Status => return (Ok(()), Task::none()),
+            Request::Quit => {
+                let _ = std::fs::remove_file(control::socket());
+                return (Ok(()), iced::exit());
+            }
+            _ if self.copying.is_some() => {
+                return (
+                    Err("the drive is busy keeping a copy of the disc".into()),
+                    Task::none(),
+                );
+            }
+            _ if self.in_game => {
+                return (
+                    Err("a game is running: quit it first (hold Start)".into()),
+                    Task::none(),
+                );
+            }
+            // VLC has the screen: the transport is its remote, as the pad's
+            // buttons are.
+            _ if self.film.is_some() => {
+                let key = match request {
+                    Request::Pause | Request::Resume | Request::Toggle => film::Key::PlayPause,
+                    Request::Next => film::Key::NextChapter,
+                    Request::Previous => film::Key::PreviousChapter,
+                    Request::Stop => {
+                        self.film = None;
+                        return (Ok(()), Task::none());
+                    }
+                    _ => {
+                        return (
+                            Err("a film is playing: `spectra stop` ends it".into()),
+                            Task::none(),
+                        );
+                    }
+                };
+                if let Some(film) = &self.film {
+                    film.press(key);
+                }
+                return (Ok(()), Task::none());
+            }
+            Request::Play { target, track } => return self.control_play(target, track),
+            _ => {}
+        }
+        if self.album.tracks.is_empty() || !self.album.playable {
+            return (Err("nothing on the stage plays".into()), Task::none());
+        }
+        match request {
+            Request::Pause | Request::Resume if self.playing.is_none() => {
+                return (Err("nothing is playing".into()), Task::none());
+            }
+            Request::Pause => self.pause(true),
+            Request::Resume => self.pause(false),
+            Request::Toggle => match self.playing {
+                Some(_) => self.pause(!self.paused),
+                None => self.play(self.focus),
+            },
+            Request::Next => self.skip(true),
+            Request::Previous => self.skip(false),
+            Request::Stop => self.stop(),
+            Request::Status | Request::Quit | Request::Play { .. } => {}
+        }
+        (Ok(()), self.reveal_focus())
+    }
+
+    fn control_play(
+        &mut self,
+        target: control::Target,
+        track: Option<usize>,
+    ) -> (Result<(), String>, Task<Message>) {
+        use control::Target;
+        let mut task = Task::none();
+        match target {
+            Target::Stage => {}
+            Target::Disc => {
+                if self.picked.is_some() {
+                    task = self.return_to_drive();
+                }
+                if self.film_uri.is_some() {
+                    if !film::installed() {
+                        return (Err("films play in VLC, which isn't installed".into()), task);
+                    }
+                    return (Ok(()), Task::batch([task, self.start_film()]));
+                }
+                if self.disc.is_none() {
+                    return (Err("no disc Spectra plays is in the drive".into()), task);
+                }
+                if self.launch.is_some() {
+                    return (Ok(()), Task::batch([task, self.start_game()]));
+                }
+                if self.disc.as_ref().is_some_and(|d| d.game.is_some()) {
+                    return (Err(plain(&self.ready_note())), task);
+                }
+            }
+            Target::Copy(id) => {
+                let missing = self.shelf.load(self.shelf_entries());
+                let faces = shelf_faces(missing);
+                let Some(index) = self.shelf.entries.iter().position(|e| e.meta.id == id) else {
+                    return (Err(format!("no kept copy called {id}")), faces);
+                };
+                let entry = &self.shelf.entries[index];
+                if let Some(n) = track
+                    && entry.is_album()
+                    && entry.toc().is_some_and(|toc| n > audio::spans(&toc).len())
+                {
+                    return (Err(format!("{} has no track {n}", entry.meta.title)), faces);
+                }
+                let game = !entry.is_album();
+                let picked = self.pick(index);
+                if self.picked.as_ref().is_none_or(|p| p.meta.id != id) {
+                    return (Err("that copy would not open".into()), faces);
+                }
+                if game && self.launch.is_none() {
+                    return (
+                        Err("no emulator for this console is installed".into()),
+                        Task::batch([faces, picked]),
+                    );
+                }
+                task = Task::batch([faces, picked]);
+                // A copy starts playing as it goes on the stage.
+                if track.is_none() || game {
+                    return (Ok(()), task);
+                }
+            }
+        }
+        if self.launch.is_some() && track.is_none() && self.playing.is_none() {
+            return (Ok(()), Task::batch([task, self.start_game()]));
+        }
+        if self.film_uri.is_some() && self.picked.is_none() && track.is_none() {
+            return (Ok(()), Task::batch([task, self.start_film()]));
+        }
+        if !self.album.playable {
+            return (Err("nothing on the stage plays".into()), task);
+        }
+        let count = self.album.tracks.len();
+        match track {
+            Some(n) if n > count => {
+                return (
+                    Err(format!("there is no track {n}; there are {count}")),
+                    task,
+                );
+            }
+            Some(n) => {
+                self.focus = n - 1;
+                self.play(n - 1);
+            }
+            None if self.playing.is_some() && self.paused => self.pause(false),
+            None if self.playing.is_some() => {}
+            None => self.play(self.focus),
+        }
+        (Ok(()), Task::batch([task, self.reveal_focus()]))
+    }
+
+    /// What is on the stage, for whoever asked from outside.
+    fn status(&self) -> control::Status {
+        let (source, id) = match (&self.picked, &self.disc) {
+            (Some(entry), _) => ("copy", Some(entry.meta.id.clone())),
+            _ if !self.watching => ("file", None),
+            (None, Some(disc)) => ("drive", library::id(&disc.report)),
+            (None, None) => ("drive", None),
+        };
+        let kind = match (&self.picked, &self.disc) {
+            (Some(entry), _) if entry.is_album() => "music",
+            (Some(_), _) => "game",
+            _ if !self.watching => "music",
+            (None, _) if self.film_uri.is_some() => "film",
+            (None, Some(disc)) if disc.game.is_some() => "game",
+            (None, Some(_)) => "music",
+            (None, None) => "none",
+        };
+        let drive = match &self.drive_state {
+            _ if !self.watching => "not-watched",
+            None | Some(DriveState::NoDrive) => "no-drive",
+            Some(DriveState::Empty) => "empty",
+            Some(DriveState::Reading) => "reading",
+            Some(DriveState::Disc { .. }) => "disc",
+            Some(DriveState::Unreadable(_)) => "unreadable",
+        };
+        control::Status {
+            screen: match self.screen {
+                Screen::Stage => "stage",
+                Screen::Library => "library",
+            }
+            .into(),
+            source: source.into(),
+            drive: drive.into(),
+            id,
+            kind: kind.into(),
+            title: self.album.title.clone(),
+            artist: self.album.artist.clone(),
+            tracks: self
+                .album
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| control::TrackStatus {
+                    number: i + 1,
+                    title: t.title.clone(),
+                    seconds: t.seconds,
+                })
+                .collect(),
+            playing: self.playing.map(|t| t + 1),
+            paused: self.paused,
+            elapsed: self.elapsed,
+            in_game: self.in_game,
+            in_film: self.film.is_some(),
+            copying: self.copying.is_some(),
+            note: self
+                .album
+                .note
+                .as_deref()
+                .map(plain)
+                .filter(|n| !n.is_empty()),
         }
     }
 
@@ -841,39 +1077,49 @@ impl Spectra {
             Remote::Down => self.focus = (self.focus + 1).min(count - 1),
             Remote::Select => self.play(self.focus),
             Remote::PlayPause => match self.playing {
-                Some(_) => {
-                    self.paused = !self.paused;
-                    self.motion.set_spinning(!self.paused);
-                    if let Some(player) = &self.player {
-                        if self.paused {
-                            player.pause();
-                        } else {
-                            player.resume();
-                        }
-                    }
-                }
+                Some(_) => self.pause(!self.paused),
                 None => self.play(self.focus),
             },
-            Remote::Previous | Remote::Next | Remote::Left | Remote::Right => {
-                let current = self.playing.unwrap_or(self.focus);
-                self.focus = match remote {
-                    Remote::Previous | Remote::Left => current.saturating_sub(1),
-                    _ => (current + 1).min(count - 1),
-                };
-                if self.playing.is_some() {
-                    self.play(self.focus);
-                }
-            }
-            Remote::Back => {
-                self.playing = None;
-                self.motion.set_spinning(false);
-                if let Some(player) = &self.player {
-                    player.stop();
-                }
-            }
+            Remote::Previous | Remote::Left => self.skip(false),
+            Remote::Next | Remote::Right => self.skip(true),
+            Remote::Back => self.stop(),
             Remote::Keep | Remote::Menu | Remote::Library | Remote::Quit => {}
         }
         self.reveal_focus()
+    }
+
+    fn pause(&mut self, paused: bool) {
+        self.paused = paused;
+        self.motion.set_spinning(!paused);
+        if let Some(player) = &self.player {
+            if paused {
+                player.pause();
+            } else {
+                player.resume();
+            }
+        }
+    }
+
+    /// On to the next track or back to the one before, playing it if a
+    /// track was playing. The album has tracks.
+    fn skip(&mut self, forward: bool) {
+        let current = self.playing.unwrap_or(self.focus);
+        self.focus = if forward {
+            (current + 1).min(self.album.tracks.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        if self.playing.is_some() {
+            self.play(self.focus);
+        }
+    }
+
+    fn stop(&mut self) {
+        self.playing = None;
+        self.motion.set_spinning(false);
+        if let Some(player) = &self.player {
+            player.stop();
+        }
     }
 
     /// A step of the wheel: down from the stage to the library, and up from
@@ -1566,6 +1812,8 @@ impl Spectra {
         let remote = Subscription::batch([
             keyboard::listen().filter_map(key).map(Message::Remote),
             gamepad::subscription().map(|(pad, remote)| Message::Pad(pad, remote)),
+            control::subscription()
+                .map(|(request, responder)| Message::Control(request, responder)),
         ]);
         let remote = if self.watching {
             Subscription::batch([remote, watch::subscription().map(Message::Drive)])
@@ -2119,6 +2367,16 @@ fn film_uri(state: &DriveState) -> Option<String> {
     }
 }
 
+/// A note with its buttons named as keys, for the command line:
+/// `"{accept} Play"` is `"Enter Play"`.
+fn plain(note: &str) -> String {
+    note.replace("{accept}", "Enter")
+        .replace("{back}", "Backspace")
+        .replace("{alt}", "C")
+        .replace("{library}", "L")
+        .replace("{select}", "M")
+}
+
 fn key(event: keyboard::Event) -> Option<Remote> {
     let keyboard::Event::KeyPressed { key, .. } = event else {
         return None;
@@ -2163,6 +2421,10 @@ fn prefer_vulkan() {
 }
 
 fn main() -> iced::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = cli::run(&args) {
+        std::process::exit(code);
+    }
     prefer_vulkan();
     iced::application(Spectra::new, Spectra::update, Spectra::view)
         .title("Spectra")
