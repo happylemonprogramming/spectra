@@ -40,12 +40,12 @@ use iced::mouse::ScrollDelta;
 use iced::widget::scrollable::{AbsoluteOffset, Direction, Scrollbar, Viewport};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Id, button, column, container, image, mouse_area, operation, pin, responsive, row, scrollable,
-    shader, space, stack, text,
+    Id, button, column, container, image, mouse_area, operation, pin, progress_bar, responsive,
+    row, scrollable, shader, space, stack, text,
 };
 use iced::{
-    Background, Border, Color, ContentFit, Element, Fill, Font, Point, Radians, Shadow, Size,
-    Subscription, Task, Theme, Vector, window,
+    Background, Border, Color, ContentFit, Element, Fill, Font, Point, Radians, Shadow, Shrink,
+    Size, Subscription, Task, Theme, Vector, window,
 };
 
 use album::Album;
@@ -1696,9 +1696,16 @@ impl Spectra {
         let scale = Scale::for_size(size);
         match Layout::for_size(size) {
             Layout::Beside { disc } => {
-                let album = column![self.header(scale), self.tracks(scale), self.hints(scale)]
-                    .spacing(scale.gap)
-                    .max_width(560);
+                let album = column![
+                    self.header(scale),
+                    self.tracks(scale),
+                    self.player_bar(scale),
+                    self.hints(scale)
+                ]
+                .spacing(scale.gap)
+                .max_width(560)
+                // As tall as what is in it, to be centred.
+                .height(Shrink);
                 let pad = if scale.gap > 20.0 { [40, 44] } else { [16, 20] };
                 row![
                     self.disc().width(disc).height(Fill),
@@ -1709,9 +1716,15 @@ impl Spectra {
             Layout::Above { disc } => column![
                 self.disc().width(Fill).height(disc),
                 container(
-                    column![self.header(scale), self.tracks(scale), self.hints(scale)]
-                        .spacing(scale.gap)
-                        .max_width(560),
+                    column![
+                        self.header(scale),
+                        self.tracks(scale),
+                        self.player_bar(scale),
+                        self.hints(scale)
+                    ]
+                    .spacing(scale.gap)
+                    .max_width(560)
+                    .height(Shrink),
                 )
                 .padding([0, 20])
                 .center_x(Fill)
@@ -1724,6 +1737,7 @@ impl Spectra {
                         .spacing(14)
                         .align_y(Vertical::Center),
                     self.tracks(scale),
+                    self.player_bar(scale),
                 ]
                 .spacing(scale.gap),
             )
@@ -1829,11 +1843,10 @@ impl Spectra {
                 .width(Fill)
                 .clip(true),
                 text(track.detail.clone().unwrap_or_else(|| {
-                    let length = format!("{}:{:02}", track.seconds / 60, track.seconds % 60);
                     if is_playing && self.player.is_some() {
-                        format!("{}:{:02} / {length}", self.elapsed / 60, self.elapsed % 60)
+                        format!("{} / {}", clock(self.elapsed), clock(track.seconds))
                     } else {
-                        length
+                        clock(track.seconds)
                     }
                 }))
                 .font(FONT)
@@ -1875,13 +1888,18 @@ impl Spectra {
                 });
             mouse_area(row).on_press(Message::Pick(i)).into()
         });
-        scrollable(column(rows).spacing(ROW_GAP).padding(LIST_PAD))
+        let list = scrollable(column(rows).spacing(ROW_GAP).padding(LIST_PAD))
             .id(TRACKS)
             .on_scroll(Message::Scrolled)
             .direction(Direction::Vertical(
                 Scrollbar::new().width(3).scroller_width(3).margin(2),
-            ))
-            .into()
+            ));
+        // Filling what the header and the player leave, so a long list
+        // scrolls rather than pushing the player off the screen; but no
+        // taller than its rows, so a short one does not stretch.
+        let count = self.album.tracks.len() as f32;
+        let rows = count * scale.row + (count - 1.0).max(0.0) * ROW_GAP + 2.0 * LIST_PAD;
+        container(list).height(Fill).max_height(rows).into()
     }
 
     fn hints(&self, scale: Scale) -> Element<'_, Message> {
@@ -1898,16 +1916,26 @@ impl Spectra {
         .into()
     }
 
-    /// The smallest layout: the cover, what is playing (or would play), and
-    /// buttons for the mouse.
-    fn controls(&self, size: Size) -> Element<'_, Message> {
+    /// The track playing, or the one that would if Play were pressed, and
+    /// how many seconds into it.
+    fn now(&self) -> Option<(&album::Track, u32)> {
+        if !self.album.playable {
+            return None;
+        }
+        let track = self.album.tracks.get(self.playing.unwrap_or(self.focus))?;
+        Some((
+            track,
+            if self.playing.is_some() {
+                self.elapsed
+            } else {
+                0
+            },
+        ))
+    }
+
+    /// Previous, play or pause, and next, as buttons.
+    fn transport(&self) -> iced::widget::Row<'_, Message> {
         let accent = self.accent();
-        let now = self.playing.unwrap_or(self.focus);
-        let title = self
-            .album
-            .tracks
-            .get(now)
-            .map_or(self.album.title.as_str(), |t| t.title.as_str());
         let control = |glyph: &'static str, remote: Remote| {
             button(text(glyph).font(FONT).size(15).center())
                 .width(40)
@@ -1925,12 +1953,81 @@ impl Spectra {
                 })
         };
         let playing = self.playing.is_some() && !self.paused;
-        let buttons = row![
+        row![
             control("❚◀", Remote::Previous),
             control(if playing { "❚❚" } else { "▶" }, Remote::PlayPause),
             control("▶❚", Remote::Next),
         ]
-        .spacing(4);
+        .spacing(4)
+    }
+
+    /// How far into the track, as a bar.
+    fn progress(&self) -> Option<Element<'_, Message>> {
+        let (track, elapsed) = self.now()?;
+        let total = track.seconds.max(1);
+        let accent = self.accent();
+        Some(
+            progress_bar(0.0..=total as f32, elapsed.min(total) as f32)
+                .girth(4)
+                .style(move |_| progress_bar::Style {
+                    background: Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.15)),
+                    bar: Background::Color(accent),
+                    border: Border {
+                        radius: 2.0.into(),
+                        ..Border::default()
+                    },
+                })
+                .into(),
+        )
+    }
+
+    /// The player under the track list: the buttons, what is playing, how
+    /// far into it, and its time against its length.
+    fn player_bar(&self, scale: Scale) -> Element<'_, Message> {
+        let Some((track, elapsed)) = self.now() else {
+            return space().into();
+        };
+        let dim = Color::from_rgba(1.0, 1.0, 1.0, 0.6);
+        let about = column![
+            row![
+                container(
+                    text(&track.title)
+                        .font(FONT)
+                        .size(scale.detail)
+                        .wrapping(Wrapping::None)
+                        .color(Color::WHITE),
+                )
+                .width(Fill)
+                .clip(true),
+                text(format!("{} / {}", clock(elapsed), clock(track.seconds)))
+                    .font(FONT)
+                    .size(scale.detail)
+                    .color(dim),
+            ]
+            .spacing(8),
+        ]
+        .push(self.progress())
+        .spacing(6)
+        .width(Fill);
+        container(
+            row![self.transport(), about]
+                .spacing(14)
+                .align_y(Vertical::Center),
+        )
+        .padding([0.0, LIST_PAD])
+        .into()
+    }
+
+    /// The smallest layout: the cover, what is playing (or would play), and
+    /// buttons for the mouse.
+    fn controls(&self, size: Size) -> Element<'_, Message> {
+        let now = self.playing.unwrap_or(self.focus);
+        let title = self
+            .album
+            .tracks
+            .get(now)
+            .map_or(self.album.title.as_str(), |t| t.title.as_str());
+        let buttons = self.transport();
         let line = |text_size: f32| {
             column![
                 text(title)
@@ -1953,7 +2050,8 @@ impl Spectra {
             if size.width >= 360.0 {
                 side = side.push(self.cover(48.0));
             }
-            side.push(container(line(15.0)).width(Fill).clip(true))
+            let line = line(15.0).push(self.progress());
+            side.push(container(line).width(Fill).clip(true))
                 .push(buttons)
                 .into()
         } else if size.height >= 150.0 {
@@ -1982,6 +2080,11 @@ fn blocking<T: Default + Send + 'static>(
         let _ = tx.send(work());
     });
     async move { rx.await.unwrap_or_default() }
+}
+
+/// Seconds as a player shows them: `4:28`.
+fn clock(seconds: u32) -> String {
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 /// Faces for copies new to the shelf, made off the UI thread.
