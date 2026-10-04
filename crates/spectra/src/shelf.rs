@@ -43,6 +43,8 @@ const GAP_Y: f32 = 24.0;
 const CELL_PAD: f32 = 8.0;
 /// The status line under each disc.
 const STATUS: f32 = 20.0;
+/// The side of the picture on each disc saying what it holds.
+const BADGE: f32 = 20.0;
 const HEADER_TOP: f32 = 40.0;
 const HEADER_BOTTOM: f32 = 24.0;
 const GRID_BOTTOM: f32 = 24.0;
@@ -284,6 +286,18 @@ fn slot(id: &str) -> u64 {
     hasher.finish() | SLOT_BIT
 }
 
+/// What a copy holds, for its badge. A soundtrack is music, though its copy
+/// is a game's.
+fn kind(entry: &Entry) -> ui::Kind {
+    if entry.is_film() {
+        ui::Kind::Film
+    } else if entry.is_album() || crate::soundtrack::is_entry(entry) {
+        ui::Kind::Music
+    } else {
+        ui::Kind::Game
+    }
+}
+
 /// "PlayStation · Eidos Interactive · 1996", or an album's artist.
 pub fn byline(entry: &Entry) -> String {
     if entry.is_film() {
@@ -511,6 +525,25 @@ impl Shelf {
         .spacing(4)
         .align_x(Horizontal::Center);
         let content = container(content).padding(CELL_PAD).width(cell);
+        // What the disc holds, on a dark chip at its lower right; a layer of
+        // its own over the disc, as the ring is.
+        let chip = container(image(kind(entry).icon()).width(BADGE).height(BADGE))
+            .padding(BADGE / 3.0)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))),
+                border: Border {
+                    radius: BADGE.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let badge = container(chip)
+            .width(cell)
+            .height(disc + CELL_PAD)
+            .padding(CELL_PAD)
+            .align_right(Fill)
+            .align_bottom(Fill);
+        let content = stack![content, badge];
         // The ring is a layer of its own over the cell: drawn in the disc's
         // layer, a bordered quad blacks out the disc's surroundings.
         let boxed: Element<'_, Message> = if ring {

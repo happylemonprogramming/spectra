@@ -269,6 +269,37 @@ pub fn quiet_text<'a>(words: &str) -> Element<'a, Message> {
     text(words.to_uppercase()).font(FONT).size(13).into()
 }
 
+/// What a disc holds, for the small picture on it in the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Game,
+    Film,
+    Music,
+}
+
+impl Kind {
+    /// Its picture: a controller, a screen or a pair of notes, white, from
+    /// `assets/kinds`. The controller is Kenney's (CC0); the others are drawn
+    /// to match it. Decoded the first time each is shown.
+    pub fn icon(self) -> image::Handle {
+        static DECODED: [OnceLock<image::Handle>; 3] =
+            [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+        let (slot, bytes): (usize, &[u8]) = match self {
+            Self::Game => (0, include_bytes!("../assets/kinds/game.png")),
+            Self::Film => (1, include_bytes!("../assets/kinds/film.png")),
+            Self::Music => (2, include_bytes!("../assets/kinds/music.png")),
+        };
+        DECODED[slot]
+            .get_or_init(|| {
+                let pixels = ::image::load_from_memory(bytes)
+                    .expect("built-in icon decodes")
+                    .to_rgba8();
+                image::Handle::from_rgba(pixels.width(), pixels.height(), pixels.into_raw())
+            })
+            .clone()
+    }
+}
+
 /// The library's light: a soft blue glow from the top of the screen, made
 /// once as a small image the GPU stretches, like the stage's backdrop.
 pub fn glow() -> image::Handle {

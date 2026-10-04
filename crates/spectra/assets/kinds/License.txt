@@ -1,0 +1,7 @@
+game.svg is controller_generic.svg from Kenney's Input Prompts (1.5A),
+Creative Commons Zero (CC0): www.kenney.nl. film.svg and music.svg are
+Spectra's own, drawn to match it, under Spectra's licence.
+
+The PNGs are the SVGs at 64 px:
+
+    for n in game film music; do rsvg-convert -w 64 -h 64 $n.svg -o $n.png; done
