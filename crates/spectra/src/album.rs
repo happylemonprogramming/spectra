@@ -208,7 +208,11 @@ impl Album {
                     None => "Spectra can't play this console's games",
                 }),
             ),
-            DiscKind::DvdVideo => film(label, "DVD-Video"),
+            DiscKind::DvdVideo { feature_seconds } => {
+                let (title, artist, _, note) = film(label, "DVD-Video");
+                let length = feature_seconds.map(|s| format!("{} min", (s + 30) / 60));
+                (title, artist, length, note)
+            }
             DiscKind::BluRayVideo => film(label, "Blu-ray"),
             DiscKind::VideoCd { super_vcd } => film(
                 label,
@@ -247,10 +251,10 @@ fn film(
     format: &str,
 ) -> (String, String, Option<String>, Option<&'static str>) {
     (
-        label.unwrap_or(format.into()),
+        label.map_or(format.into(), |l| crate::filmdb::tidy(&l)),
         format.into(),
         None,
-        Some("Playing films isn't built yet"),
+        None,
     )
 }
 

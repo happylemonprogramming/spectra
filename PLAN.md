@@ -146,6 +146,7 @@ Credit it in anything that is ported.
 | `src/lib/game/catalog.ts`, `scripts/ps2-titles.mjs` | Reuse for serial → title and cover lookups |
 | `src/lib/discScene.ts` | Ported: the shaders to WGSL (`crates/spectra/src/disc.wgsl`), the motion to `motion.rs`. Bloom not yet |
 | `src/lib/discArt.ts` | Port to Rust: finding the disc in a Cover Art Archive scan |
+| `src/lib/dvd/art.ts`, `src/lib/dvdLabel.ts`, `src/lib/dvd/disc.ts` | Ported: a DVD's title and pictures from its label, Wikidata and fanart.tv (`filmdb.rs`), told apart by the feature's length (`spectra-core::dvd`). Uses Rainbow Player's fanart.tv key until Spectra has its own |
 | `components/player/*` | Reference for the layout |
 | `components/player/LibraryShelf.tsx`, `src/lib/shelfScene.ts`, `hooks/useWheelStep.ts` | Ported: the library below the stage (`shelf.rs`) - a grid of 3D discs, the focused one turning, the slide between the two, wheel steps, delete pressed twice |
 | `components/player/ButtonGlyph.tsx`, `src/lib/input/pads.ts`, `public/input-prompts/` | Ported: prompts drawn as the pad in hand has its buttons (`ui.rs`), with Kenney's Input Prompts (CC0) rasterised to `crates/spectra/assets/prompts` |

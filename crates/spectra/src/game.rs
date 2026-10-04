@@ -47,7 +47,7 @@ fn core_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
-fn on_path(program: &str) -> Option<PathBuf> {
+pub fn on_path(program: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(program))
         .find(|path| path.is_file())
@@ -146,7 +146,7 @@ fn settings_text(user: &Path, system: &str) -> String {
     text
 }
 
-fn cache_dir() -> Option<PathBuf> {
+pub fn cache_dir() -> Option<PathBuf> {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".cache")))?

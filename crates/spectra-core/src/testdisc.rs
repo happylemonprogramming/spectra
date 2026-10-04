@@ -324,14 +324,24 @@ mod tests {
         let mut disc =
             MemDisc::new(Media::Dvd, 400).udf("THE_MOVIE", &["VIDEO_TS", "AUDIO_TS"], false);
         let report = identify(&mut disc).unwrap();
-        assert_eq!(report.kind, DiscKind::DvdVideo);
+        assert_eq!(
+            report.kind,
+            DiscKind::DvdVideo {
+                feature_seconds: None
+            }
+        );
         assert_eq!(report.label.as_deref(), Some("THE_MOVIE"));
     }
 
     #[test]
     fn dvd_video_through_iso_bridge() {
         let mut disc = MemDisc::new(Media::Dvd, 64).iso("THE_MOVIE", &[], &["VIDEO_TS"]);
-        assert_eq!(kind(&mut disc), DiscKind::DvdVideo);
+        assert_eq!(
+            kind(&mut disc),
+            DiscKind::DvdVideo {
+                feature_seconds: None
+            }
+        );
     }
 
     #[test]

@@ -188,13 +188,19 @@ fn print_report(r: &Report) {
             }
             Some("Phase 1, Rainbow Player's audio path")
         }
-        DiscKind::DvdVideo => {
+        DiscKind::DvdVideo { feature_seconds } => {
             row("Disc", "DVD-Video");
-            Some("Phase 1, libmpv")
+            if let Some(s) = feature_seconds {
+                row(
+                    "Feature",
+                    &format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60),
+                );
+            }
+            Some("VLC")
         }
         DiscKind::BluRayVideo => {
             row("Disc", "Blu-ray video");
-            Some("Phase 1, libmpv (needs a libaacs key database)")
+            Some("VLC (needs a libaacs key database)")
         }
         DiscKind::VideoCd { super_vcd } => {
             row(
@@ -205,7 +211,7 @@ fn print_report(r: &Report) {
                     "Video CD"
                 },
             );
-            Some("Phase 2, libmpv")
+            Some("VLC")
         }
         DiscKind::Game(g) => {
             let name = g.title.as_deref().unwrap_or("unknown title");

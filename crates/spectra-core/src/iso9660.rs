@@ -3,7 +3,8 @@
 //! Discs identify themselves through a file in the root directory -
 //! SYSTEM.CNF on a PlayStation, AUTORUN.INF on a PC disc - so all this needs
 //! is the primary volume descriptor, the root directory, and the ability to
-//! read one small file out of it. No subdirectories, no Joliet, no Rock Ridge.
+//! read one small file out of it. A DVD's IFO files are a folder down, so a
+//! folder of the root can be listed too; no deeper. No Joliet, no Rock Ridge.
 //!
 //! Ported from Rainbow Player's `src/lib/game/iso9660.ts`.
 
@@ -119,9 +120,28 @@ pub fn read_root_file(
     let Some(file) = volume.find(name).filter(|f| !f.directory) else {
         return Ok(None);
     };
-    // Boot and config files are small; do not let a bogus size read a disc.
+    read_file(read, file).map(Some)
+}
+
+/// What is in a folder of the root, or None if there is no such folder.
+pub fn read_root_dir(
+    read: &mut ReadSectors,
+    volume: &IsoVolume,
+    name: &str,
+) -> Result<Option<Vec<IsoFile>>> {
+    let Some(dir) = volume.find(name).filter(|f| f.directory) else {
+        return Ok(None);
+    };
+    let sectors = dir.size.div_ceil(SECTOR as u32).clamp(1, 64);
+    let data = read(dir.lba, sectors)?;
+    Ok(Some(parse_directory(&data, dir.size as usize)))
+}
+
+/// A small file's contents. Boot, config and IFO files are small; a bogus
+/// size is not let read a whole disc.
+pub fn read_file(read: &mut ReadSectors, file: &IsoFile) -> Result<Vec<u8>> {
     let size = file.size.min(1 << 20);
     let mut data = read(file.lba, size.div_ceil(SECTOR as u32).max(1))?;
     data.truncate(size as usize);
-    Ok(Some(data))
+    Ok(data)
 }

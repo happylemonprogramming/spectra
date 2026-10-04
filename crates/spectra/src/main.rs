@@ -15,6 +15,8 @@ mod art;
 mod artwork;
 mod audio;
 mod disc;
+mod film;
+mod filmdb;
 mod game;
 mod gamepad;
 mod motion;
@@ -118,6 +120,10 @@ enum Message {
     Drive(DriveState),
     /// The emulator closed: how it went, in words, if badly.
     GameOver(Option<String>),
+    /// VLC closed, the same.
+    FilmOver(Option<String>),
+    /// What the DVD with this label turned out to be.
+    FilmFound(String, Box<filmdb::Found>),
     /// Pictures for the game with this serial arrived.
     Pictures(String, artwork::Pictures),
     Keeping(Keeping),
@@ -238,6 +244,12 @@ struct Spectra {
     launch: Option<Launch>,
     /// A game is running, and has the gamepad.
     in_game: bool,
+    /// What VLC would open for the film in the drive.
+    film_uri: Option<String>,
+    /// A film playing in VLC: the gamepad is its remote.
+    film: Option<film::Film>,
+    /// The label of the DVD on screen, which a lookup's answer is for.
+    film_label: Option<String>,
     /// The serial of the game disc on screen, which its pictures are for.
     serial: Option<String>,
     disc: Option<Inserted>,
@@ -389,6 +401,9 @@ impl Spectra {
             watching: options.album.is_none(),
             launch: None,
             in_game: false,
+            film_uri: None,
+            film: None,
+            film_label: None,
             serial: None,
             disc: None,
             copying: None,
@@ -606,6 +621,45 @@ impl Spectra {
                 }));
                 Task::none()
             }
+            Message::FilmFound(label, found) => {
+                if self.film_label.as_deref() != Some(label.as_str()) {
+                    return Task::none();
+                }
+                let filmdb::Found {
+                    title,
+                    year,
+                    pictures,
+                } = *found;
+                if let Some(title) = title {
+                    self.album.title = title;
+                }
+                if let Some(year) = year {
+                    self.album.details = Some(match self.album.details.take() {
+                        Some(length) => format!("{year}  ·  {length}"),
+                        None => year.to_string(),
+                    });
+                }
+                // The poster behind, the disc's own face on it; either
+                // stands in for the other.
+                if let Some(cover) = pictures.cover.clone().or_else(|| pictures.face.clone()) {
+                    self.album.cover = cover;
+                }
+                if pictures.face.is_some() {
+                    self.album.face = pictures.face;
+                }
+                self.art = Art::new(&self.album.cover, self.album.face.as_ref());
+                platform::release_memory();
+                Task::none()
+            }
+            Message::FilmOver(trouble) => {
+                self.film = None;
+                self.motion.set_spinning(false);
+                let ready = self.ready_note();
+                self.album.note = Some(trouble.map_or(ready, |why| {
+                    format!("{why} - see ~/.cache/spectra/film.log")
+                }));
+                Task::none()
+            }
             // The drive is busy copying.
             Message::Pick(_) if self.copying.is_some() => Task::none(),
             Message::Pick(track) => {
@@ -682,6 +736,9 @@ impl Spectra {
         if self.in_game {
             return Task::none();
         }
+        if self.film.is_some() {
+            return self.film_remote(remote);
+        }
         match self.screen {
             Screen::Library => self.library_remote(remote),
             Screen::Stage => self.stage_remote(remote),
@@ -745,6 +802,9 @@ impl Spectra {
             }
             Remote::Select | Remote::PlayPause if self.launch.is_some() => {
                 return self.start_game();
+            }
+            Remote::Select | Remote::PlayPause if self.film_uri.is_some() => {
+                return self.start_film();
             }
             Remote::Quit => return iced::exit(),
             _ => {}
@@ -845,7 +905,7 @@ impl Spectra {
     /// Slide down to the library, with its shelf brought up to date and
     /// faces made for any copy new to it.
     fn open_library(&mut self) -> Task<Message> {
-        if self.copying.is_some() || self.in_game {
+        if self.copying.is_some() || self.in_game || self.film.is_some() {
             return Task::none();
         }
         let missing = self.shelf.load(library::list());
@@ -890,6 +950,8 @@ impl Spectra {
         self.player = None;
         self.serial = None;
         self.disc_id = None;
+        self.film_uri = None;
+        self.film_label = None;
         if entry.is_album() {
             let Some(toc) = entry.toc() else {
                 self.shelf.notice = Some("That copy would not open".into());
@@ -966,6 +1028,7 @@ impl Spectra {
         let mut album = Album::from_drive(&state);
         // A new disc, or none: whatever was playing stops.
         self.player = None;
+        self.film = None;
         self.disc_id = None;
         self.picked = None;
         let mut audio_tasks = Vec::new();
@@ -1002,6 +1065,26 @@ impl Spectra {
                 ));
             }
         }
+        self.film_uri = match &state {
+            DriveState::Disc { report, drive } => film::uri(&report.kind, drive),
+            _ => None,
+        };
+        // A DVD's name and pictures follow, from the cache or the network.
+        let mut film_task = None;
+        self.film_label = None;
+        if let DriveState::Disc { report, .. } = &state
+            && let DiscKind::DvdVideo { feature_seconds } = report.kind
+            && let Some(label) = report.label.clone()
+        {
+            self.film_label = Some(label.clone());
+            film_task = Some(Task::perform(
+                blocking({
+                    let label = label.clone();
+                    move || Box::new(filmdb::look_up(&label, feature_seconds))
+                }),
+                move |found| Message::FilmFound(label.clone(), found),
+            ));
+        }
         self.disc = match state {
             DriveState::Disc { report, drive } => match &report.kind {
                 DiscKind::Game(game) => Some(Inserted {
@@ -1025,7 +1108,7 @@ impl Spectra {
             .as_ref()
             .and_then(|d| d.game.as_ref())
             .is_some_and(|g| game::find(g.system).is_some());
-        if self.launch.is_some() || music || emulator {
+        if self.launch.is_some() || music || emulator || self.film_uri.is_some() {
             album.note = Some(self.ready_note());
         }
         self.show(album);
@@ -1044,7 +1127,13 @@ impl Spectra {
             ))
         });
         let top = self.scroll_to_top();
-        Task::batch([top].into_iter().chain(pictures).chain(audio_tasks))
+        Task::batch(
+            [top]
+                .into_iter()
+                .chain(pictures)
+                .chain(film_task)
+                .chain(audio_tasks),
+        )
     }
 
     /// How the disc in the drive would be played: from its kept copy if
@@ -1081,6 +1170,13 @@ impl Spectra {
                 format!("Your copy  ·  {{accept}} Play  ·  {{back}} Back {back}")
             };
         }
+        if self.film_uri.is_some() {
+            return if film::installed() {
+                "{accept} Play in VLC  ·  Esc to come back".into()
+            } else {
+                "Films play in VLC, which isn't installed".into()
+            };
+        }
         let Some(disc) = &self.disc else {
             return String::new();
         };
@@ -1115,6 +1211,7 @@ impl Spectra {
         self.picked.is_none()
             && self.copying.is_none()
             && !self.in_game
+            && self.film.is_none()
             && self.disc.as_ref().is_some_and(|disc| {
                 library::id(&disc.report).is_some_and(|id| library::find(&id).is_none())
             })
@@ -1240,6 +1337,53 @@ impl Spectra {
             let _ = tx.send(trouble);
         });
         Task::perform(rx, |trouble| Message::GameOver(trouble.ok().flatten()))
+    }
+
+    /// Hand the film in the drive to VLC, which takes the screen until it
+    /// is over.
+    fn start_film(&mut self) -> Task<Message> {
+        let Some(uri) = &self.film_uri else {
+            return Task::none();
+        };
+        let (tx, rx) = iced::futures::channel::oneshot::channel();
+        match film::Film::start(uri, move |trouble| {
+            let _ = tx.send(trouble);
+        }) {
+            Ok(film) => self.film = Some(film),
+            Err(e) => {
+                self.album.note = Some(format!("Couldn't start VLC: {e}"));
+                return Task::none();
+            }
+        }
+        self.motion.set_spinning(true);
+        self.album.note = Some("Playing in VLC  ·  Esc to come back".into());
+        Task::perform(rx, |trouble| Message::FilmOver(trouble.ok().flatten()))
+    }
+
+    /// The gamepad, while VLC has the screen. The keyboard reaches VLC
+    /// itself; this is the pad, which Spectra hears wherever focus is.
+    fn film_remote(&mut self, remote: Remote) -> Task<Message> {
+        let key = match remote {
+            Remote::Up => film::Key::Up,
+            Remote::Down => film::Key::Down,
+            Remote::Left => film::Key::Left,
+            Remote::Right => film::Key::Right,
+            Remote::Select => film::Key::Activate,
+            Remote::PlayPause => film::Key::PlayPause,
+            Remote::Previous => film::Key::PreviousChapter,
+            Remote::Next => film::Key::NextChapter,
+            Remote::Menu => film::Key::DiscMenu,
+            // Back always gets out: dropping the film ends VLC.
+            Remote::Back | Remote::Quit => {
+                self.film = None;
+                return Task::none();
+            }
+            Remote::Keep | Remote::Library => return Task::none(),
+        };
+        if let Some(film) = &self.film {
+            film.press(key);
+        }
+        Task::none()
     }
 
     /// Scroll the track list just enough to show the focused row, glow
@@ -1389,7 +1533,7 @@ impl Spectra {
             }
         };
         let mut buttons = row![].spacing(8).align_y(Vertical::Center);
-        if self.picked.is_some() && !self.in_game {
+        if self.picked.is_some() && !self.in_game && self.film.is_none() {
             buttons = buttons.push(ui::quiet(
                 label("{back}", "Back to the drive"),
                 Message::ReturnToDrive,
@@ -1398,7 +1542,7 @@ impl Spectra {
         if self.keepable() {
             buttons = buttons.push(ui::quiet(label("{alt}", "Keep a copy"), Message::KeepCopy));
         }
-        if self.copying.is_none() && !self.in_game {
+        if self.copying.is_none() && !self.in_game && self.film.is_none() {
             let library: Element<'_, Message> = if self.pointing {
                 ui::quiet_text("Your discs ↓")
             } else {

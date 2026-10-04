@@ -118,7 +118,11 @@ pub enum DiscKind {
         enhanced: bool,
         musicbrainz: Option<MusicBrainzId>,
     },
-    DvdVideo,
+    DvdVideo {
+        /// How long the feature runs, which tells apart films that share a
+        /// label.
+        feature_seconds: Option<u32>,
+    },
     BluRayVideo,
     VideoCd {
         super_vcd: bool,
@@ -217,7 +221,11 @@ pub fn identify(disc: &mut dyn Disc) -> Result<Report> {
     };
 
     let kind = if has_dir("VIDEO_TS") {
-        DiscKind::DvdVideo
+        // Nice to have, so a disc whose IFO files will not read still plays.
+        let feature_seconds = iso
+            .as_ref()
+            .and_then(|iso| crate::dvd::feature_seconds(&mut read, iso).ok().flatten());
+        DiscKind::DvdVideo { feature_seconds }
     } else if has_dir("BDMV") {
         DiscKind::BluRayVideo
     } else if has_dir("SVCD") {
