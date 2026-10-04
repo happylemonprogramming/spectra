@@ -175,6 +175,29 @@ pub fn find(id: &str) -> Option<Entry> {
     list().into_iter().find(|e| e.meta.id == id)
 }
 
+/// Throw a kept copy away.
+pub fn remove(entry: &Entry) -> Result<()> {
+    let root = root().ok_or_else(|| Error::Unsupported("no home folder".into()))?;
+    remove_in(&root, entry)
+}
+
+/// Only ever a folder directly in the library: an entry's own `dir` is
+/// not trusted to say where that is.
+pub fn remove_in(root: &Path, entry: &Entry) -> Result<()> {
+    let id = &entry.meta.id;
+    let plain = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && id != "."
+        && id != "..";
+    if !plain {
+        return Err(Error::Unsupported(format!("removing a copy called {id:?}")));
+    }
+    std::fs::remove_dir_all(root.join(id))?;
+    Ok(())
+}
+
 /// Copy the disc in `drive` into the library, as `report` describes it, and
 /// an audio CD by `names` where they are known.
 pub fn keep(
@@ -359,6 +382,37 @@ mod tests {
         // Not a real game's sectors, so it identifies as something else, but
         // it reads.
         let _ = identify(disc.as_mut());
+    }
+
+    #[test]
+    fn a_removed_copy_is_gone_and_nothing_else_is() {
+        let root = tempfile::tempdir().unwrap();
+        let keep = |r: &Report| {
+            keep_in(
+                root.path(),
+                r,
+                None,
+                sectors,
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap()
+        };
+        let entry = keep(&report());
+        let mut other = report();
+        if let DiscKind::Game(g) = &mut other.kind {
+            g.serial = Some("SLUS-00001".into());
+        }
+        keep(&other);
+        remove_in(root.path(), &entry).unwrap();
+        let left = list_in(root.path());
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].meta.id, "SLUS-00001");
+
+        let mut outside = left[0].clone();
+        outside.meta.id = "..".into();
+        assert!(remove_in(root.path(), &outside).is_err());
+        assert_eq!(list_in(root.path()).len(), 1);
     }
 
     #[test]

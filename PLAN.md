@@ -147,6 +147,8 @@ Credit it in anything that is ported.
 | `src/lib/discScene.ts` | Ported: the shaders to WGSL (`crates/spectra/src/disc.wgsl`), the motion to `motion.rs`. Bloom not yet |
 | `src/lib/discArt.ts` | Port to Rust: finding the disc in a Cover Art Archive scan |
 | `components/player/*` | Reference for the layout |
+| `components/player/LibraryShelf.tsx`, `src/lib/shelfScene.ts`, `hooks/useWheelStep.ts` | Ported: the library below the stage (`shelf.rs`) - a grid of 3D discs, the focused one turning, the slide between the two, wheel steps, delete pressed twice |
+| `components/player/ButtonGlyph.tsx`, `src/lib/input/pads.ts`, `public/input-prompts/` | Ported: prompts drawn as the pad in hand has its buttons (`ui.rs`), with Kenney's Input Prompts (CC0) rasterised to `crates/spectra/assets/prompts` |
 | `src/hooks/useCdAudio.ts`, `src/lib/cd/drive.ts` (audio path) | Port: READ CD into `cpal` instead of Web Audio |
 | `src/lib/input/remote.ts`, `hooks/useRemote.ts` | Ported in spirit: `Remote` in the UI, pads through `gilrs` |
 | `electron/usb/virtual/*`, `src/lib/cd/virtualDrive.test.ts` | Design basis for the fake drive used in tests |
@@ -172,7 +174,8 @@ ported into Spectra with credit.
 ```
 crates/spectra-core/    reading and identifying discs (drive over SG_IO, or images)
 crates/spectra-discid/  command line: what disc is this?
-crates/spectra/         the app: iced UI, the disc shader, motion, gamepads
+crates/spectra/         the app: iced UI, the disc shader, motion, gamepads, the library
+crates/spectra/assets/  Kenney's Input Prompts (CC0), as small PNGs built into the app
 docs/spikes.md          Phase 0 questions and their answers
 packaging/              the desktop entry and icon
 scripts/check.sh        fmt, clippy, tests

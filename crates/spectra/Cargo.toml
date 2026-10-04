@@ -19,6 +19,8 @@ iced = { version = "0.14", default-features = false, features = [
     "wayland",
     "x11",
     "image-without-codecs",
+    # For the one small widget of our own: the empty library's dashed edge.
+    "advanced",
 ] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc.workspace = true

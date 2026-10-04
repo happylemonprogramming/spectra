@@ -3,11 +3,19 @@
 //! It renders into its own multisampled target with a depth buffer - a disc
 //! is thin, and its edges alias badly otherwise - then lays the result over
 //! whatever the UI drew beneath it. Geometry is built once; each frame costs
-//! one small uniform upload and two draw calls, and when nothing moves no
-//! frames are drawn at all.
+//! one small uniform upload and two draw calls per disc, and when nothing
+//! moves no frames are drawn at all.
+//!
+//! Several discs can be on screen at once - the stage, and the library's
+//! shelf. iced prepares every widget before it renders any, so each disc
+//! keeps its own uniforms and label, under the slot it is drawn for. They
+//! share the offscreen targets, one set per size: discs render one after
+//! another, and the shelf's are all one size.
 
+use std::collections::HashMap;
 use std::f32::consts::TAU;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use glam::{Mat4, Vec3};
 use iced::wgpu::{self, util::DeviceExt};
@@ -31,8 +39,14 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Where the scan stops and the metallised lip begins, as in Rainbow Player.
 const ART_OUTER_RATIO: f32 = 0.945;
 
+/// A slot nobody has drawn into for this long gives its GPU memory back.
+const STALE: Duration = Duration::from_secs(2);
+
 /// What the widget draws this frame.
 pub struct Disc {
+    /// Which disc this is, so each keeps its own label on the GPU: the
+    /// stage's, or one of the shelf's.
+    pub slot: u64,
     pub pose: Pose,
     pub label: Arc<Label>,
     pub accent: [f32; 3],
@@ -46,6 +60,7 @@ impl<Message> shader::Program<Message> for Disc {
 
     fn draw(&self, _state: &(), _cursor: mouse::Cursor, _bounds: Rectangle) -> Primitive {
         Primitive {
+            slot: self.slot,
             pose: self.pose,
             label: self.label.clone(),
             accent: self.accent,
@@ -56,6 +71,7 @@ impl<Message> shader::Program<Message> for Disc {
 
 #[derive(Debug)]
 pub struct Primitive {
+    slot: u64,
     pose: Pose,
     label: Arc<Label>,
     accent: [f32; 3],
@@ -159,11 +175,22 @@ fn mesh() -> Vec<Vertex> {
 }
 
 struct Targets {
-    size: (u32, u32),
     color: wgpu::TextureView,
     depth: wgpu::TextureView,
     resolve: wgpu::TextureView,
     composite: wgpu::BindGroup,
+}
+
+/// One disc's own GPU state.
+struct Instance {
+    uniforms: wgpu::Buffer,
+    bind: Option<wgpu::BindGroup>,
+    label_id: u64,
+    /// Where the widget is, in physical pixels, as of the last prepare.
+    bounds: (f32, f32, f32, f32),
+    /// The size of target it renders into.
+    size: (u32, u32),
+    used: Instant,
 }
 
 pub struct Pipeline {
@@ -171,17 +198,13 @@ pub struct Pipeline {
     composite: wgpu::RenderPipeline,
     vertices: wgpu::Buffer,
     vertex_count: u32,
-    uniforms: wgpu::Buffer,
     options: wgpu::Buffer,
     disc_layout: wgpu::BindGroupLayout,
     composite_layout: wgpu::BindGroupLayout,
     art_sampler: wgpu::Sampler,
     plain_sampler: wgpu::Sampler,
-    bind: Option<wgpu::BindGroup>,
-    label_id: u64,
-    targets: Option<Targets>,
-    /// Where the widget is, in physical pixels, as of the last prepare.
-    bounds: (f32, f32, f32, f32),
+    instances: HashMap<u64, Instance>,
+    targets: HashMap<(u32, u32), Targets>,
 }
 
 impl shader::Pipeline for Pipeline {
@@ -307,12 +330,6 @@ impl shader::Pipeline for Pipeline {
                 contents: bytemuck::cast_slice(&vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             }),
-            uniforms: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("disc uniforms"),
-                size: std::mem::size_of::<Uniforms>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
             options: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("disc composite options"),
                 contents: bytemuck::cast_slice(&options),
@@ -331,10 +348,8 @@ impl shader::Pipeline for Pipeline {
                 ..Default::default()
             }),
             plain_sampler: device.create_sampler(&wgpu::SamplerDescriptor::default()),
-            bind: None,
-            label_id: 0,
-            targets: None,
-            bounds: (0.0, 0.0, 0.0, 0.0),
+            instances: HashMap::new(),
+            targets: HashMap::new(),
         }
     }
 }
@@ -362,7 +377,39 @@ fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 impl Pipeline {
-    fn upload_label(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, label: &Label) {
+    /// The slot's own state, made the first time it is drawn.
+    fn instance(&mut self, device: &wgpu::Device, slot: u64) -> &mut Instance {
+        self.instances.entry(slot).or_insert_with(|| Instance {
+            uniforms: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("disc uniforms"),
+                size: std::mem::size_of::<Uniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            bind: None,
+            label_id: 0,
+            bounds: (0.0, 0.0, 0.0, 0.0),
+            size: (0, 0),
+            used: Instant::now(),
+        })
+    }
+
+    /// Give back what discs no longer on screen were holding.
+    fn forget_stale(&mut self) {
+        let now = Instant::now();
+        self.instances
+            .retain(|_, instance| now.duration_since(instance.used) < STALE);
+        let sizes: Vec<_> = self.instances.values().map(|i| i.size).collect();
+        self.targets.retain(|size, _| sizes.contains(size));
+    }
+
+    fn upload_label(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: u64,
+        label: &Label,
+    ) {
         let base = &label.levels[0];
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("label"),
@@ -400,13 +447,17 @@ impl Pipeline {
             );
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let (layout, sampler) = (&self.disc_layout, &self.art_sampler);
+        let Some(instance) = self.instances.get_mut(&slot) else {
+            return;
+        };
+        instance.bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("disc"),
-            layout: &self.disc_layout,
+            layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.uniforms.as_entire_binding(),
+                    resource: instance.uniforms.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -414,15 +465,15 @@ impl Pipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.art_sampler),
+                    resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
         }));
-        self.label_id = label.id;
+        instance.label_id = label.id;
     }
 
     fn ensure_targets(&mut self, device: &wgpu::Device, size: (u32, u32)) {
-        if self.targets.as_ref().is_some_and(|t| t.size == size) {
+        if self.targets.contains_key(&size) {
             return;
         }
         let texture = |label, format, samples, usage| {
@@ -468,13 +519,15 @@ impl Pipeline {
                 },
             ],
         });
-        self.targets = Some(Targets {
+        self.targets.insert(
             size,
-            color: texture("disc color", COLOR_FORMAT, SAMPLES, attachment),
-            depth: texture("disc depth", DEPTH_FORMAT, SAMPLES, attachment),
-            resolve,
-            composite,
-        });
+            Targets {
+                color: texture("disc color", COLOR_FORMAT, SAMPLES, attachment),
+                depth: texture("disc depth", DEPTH_FORMAT, SAMPLES, attachment),
+                resolve,
+                composite,
+            },
+        );
     }
 }
 
@@ -495,10 +548,15 @@ impl shader::Primitive for Primitive {
             (bounds.width * scale).round().max(1.0),
             (bounds.height * scale).round().max(1.0),
         );
-        pipeline.bounds = (x, y, w, h);
-        pipeline.ensure_targets(device, (w as u32, h as u32));
-        if pipeline.label_id != self.label.id {
-            pipeline.upload_label(device, queue, &self.label);
+        let size = (w as u32, h as u32);
+        pipeline.forget_stale();
+        pipeline.ensure_targets(device, size);
+        let instance = pipeline.instance(device, self.slot);
+        instance.bounds = (x, y, w, h);
+        instance.size = size;
+        instance.used = Instant::now();
+        if instance.label_id != self.label.id {
+            pipeline.upload_label(device, queue, self.slot, &self.label);
         }
 
         // Fit the disc to the widget with a margin, looking straight down -z.
@@ -515,7 +573,7 @@ impl shader::Primitive for Primitive {
         let view = glam::camera::rh::view::look_at_mat4(camera, Vec3::ZERO, Vec3::Y);
 
         let pose = self.pose;
-        let scale_by = 0.92 + 0.08 * pose.presence;
+        let scale_by = (0.92 + 0.08 * pose.presence) * pose.zoom;
         let model = Mat4::from_rotation_x(pose.tilt)
             * Mat4::from_rotation_y(pose.turn)
             * Mat4::from_rotation_z(pose.spin)
@@ -544,7 +602,9 @@ impl shader::Primitive for Primitive {
                 DISC_R * ART_OUTER_RATIO,
             ],
         };
-        queue.write_buffer(&pipeline.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        if let Some(instance) = pipeline.instances.get(&self.slot) {
+            queue.write_buffer(&instance.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        }
     }
 
     fn render(
@@ -554,7 +614,11 @@ impl shader::Primitive for Primitive {
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
     ) {
-        let (Some(targets), Some(bind)) = (&pipeline.targets, &pipeline.bind) else {
+        let Some(instance) = pipeline.instances.get(&self.slot) else {
+            return;
+        };
+        let (Some(targets), Some(bind)) = (pipeline.targets.get(&instance.size), &instance.bind)
+        else {
             return;
         };
         if clip_bounds.width == 0 || clip_bounds.height == 0 {
@@ -604,7 +668,7 @@ impl shader::Primitive for Primitive {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        let (x, y, w, h) = pipeline.bounds;
+        let (x, y, w, h) = instance.bounds;
         pass.set_viewport(x, y, w, h, 0.0, 1.0);
         pass.set_scissor_rect(
             clip_bounds.x,

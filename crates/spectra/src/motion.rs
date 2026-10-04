@@ -13,6 +13,8 @@ const HOLD_SECONDS: f32 = 2.1;
 /// Flips on arrival: label, read side, label.
 const SHOWCASE_FLIPS: u8 = 2;
 const PLAYING_RPM: f32 = 320.0;
+/// A disc on the shelf that is not in focus, against one that is.
+const SHELF_REST: f32 = 0.84;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Pose {
@@ -24,6 +26,8 @@ pub struct Pose {
     pub spin: f32,
     /// 0 invisible to 1 fully present.
     pub presence: f32,
+    /// Size against a disc that fills its box: smaller at rest on the shelf.
+    pub zoom: f32,
 }
 
 pub struct Motion {
@@ -40,6 +44,8 @@ pub struct Motion {
     rpm: f32,
     spinning: bool,
     presence: f32,
+    zoom: f32,
+    zoom_to: f32,
     reduced: bool,
 }
 
@@ -81,7 +87,38 @@ impl Motion {
             rpm: 0.0,
             spinning: false,
             presence: 0.0,
+            zoom: 1.0,
+            zoom_to: 1.0,
             reduced,
+        }
+    }
+
+    /// A disc on the library's shelf: it fades in at rest, label side out,
+    /// and smaller than the one in focus.
+    pub fn shelved(reduced: bool) -> Self {
+        let mut motion = Self::new(reduced);
+        motion.flips_left = 0;
+        motion.zoom = SHELF_REST;
+        motion.zoom_to = SHELF_REST;
+        motion
+    }
+
+    /// The shelf's focus arrived or left. The disc that has just been
+    /// reached turns straight away, rather than sitting through a hold first;
+    /// one that is left finishes its turn and rests label side out.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.zoom_to = if focused { 1.0 } else { SHELF_REST };
+        if focused {
+            if !self.reduced {
+                self.flips_left = SHOWCASE_FLIPS;
+                self.hold = self.hold.min(0.15);
+            }
+        } else {
+            // An odd number of half-turns so far leaves the read side out:
+            // one more brings the label back round.
+            let halves = (self.flip_to / std::f32::consts::PI).round() as i32;
+            self.flips_left = u8::from(halves % 2 != 0);
+            self.hold = self.hold.min(0.15);
         }
     }
 
@@ -131,6 +168,7 @@ impl Motion {
         let tilt = if self.spinning { -0.34 } else { -0.16 };
         settle(&mut self.tilt, tilt, 3.2, dt, 1e-4);
         settle(&mut self.presence, 1.0, 4.0, dt, 2e-3);
+        settle(&mut self.zoom, self.zoom_to, 9.0, dt, 1e-3);
 
         // Spin-up and spin-down are eased: a drive takes a moment to reach
         // speed, and it reads as weight.
@@ -155,6 +193,7 @@ impl Motion {
             || self.yaw != 0.22
             || self.tilt != if self.spinning { -0.34 } else { -0.16 }
             || self.presence != 1.0
+            || self.zoom != self.zoom_to
     }
 
     pub fn pose(&self) -> Pose {
@@ -165,6 +204,7 @@ impl Motion {
             tilt: self.tilt,
             spin: self.spin,
             presence: self.presence,
+            zoom: self.zoom,
         }
     }
 }
@@ -185,6 +225,20 @@ mod tests {
         assert!(m.moving());
         run(&mut m, 15.0);
         assert!(!m.moving(), "still moving after the showcase");
+    }
+
+    #[test]
+    fn a_shelved_disc_rests_label_out_after_losing_focus() {
+        let mut m = Motion::shelved(false);
+        m.set_focused(true);
+        // Part way through the showcase: one half-turn in.
+        run(&mut m, 1.6);
+        m.set_focused(false);
+        run(&mut m, 15.0);
+        assert!(!m.moving(), "still moving after losing focus");
+        let halves = (m.flip_to / std::f32::consts::PI).round() as i32;
+        assert_eq!(halves % 2, 0, "rests read side out");
+        assert_eq!(m.pose().zoom, SHELF_REST);
     }
 
     #[test]

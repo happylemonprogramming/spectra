@@ -14,6 +14,8 @@ use image::{Rgba, RgbaImage};
 /// Label texture size. The disc never covers more than about a thousand
 /// pixels, and mipmaps take care of it when smaller.
 const LABEL_SIZE: u32 = 1024;
+/// A shelf disc is a few hundred pixels across.
+const SHELF_LABEL_SIZE: u32 = 512;
 /// Inside this fraction of the radius a pressed disc is bare, clear hub.
 pub const HUB_RATIO: f32 = 0.31;
 
@@ -46,12 +48,65 @@ impl Art {
         let square = square(cover);
         let printed = face.map(cut_out);
         Self {
-            label: Arc::new(label(printed.as_ref().unwrap_or(&square))),
+            label: Arc::new(label(printed.as_ref().unwrap_or(&square), LABEL_SIZE)),
             backdrop: backdrop(&square),
             thumbnail: thumbnail(&square),
             accent: accent(&square),
         }
     }
+}
+
+/// What a disc on the shelf wears: its label, small, and the colour of its
+/// light. Without a cover or a scan it is a bare disc.
+pub struct Face {
+    pub label: Arc<Label>,
+    pub accent: [f32; 3],
+    /// Whether there was any art; a bare disc needs its name said.
+    pub printed: bool,
+}
+
+impl std::fmt::Debug for Face {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Face({:?}, printed: {})", self.label, self.printed)
+    }
+}
+
+impl Face {
+    pub fn new(cover: Option<&RgbaImage>, scan: Option<&RgbaImage>) -> Self {
+        let square = cover.map(square);
+        let printed = scan.map(cut_out).or_else(|| square.clone());
+        match printed {
+            Some(printed) => Self {
+                label: Arc::new(label(&printed, SHELF_LABEL_SIZE)),
+                accent: accent(square.as_ref().unwrap_or(&printed)),
+                printed: true,
+            },
+            None => Self::blank(),
+        }
+    }
+
+    /// Clear polycarbonate, with nothing printed on it.
+    pub fn blank() -> Self {
+        static BLANK: std::sync::OnceLock<Arc<Label>> = std::sync::OnceLock::new();
+        let label = BLANK
+            .get_or_init(|| {
+                Arc::new(Label {
+                    id: next_id(),
+                    levels: vec![RgbaImage::new(1, 1)],
+                })
+            })
+            .clone();
+        Self {
+            label,
+            accent: [0.62, 0.52, 1.0],
+            printed: false,
+        }
+    }
+}
+
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The largest centred square: covers are nearly square, scans sometimes not.
@@ -91,10 +146,9 @@ fn cut_out(scan: &RgbaImage) -> RgbaImage {
 
 /// The cover printed on a disc: the hub left clear, so the read side's
 /// polycarbonate shows through as it does on a real pressing.
-fn label(square: &RgbaImage) -> Label {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let mut base = imageops::resize(square, LABEL_SIZE, LABEL_SIZE, FilterType::CatmullRom);
-    let centre = LABEL_SIZE as f32 / 2.0;
+fn label(square: &RgbaImage, size: u32) -> Label {
+    let mut base = imageops::resize(square, size, size, FilterType::CatmullRom);
+    let centre = size as f32 / 2.0;
     let feather = 2.0 / centre;
     for (x, y, px) in base.enumerate_pixels_mut() {
         let r = ((x as f32 + 0.5 - centre).hypot(y as f32 + 0.5 - centre)) / centre;
@@ -109,7 +163,7 @@ fn label(square: &RgbaImage) -> Label {
         levels.push(imageops::resize(prev, size, size, FilterType::Triangle));
     }
     Label {
-        id: NEXT.fetch_add(1, Ordering::Relaxed),
+        id: next_id(),
         levels,
     }
 }

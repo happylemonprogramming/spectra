@@ -1,8 +1,12 @@
 //! Spectra: put a disc in, and it plays.
 //!
-//! One screen - the rainbow disc, the album's blurred cover behind it, and a
-//! track list driven by keyboard or gamepad - showing whatever disc is in the
-//! drive. An album file stands in for the drive while working on the screen.
+//! Two screens, stacked. The stage - the rainbow disc, the album's blurred
+//! cover behind it, and a track list driven by keyboard or gamepad - shows
+//! whatever disc is in the drive. Below it is the library: every disc kept
+//! as a copy, on a shelf of small discs, any of which can be put on the
+//! stage and played without the disc. Moving between them slides the pair
+//! up or down a screen, as Rainbow Player's do. An album file stands in for
+//! the drive while working on the screen.
 //!
 //!   spectra [ALBUM.json] [--play] [--reduced-motion]
 
@@ -17,29 +21,33 @@ mod motion;
 mod musicbrainz;
 mod net;
 mod platform;
+mod shelf;
+mod ui;
 mod watch;
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iced::alignment::Vertical;
 use iced::font::Weight;
 use iced::gradient::Linear;
 use iced::keyboard::{self, Key, key::Named};
+use iced::mouse::ScrollDelta;
 use iced::widget::scrollable::{AbsoluteOffset, Direction, Scrollbar, Viewport};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Id, button, column, container, image, mouse_area, operation, responsive, row, scrollable,
+    Id, button, column, container, image, mouse_area, operation, pin, responsive, row, scrollable,
     shader, space, stack, text,
 };
 use iced::{
-    Background, Border, Color, ContentFit, Element, Fill, Font, Radians, Shadow, Size,
+    Background, Border, Color, ContentFit, Element, Fill, Font, Point, Radians, Shadow, Size,
     Subscription, Task, Theme, Vector, window,
 };
 
 use album::Album;
-use art::Art;
+use art::{Art, Face};
 use motion::Motion;
+use shelf::{Moved, Shelf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,13 +67,21 @@ const TRACKS: &str = "tracks";
 /// Room around the rows inside the scrolling list, so the focus glow is not
 /// clipped at its edges.
 const LIST_PAD: f32 = 14.0;
+/// The stage's disc, among the discs on the GPU; the shelf's come after.
+const STAGE: u64 = 0;
 const ROW_GAP: f32 = 4.0;
+/// How long the stage and the library take to slide past each other.
+const SLIDE_SECONDS: f32 = 0.7;
+/// How long a delete waits to be confirmed.
+const ARMED: Duration = Duration::from_secs(4);
 
 /// The remote control: keyboard and gamepads both speak it.
 #[derive(Debug, Clone, Copy)]
 pub enum Remote {
     Up,
     Down,
+    Left,
+    Right,
     Select,
     PlayPause,
     Previous,
@@ -73,14 +89,27 @@ pub enum Remote {
     Back,
     /// Keep a copy of the disc, to play without it.
     Keep,
-    /// Over to the kept copies, and back to the disc in the drive.
+    /// The pad's select button, or M: the library from the stage, and
+    /// delete on the shelf.
+    Menu,
+    /// Over to the kept copies, and back to the stage.
     Library,
     Quit,
 }
 
+/// The two screens, the stage above the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Stage,
+    Library,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
+    /// The keyboard.
     Remote(Remote),
+    /// A gamepad, and which kind, for the prompts.
+    Pad(ui::Pad, Remote),
     /// A track clicked.
     Pick(usize),
     /// The track list scrolled or changed size.
@@ -95,6 +124,24 @@ enum Message {
     Audio(audio::Event),
     /// MusicBrainz's answer for the audio CD with this disc ID.
     Release(String, Box<musicbrainz::Found>),
+    OpenLibrary,
+    CloseLibrary,
+    /// From a copy on the stage back to the disc in the drive.
+    ReturnToDrive,
+    KeepCopy,
+    ShelfFocus(usize),
+    ShelfPick(usize),
+    ShelfMenu(usize),
+    ShelfDelete(usize),
+    MenuClose,
+    ShelfScrolled(Viewport),
+    /// A copy's face for the shelf, made off the UI thread.
+    ShelfFace(String, Option<Arc<Face>>),
+    /// A delete nobody confirmed in time.
+    Disarm(String),
+    Wheel(Screen, ScrollDelta),
+    /// The pointer moved: the mouse is in use, and here.
+    Pointer(Point),
 }
 
 /// How the screen is arranged, from the most room to the least.
@@ -195,25 +242,81 @@ struct Spectra {
     serial: Option<String>,
     disc: Option<Inserted>,
     copying: Option<Copying>,
-    /// The kept copies on screen, row for row, when there is no disc.
-    shelf: Vec<library::Entry>,
-    /// The row whose copy the disc on screen is wearing.
-    shelf_art: Option<usize>,
     /// The audio CD's player, while there is one in.
     player: Option<audio::Player>,
     /// Seconds into the playing track.
     elapsed: u32,
     /// The audio CD on screen, which a MusicBrainz answer is for.
     disc_id: Option<String>,
-    /// The album on screen is a copy opened from the shelf, which Back
-    /// returns to.
-    opened: bool,
-    /// What the drive last said, kept while the library is on screen so
-    /// that Back can return to the disc.
+    /// A kept copy on the stage in place of the drive's disc, picked from
+    /// the library. Back returns to the drive.
+    picked: Option<library::Entry>,
+    /// What the drive last said, kept while a copy is on the stage so that
+    /// Back can return to the disc.
     drive_state: Option<DriveState>,
-    /// There are kept copies to go to.
-    kept: bool,
+    /// The screen with the remote: where the slide is going.
+    screen: Screen,
+    slide: Slide,
+    shelf: Shelf,
+    /// What the prompts are drawn as: keys, or the pad last used.
+    style: ui::Style,
+    /// The mouse is what is in use, so there is a pointer to show where
+    /// things are and prompts can step back.
+    pointing: bool,
+    cursor: Point,
+    wheel: Wheel,
+    reduced_motion: bool,
 }
+
+/// Where the screens are: 0 the stage, 1 the library, eased between.
+struct Slide {
+    from: f32,
+    to: f32,
+    t: f32,
+}
+
+impl Slide {
+    fn at(&self) -> f32 {
+        // Rainbow Player's cubic-bezier(0.65, 0, 0.35, 1), near enough.
+        let t = self.t;
+        let eased = if t < 0.5 {
+            4.0 * t * t * t
+        } else {
+            1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+        };
+        self.from + (self.to - self.from) * eased
+    }
+
+    fn go(&mut self, to: f32, reduced: bool) {
+        self.from = self.at();
+        self.to = to;
+        self.t = if reduced || self.from == to { 1.0 } else { 0.0 };
+    }
+
+    fn moving(&self) -> bool {
+        self.t < 1.0
+    }
+
+    fn step(&mut self, dt: f32) {
+        self.t = (self.t + dt / SLIDE_SECONDS).min(1.0);
+    }
+}
+
+/// The wheel, turned into single steps between the screens: at most one
+/// per gesture, so a flick of a trackpad and the momentum after it move one
+/// screen, not several. As Rainbow Player's `useWheelStep`.
+#[derive(Default)]
+struct Wheel {
+    last: Option<Instant>,
+    travel: f32,
+    live: bool,
+}
+
+/// A pause this long between wheel events ends one gesture.
+const GESTURE_GAP: Duration = Duration::from_millis(250);
+/// How far a gesture travels before it counts, so a brush of a trackpad does
+/// not.
+const STEP_PX: f32 = 60.0;
 
 struct Launch {
     emulator: game::Emulator,
@@ -289,14 +392,23 @@ impl Spectra {
             serial: None,
             disc: None,
             copying: None,
-            shelf: Vec::new(),
-            shelf_art: None,
             player: None,
             elapsed: 0,
             disc_id: None,
-            opened: false,
+            picked: None,
             drive_state: None,
-            kept: !library::list().is_empty(),
+            screen: Screen::Stage,
+            slide: Slide {
+                from: 0.0,
+                to: 0.0,
+                t: 1.0,
+            },
+            shelf: Shelf::new(options.reduced_motion),
+            style: ui::Style::Keys,
+            pointing: false,
+            cursor: Point::ORIGIN,
+            wheel: Wheel::default(),
+            reduced_motion: options.reduced_motion,
         };
         app.rewind();
         if options.play {
@@ -359,6 +471,10 @@ impl Spectra {
                         *glow = target;
                     }
                 }
+                self.slide.step(dt);
+                if self.library_visible() {
+                    self.shelf.step(dt);
+                }
                 Task::none()
             }
             Message::Scrolled(viewport) => {
@@ -376,28 +492,14 @@ impl Spectra {
             }
             Message::Drive(state) => {
                 self.drive_state = Some(state.clone());
-                // A kept album is playing: the drive waits until Back.
-                if self.opened {
+                // A kept copy is on the stage: the drive waits until Back.
+                // Otherwise the stage follows the drive, even under the
+                // library, so it is current when the library slides away.
+                if self.picked.is_some() {
                     return Task::none();
-                }
-                // On the shelf, only a disc that has been read takes over the
-                // screen; until then the shelf stays, and says so.
-                if !self.shelf.is_empty() {
-                    match state {
-                        DriveState::Reading => {
-                            self.album.note = Some("Reading the disc in the drive…".into());
-                            return Task::none();
-                        }
-                        DriveState::NoDrive | DriveState::Empty => {
-                            self.album.note = Some(self.ready_note());
-                            return Task::none();
-                        }
-                        DriveState::Disc { .. } | DriveState::Unreadable(_) => {}
-                    }
                 }
                 self.show_drive(state)
             }
-            Message::Audio(_) if !self.shelf.is_empty() => Task::none(),
             Message::Audio(event) => {
                 match event {
                     audio::Event::At { track, seconds } => {
@@ -449,7 +551,7 @@ impl Spectra {
                             m => format!("  ·  about {m} minutes left"),
                         });
                     }
-                    note.push_str("  ·  ○ or Backspace to stop");
+                    note.push_str("  ·  {back} Stop");
                     self.album.note = Some(note);
                 }
                 Task::none()
@@ -461,7 +563,6 @@ impl Spectra {
                     .is_some_and(|c| c.cancel.load(Ordering::Relaxed));
                 self.motion.set_spinning(false);
                 self.launch = self.disc_launch();
-                self.kept |= result.is_ok();
                 // A kept CD plays from its copy from now on.
                 let mut task = Task::none();
                 if let Ok(entry) = &result
@@ -507,108 +608,366 @@ impl Spectra {
             }
             // The drive is busy copying.
             Message::Pick(_) if self.copying.is_some() => Task::none(),
-            Message::Pick(track) if !self.shelf.is_empty() && !self.in_game => {
-                self.focus = track;
-                self.show_shelf_art();
-                self.play_kept()
-            }
             Message::Pick(track) => {
                 self.focus = track;
                 self.play(track);
                 Task::none()
             }
-            // Gamepads reach every program at once: while a game runs, the
-            // buttons are the game's.
-            Message::Remote(_) if self.in_game => Task::none(),
-            // The drive is busy copying: a game would only fight it for reads.
-            Message::Remote(Remote::Back) if self.copying.is_some() => {
-                if let Some(copying) = &self.copying {
-                    copying.cancel.store(true, Ordering::Relaxed);
+            Message::Pointer(at) => {
+                self.cursor = at;
+                self.pointing = true;
+                Task::none()
+            }
+            Message::Wheel(screen, delta) => self.wheel(screen, delta),
+            Message::OpenLibrary => self.open_library(),
+            Message::CloseLibrary => self.close_library(),
+            Message::ReturnToDrive => self.return_to_drive(),
+            Message::KeepCopy => self.keep_copy(),
+            Message::ShelfScrolled(viewport) => {
+                self.shelf.scrolled(viewport);
+                Task::none()
+            }
+            Message::ShelfFace(id, face) => {
+                self.shelf
+                    .set_face(id, face.unwrap_or_else(|| Arc::new(Face::blank())));
+                Task::none()
+            }
+            Message::ShelfFocus(index) => {
+                if self.shelf.menu.is_some() {
+                    return Task::none();
+                }
+                self.shelf.focus_on(index)
+            }
+            Message::ShelfPick(index) => {
+                self.shelf.menu = None;
+                self.pick(index)
+            }
+            Message::ShelfMenu(index) => {
+                let focus = self.shelf.focus_on(index);
+                self.shelf.menu = Some(shelf::Menu {
+                    index,
+                    at: self.cursor,
+                });
+                focus
+            }
+            Message::MenuClose => {
+                self.shelf.menu = None;
+                self.shelf.armed = None;
+                Task::none()
+            }
+            Message::ShelfDelete(index) => self.delete(index),
+            Message::Disarm(id) => {
+                if self.shelf.armed.as_deref() == Some(id.as_str()) {
+                    self.shelf.armed = None;
                 }
                 Task::none()
             }
-            Message::Remote(
-                Remote::Select | Remote::PlayPause | Remote::Keep | Remote::Library,
-            ) if self.copying.is_some() => Task::none(),
-            Message::Remote(Remote::Library) => self.toggle_library(),
-            // Only the disc in the drive can be kept.
-            Message::Remote(Remote::Keep) if !self.shelf.is_empty() || self.opened => Task::none(),
-            Message::Remote(Remote::Keep) => self.keep_copy(),
-            Message::Remote(Remote::Back) if !self.shelf.is_empty() && self.disc_in_drive() => {
-                self.return_to_drive()
-            }
-            Message::Remote(Remote::Select | Remote::PlayPause) if !self.shelf.is_empty() => {
-                self.play_kept()
-            }
-            Message::Remote(Remote::Select | Remote::PlayPause) if self.launch.is_some() => {
-                self.start_game()
-            }
             Message::Remote(remote) => {
-                let count = self.album.tracks.len();
-                if count == 0 {
-                    return if let Remote::Quit = remote {
-                        iced::exit()
-                    } else {
-                        Task::none()
-                    };
-                }
-                match remote {
-                    Remote::Up => self.focus = self.focus.saturating_sub(1),
-                    Remote::Down => self.focus = (self.focus + 1).min(count - 1),
-                    Remote::Select => self.play(self.focus),
-                    Remote::PlayPause => match self.playing {
-                        Some(_) => {
-                            self.paused = !self.paused;
-                            self.motion.set_spinning(!self.paused);
-                            if let Some(player) = &self.player {
-                                if self.paused {
-                                    player.pause();
-                                } else {
-                                    player.resume();
-                                }
-                            }
-                        }
-                        None => self.play(self.focus),
-                    },
-                    Remote::Previous | Remote::Next => {
-                        let current = self.playing.unwrap_or(self.focus);
-                        self.focus = match remote {
-                            Remote::Previous => current.saturating_sub(1),
-                            _ => (current + 1).min(count - 1),
-                        };
-                        if self.playing.is_some() {
-                            self.play(self.focus);
-                        }
-                    }
-                    Remote::Back if self.playing.is_none() && self.opened => {
-                        return self.back_to_shelf();
-                    }
-                    Remote::Back => {
-                        self.playing = None;
-                        self.motion.set_spinning(false);
-                        if let Some(player) = &self.player {
-                            player.stop();
-                        }
-                    }
-                    Remote::Keep | Remote::Library => {}
-                    Remote::Quit => return iced::exit(),
-                }
-                self.show_shelf_art();
-                self.reveal_focus()
+                self.style = ui::Style::Keys;
+                self.pointing = false;
+                self.remote(remote)
+            }
+            Message::Pad(pad, remote) => {
+                self.style = ui::Style::Pad(pad);
+                self.pointing = false;
+                self.remote(remote)
             }
         }
     }
 
-    /// Put the drive's disc on screen, or the shelf when there is none,
-    /// with whatever it needs started: its player, its names, its pictures.
+    /// A press of the remote, for whichever screen has it.
+    fn remote(&mut self, remote: Remote) -> Task<Message> {
+        // Gamepads reach every program at once: while a game runs, the
+        // buttons are the game's.
+        if self.in_game {
+            return Task::none();
+        }
+        match self.screen {
+            Screen::Library => self.library_remote(remote),
+            Screen::Stage => self.stage_remote(remote),
+        }
+    }
+
+    fn library_remote(&mut self, remote: Remote) -> Task<Message> {
+        // A menu is up: it has the controls until it goes.
+        if let Some(menu) = self.shelf.menu {
+            return match remote {
+                Remote::Select | Remote::PlayPause => {
+                    self.shelf.menu = None;
+                    self.pick(menu.index)
+                }
+                Remote::Menu => self.delete(menu.index),
+                _ => {
+                    self.shelf.menu = None;
+                    self.shelf.armed = None;
+                    Task::none()
+                }
+            };
+        }
+        let (moved, task) = match remote {
+            Remote::Left => self.shelf.left(),
+            Remote::Right => self.shelf.right(),
+            Remote::Up => self.shelf.up(),
+            Remote::Down => self.shelf.down(),
+            Remote::Select | Remote::PlayPause => return self.pick(self.shelf.focus),
+            Remote::Menu => return self.delete(self.shelf.focus),
+            Remote::Back | Remote::Library | Remote::Quit => return self.close_library(),
+            Remote::Keep | Remote::Previous | Remote::Next => return Task::none(),
+        };
+        match moved {
+            Moved::Out => self.close_library(),
+            Moved::To | Moved::Nowhere => task,
+        }
+    }
+
+    fn stage_remote(&mut self, remote: Remote) -> Task<Message> {
+        if self.copying.is_some() {
+            // The drive is busy copying: a game would only fight it for
+            // reads, and the library waits until the copy is kept.
+            return match remote {
+                Remote::Back => {
+                    if let Some(copying) = &self.copying {
+                        copying.cancel.store(true, Ordering::Relaxed);
+                    }
+                    Task::none()
+                }
+                Remote::Quit => iced::exit(),
+                _ => Task::none(),
+            };
+        }
+        match remote {
+            Remote::Library | Remote::Menu => return self.open_library(),
+            // Only the disc in the drive can be kept.
+            Remote::Keep if self.picked.is_none() => return self.keep_copy(),
+            Remote::Keep => return Task::none(),
+            Remote::Back if self.playing.is_none() && self.picked.is_some() => {
+                return self.return_to_drive();
+            }
+            Remote::Select | Remote::PlayPause if self.launch.is_some() => {
+                return self.start_game();
+            }
+            Remote::Quit => return iced::exit(),
+            _ => {}
+        }
+        let count = self.album.tracks.len();
+        // Down from the last track, or from a disc with none, goes down to
+        // the library, as the screens are stacked.
+        if matches!(remote, Remote::Down) && (count == 0 || self.focus + 1 >= count) {
+            return self.open_library();
+        }
+        if count == 0 {
+            return Task::none();
+        }
+        match remote {
+            Remote::Up => self.focus = self.focus.saturating_sub(1),
+            Remote::Down => self.focus = (self.focus + 1).min(count - 1),
+            Remote::Select => self.play(self.focus),
+            Remote::PlayPause => match self.playing {
+                Some(_) => {
+                    self.paused = !self.paused;
+                    self.motion.set_spinning(!self.paused);
+                    if let Some(player) = &self.player {
+                        if self.paused {
+                            player.pause();
+                        } else {
+                            player.resume();
+                        }
+                    }
+                }
+                None => self.play(self.focus),
+            },
+            Remote::Previous | Remote::Next | Remote::Left | Remote::Right => {
+                let current = self.playing.unwrap_or(self.focus);
+                self.focus = match remote {
+                    Remote::Previous | Remote::Left => current.saturating_sub(1),
+                    _ => (current + 1).min(count - 1),
+                };
+                if self.playing.is_some() {
+                    self.play(self.focus);
+                }
+            }
+            Remote::Back => {
+                self.playing = None;
+                self.motion.set_spinning(false);
+                if let Some(player) = &self.player {
+                    player.stop();
+                }
+            }
+            Remote::Keep | Remote::Menu | Remote::Library | Remote::Quit => {}
+        }
+        self.reveal_focus()
+    }
+
+    /// A step of the wheel: down from the stage to the library, and up from
+    /// the top of the library back to the stage. A gesture that starts with
+    /// the shelf scrolled down only scrolls it, so scrolling the grid back
+    /// up does not carry straight on out of the library.
+    fn wheel(&mut self, screen: Screen, delta: ScrollDelta) -> Task<Message> {
+        if screen != self.screen || self.slide.moving() || self.shelf.menu.is_some() {
+            return Task::none();
+        }
+        let now = Instant::now();
+        if self
+            .wheel
+            .last
+            .is_none_or(|last| now.duration_since(last) > GESTURE_GAP)
+        {
+            self.wheel.travel = 0.0;
+            self.wheel.live = match screen {
+                Screen::Stage => true,
+                Screen::Library => self.shelf.at_top(),
+            };
+        }
+        self.wheel.last = Some(now);
+        if !self.wheel.live {
+            return Task::none();
+        }
+        // Downwards is positive here; iced's wheel is the other way round.
+        self.wheel.travel -= match delta {
+            ScrollDelta::Lines { y, .. } => y * 16.0,
+            ScrollDelta::Pixels { y, .. } => y,
+        };
+        if self.wheel.travel.abs() < STEP_PX {
+            return Task::none();
+        }
+        self.wheel.live = false;
+        match (screen, self.wheel.travel > 0.0) {
+            (Screen::Stage, true) => self.open_library(),
+            (Screen::Library, false) => self.close_library(),
+            _ => Task::none(),
+        }
+    }
+
+    fn library_visible(&self) -> bool {
+        self.screen == Screen::Library || self.slide.moving()
+    }
+
+    /// Slide down to the library, with its shelf brought up to date and
+    /// faces made for any copy new to it.
+    fn open_library(&mut self) -> Task<Message> {
+        if self.copying.is_some() || self.in_game {
+            return Task::none();
+        }
+        let missing = self.shelf.load(library::list());
+        self.shelf.notice = None;
+        self.screen = Screen::Library;
+        self.slide.go(1.0, self.reduced_motion);
+        self.shelf.shown(true);
+        Task::batch(missing.into_iter().map(|entry| {
+            let id = entry.meta.id.clone();
+            Task::perform(
+                blocking(move || {
+                    let pictures = artwork::for_copy(&entry);
+                    Some(Arc::new(Face::new(
+                        pictures.cover.as_ref(),
+                        pictures.face.as_ref(),
+                    )))
+                }),
+                move |face| Message::ShelfFace(id.clone(), face),
+            )
+        }))
+    }
+
+    fn close_library(&mut self) -> Task<Message> {
+        if self.screen == Screen::Stage {
+            return Task::none();
+        }
+        self.screen = Screen::Stage;
+        self.slide.go(0.0, self.reduced_motion);
+        self.shelf.shown(false);
+        Task::none()
+    }
+
+    /// Put a kept copy on the stage in place of the drive's disc, and play
+    /// it: an album from its first track, a game straight away.
+    fn pick(&mut self, index: usize) -> Task<Message> {
+        let Some(entry) = self.shelf.entries.get(index).cloned() else {
+            return Task::none();
+        };
+        let _ = self.shelf.focus_on(index);
+        let close = self.close_library();
+        let pictures = artwork::for_copy(&entry);
+        self.player = None;
+        self.serial = None;
+        self.disc_id = None;
+        if entry.is_album() {
+            let Some(toc) = entry.toc() else {
+                self.shelf.notice = Some("That copy would not open".into());
+                return Task::none();
+            };
+            let mut album = Album::from_copy(&entry, &toc);
+            album.cover = pictures.cover.unwrap_or_else(album::placeholder_cover);
+            self.picked = Some(entry.clone());
+            album.note = Some(self.ready_note());
+            self.launch = None;
+            self.show(album);
+            let player = self.start_player(audio::Source::Image(entry.bin()), audio::spans(&toc));
+            self.play(0);
+            return Task::batch([close, player, self.scroll_to_top()]);
+        }
+        let mut album = Album::from_kept_game(&entry);
+        if let Some(cover) = pictures.cover.or_else(|| pictures.face.clone()) {
+            album.cover = cover;
+        }
+        album.face = pictures.face;
+        self.picked = Some(entry.clone());
+        self.launch = entry
+            .meta
+            .system
+            .and_then(game::find)
+            .map(|emulator| Launch {
+                emulator,
+                content: entry.cue().to_string_lossy().into_owned(),
+            });
+        album.note = Some(self.ready_note());
+        self.show(album);
+        if self.launch.is_none() {
+            return close;
+        }
+        Task::batch([close, self.start_game()])
+    }
+
+    /// Delete pressed on a copy: the first press arms it, the second
+    /// throws the copy away.
+    fn delete(&mut self, index: usize) -> Task<Message> {
+        let Some(entry) = self.shelf.delete(index) else {
+            // Armed: it disarms by itself if nobody confirms.
+            let Some(id) = self.shelf.armed.clone() else {
+                return Task::none();
+            };
+            return Task::perform(blocking(|| std::thread::sleep(ARMED)), move |()| {
+                Message::Disarm(id.clone())
+            });
+        };
+        if let Err(e) = library::remove(&entry) {
+            self.shelf.notice = Some(format!("Couldn't delete that copy: {e}"));
+            return Task::none();
+        }
+        let mut task = Task::none();
+        if self
+            .picked
+            .as_ref()
+            .is_some_and(|p| p.meta.id == entry.meta.id)
+        {
+            task = self.return_to_drive();
+        } else if self.picked.is_none() && self.disc.is_some() {
+            // The disc in the drive may have been the copy: it plays from the
+            // drive again.
+            self.launch = self.disc_launch();
+            self.album.note = Some(self.ready_note());
+        }
+        let _ = self.shelf.load(library::list());
+        task
+    }
+
+    /// Put the drive's disc on the stage, with whatever it needs started:
+    /// its player, its names, its pictures.
     fn show_drive(&mut self, state: DriveState) -> Task<Message> {
         let mut album = Album::from_drive(&state);
-        let idle = matches!(state, DriveState::NoDrive | DriveState::Empty);
         // A new disc, or none: whatever was playing stops.
         self.player = None;
         self.disc_id = None;
-        self.opened = false;
-        self.kept = !library::list().is_empty();
+        self.picked = None;
         let mut audio_tasks = Vec::new();
         if let DriveState::Disc { report, drive } = &state
             && let DiscKind::Audio { musicbrainz, .. } = &report.kind
@@ -659,11 +1018,6 @@ impl Spectra {
             },
             _ => None,
         };
-        self.shelf.clear();
-        self.shelf_art = None;
-        if idle && let Some(shelf) = self.shelf_album() {
-            album = shelf;
-        }
         self.launch = self.disc_launch();
         let music = self.disc.as_ref().is_some_and(|d| d.game.is_none());
         let emulator = self
@@ -679,7 +1033,6 @@ impl Spectra {
             .disc
             .as_ref()
             .and_then(|d| d.game.as_ref()?.serial.clone());
-        self.show_shelf_art();
         // The disc goes on screen now; its pictures follow when they
         // arrive, from the cache or the network.
         let pictures = self.disc.as_ref().and_then(|disc| {
@@ -711,93 +1064,45 @@ impl Spectra {
         Some(Launch { emulator, content })
     }
 
-    /// What can be done now, for the line under a game.
+    /// What can be done now, for the line under the title. Buttons are
+    /// written `{accept}`, and drawn as the controller in hand has them.
     fn ready_note(&self) -> String {
-        if !self.shelf.is_empty() {
-            return if self.disc_in_drive() {
-                "✕ or Enter to play  ·  ○ or Backspace for the disc in the drive".into()
+        if let Some(entry) = &self.picked {
+            let back = if self.disc_in_drive() {
+                "for the disc in the drive"
             } else {
-                "✕ or Enter to play".into()
+                "to the drive"
+            };
+            return if entry.is_album() {
+                format!("Your copy  ·  {{back}} Stop, then {{back}} again {back}")
+            } else if self.launch.is_none() {
+                format!("No emulator for this console is installed  ·  {{back}} Back {back}")
+            } else {
+                format!("Your copy  ·  {{accept}} Play  ·  {{back}} Back {back}")
             };
         }
         let Some(disc) = &self.disc else {
             return String::new();
         };
-        let mut note: String = if let Some(game) = &disc.game
+        if let Some(game) = &disc.game
             && self.launch.is_none()
         {
             // An emulator that only plays copies.
-            match (game::find(game.system), library::id(&disc.report)) {
-                (Some(_), Some(_)) => "△ or C to keep a copy, then play it from the copy".into(),
+            return match (game::find(game.system), library::id(&disc.report)) {
+                (Some(_), Some(_)) => "{alt} Keep a copy, then play it from the copy".into(),
                 _ => "No emulator for this console is installed".into(),
+            };
+        }
+        match library::id(&disc.report) {
+            Some(id) if library::find(&id).is_some() => {
+                "{accept} Play  ·  Kept: plays without the disc".into()
             }
-        } else {
-            match library::id(&disc.report) {
-                Some(id) if library::find(&id).is_some() => {
-                    "✕ or Enter to play  ·  Kept: plays without the disc".into()
-                }
-                Some(_) => "✕ or Enter to play  ·  △ or C to keep a copy".into(),
-                None => "✕ or Enter to play".into(),
-            }
-        };
-        if self.kept {
-            note.push_str("  ·  L or View for your discs");
+            Some(_) => "{accept} Play  ·  {alt} Keep a copy".into(),
+            None => "{accept} Play".into(),
         }
-        note
     }
 
-    /// Play the kept copy in focus on the shelf.
-    fn play_kept(&mut self) -> Task<Message> {
-        let Some(entry) = self.shelf.get(self.focus) else {
-            return Task::none();
-        };
-        if entry.is_album() {
-            return self.open_album(entry.clone());
-        }
-        self.launch = entry
-            .meta
-            .system
-            .and_then(game::find)
-            .map(|emulator| Launch {
-                emulator,
-                content: entry.cue().to_string_lossy().into_owned(),
-            });
-        if self.launch.is_none() {
-            self.album.note = Some("No emulator for this console is installed".into());
-        }
-        self.start_game()
-    }
-
-    /// Open a kept album from the shelf, and play it from the top.
-    fn open_album(&mut self, entry: library::Entry) -> Task<Message> {
-        let Some(toc) = entry.toc() else {
-            self.album.note = Some("Couldn't open this copy".into());
-            return Task::none();
-        };
-        let mut album = Album::from_copy(&entry, &toc);
-        album.cover = self.album.cover.clone();
-        album.face = self.album.face.take();
-        album.note = Some("○ or Backspace to stop, and again for your discs".into());
-        self.shelf.clear();
-        self.shelf_art = None;
-        self.opened = true;
-        self.show(album);
-        let player = self.start_player(audio::Source::Image(entry.bin()), audio::spans(&toc));
-        self.play(0);
-        Task::batch([player, self.scroll_to_top()])
-    }
-
-    /// From an opened album back to the shelf it came from.
-    fn back_to_shelf(&mut self) -> Task<Message> {
-        self.player = None;
-        self.opened = false;
-        let album = self.shelf_album().unwrap_or_else(Album::no_disc);
-        self.show(album);
-        self.show_shelf_art();
-        self.scroll_to_top()
-    }
-
-    /// A disc is in the drive, read or not, for the library to go back to.
+    /// A disc is in the drive, read or not, for Back to return to.
     fn disc_in_drive(&self) -> bool {
         matches!(
             self.drive_state,
@@ -805,60 +1110,23 @@ impl Spectra {
         )
     }
 
-    /// The library button: from the disc to the shelf, from a kept album
-    /// back to the shelf, and from the shelf back to the disc.
-    fn toggle_library(&mut self) -> Task<Message> {
-        if self.opened {
-            self.back_to_shelf()
-        } else if !self.shelf.is_empty() {
-            if self.disc_in_drive() {
-                self.return_to_drive()
-            } else {
-                Task::none()
-            }
-        } else {
-            self.open_library()
-        }
+    /// The disc in the drive could be kept now, from the stage.
+    fn keepable(&self) -> bool {
+        self.picked.is_none()
+            && self.copying.is_none()
+            && !self.in_game
+            && self.disc.as_ref().is_some_and(|disc| {
+                library::id(&disc.report).is_some_and(|id| library::find(&id).is_none())
+            })
     }
 
-    /// The shelf of kept copies, over the disc in the drive. The disc stays
-    /// in, and Back returns to it.
-    fn open_library(&mut self) -> Task<Message> {
-        let Some(album) = self.shelf_album() else {
-            self.album.note = Some("Nothing kept yet  ·  △ or C keeps a copy of a disc".into());
-            return Task::none();
-        };
-        // The shelf has the screen, and its own sound: the disc goes quiet.
-        self.player = None;
-        self.serial = None;
-        self.disc_id = None;
-        self.show(album);
-        self.show_shelf_art();
-        self.scroll_to_top()
-    }
-
-    /// Put the disc in the drive back on the screen, as it is now.
+    /// Put the drive's disc back on the stage in place of a copy, as the
+    /// drive is now.
     fn return_to_drive(&mut self) -> Task<Message> {
-        let Some(state) = self.drive_state.clone() else {
-            return Task::none();
-        };
+        self.picked = None;
+        self.player = None;
+        let state = self.drive_state.clone().unwrap_or(DriveState::Empty);
         self.show_drive(state)
-    }
-
-    /// The shelf of kept copies, if there are any.
-    fn shelf_album(&mut self) -> Option<Album> {
-        let entries = library::list();
-        if entries.is_empty() {
-            return None;
-        }
-        let mut album = Album::shelf(&entries);
-        self.shelf = entries;
-        self.shelf_art = None;
-        if self.disc_in_drive() {
-            album.artist = "Play one you've kept".into();
-        }
-        album.note = Some(self.ready_note());
-        Some(album)
     }
 
     fn start_player(&mut self, source: audio::Source, spans: Vec<audio::Span>) -> Task<Message> {
@@ -875,24 +1143,6 @@ impl Spectra {
                 y: Some(0.0),
             },
         )
-    }
-
-    /// On the shelf, the disc on screen is the copy in focus.
-    fn show_shelf_art(&mut self) {
-        let Some(entry) = self.shelf.get(self.focus) else {
-            return;
-        };
-        if self.shelf_art == Some(self.focus) {
-            return;
-        }
-        self.shelf_art = Some(self.focus);
-        let pictures = artwork::for_copy(entry);
-        if let Some(cover) = pictures.cover.or_else(|| pictures.face.clone()) {
-            self.album.cover = cover;
-        }
-        self.album.face = pictures.face;
-        self.art = Art::new(&self.album.cover, self.album.face.as_ref());
-        platform::release_memory();
     }
 
     fn keep_copy(&mut self) -> Task<Message> {
@@ -917,7 +1167,7 @@ impl Spectra {
             started: Instant::now(),
         });
         self.motion.set_spinning(true);
-        self.album.note = Some("Keeping a copy  ·  ○ or Backspace to stop".into());
+        self.album.note = Some("Keeping a copy  ·  {back} Stop".into());
         let (report, drive, game) = (disc.report.clone(), disc.drive.clone(), disc.game.clone());
         Task::run(
             iced::stream::channel(4, async move |mut output| {
@@ -1022,18 +1272,25 @@ impl Spectra {
     }
 
     fn animating(&self) -> bool {
-        self.motion.moving()
-            || self
-                .glow
-                .iter()
-                .enumerate()
-                .any(|(i, &g)| g != if i == self.focus { 1.0 } else { 0.0 })
+        // The stage's disc goes on turning under the library, but nothing
+        // is drawn for it while it cannot be seen.
+        let stage = self.screen == Screen::Stage || self.slide.moving();
+        self.slide.moving()
+            || (stage
+                && (self.motion.moving()
+                    || self
+                        .glow
+                        .iter()
+                        .enumerate()
+                        .any(|(i, &g)| g != if i == self.focus { 1.0 } else { 0.0 })))
+            || (self.library_visible() && self.shelf.moving())
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let remote =
-            Subscription::batch([keyboard::listen().filter_map(key), gamepad::subscription()])
-                .map(Message::Remote);
+        let remote = Subscription::batch([
+            keyboard::listen().filter_map(key).map(Message::Remote),
+            gamepad::subscription().map(|(pad, remote)| Message::Pad(pad, remote)),
+        ]);
         let remote = if self.watching {
             Subscription::batch([remote, watch::subscription().map(Message::Drive)])
         } else {
@@ -1048,7 +1305,46 @@ impl Spectra {
         }
     }
 
+    /// The stage above the library. At rest only the one on screen is
+    /// built; while sliding, both, stacked, moved up by as much of a
+    /// screen as the slide has gone.
     fn view(&self) -> Element<'_, Message> {
+        responsive(move |size| {
+            let at = self.slide.at();
+            if at <= 0.0 {
+                return self.stage();
+            }
+            if at >= 1.0 {
+                return self.library(size);
+            }
+            let both = column![
+                container(self.stage()).width(Fill).height(size.height),
+                container(self.library(size))
+                    .width(Fill)
+                    .height(size.height),
+            ];
+            container(pin(both).y(-at * size.height))
+                .width(Fill)
+                .height(Fill)
+                .clip(true)
+                .into()
+        })
+        .into()
+    }
+
+    fn library(&self, size: Size) -> Element<'_, Message> {
+        self.shelf.view(
+            size,
+            shelf::Context {
+                style: self.style,
+                picked: self.picked.as_ref().map(|p| p.meta.id.as_str()),
+                disc_in_drive: self.disc_in_drive(),
+                pointing: self.pointing,
+            },
+        )
+    }
+
+    fn stage(&self) -> Element<'_, Message> {
         let backdrop = image(self.art.backdrop.clone())
             .width(Fill)
             .height(Fill)
@@ -1066,7 +1362,57 @@ impl Spectra {
                 )),
                 ..Default::default()
             });
-        stack![backdrop, shade, responsive(|size| self.screen(size))].into()
+        mouse_area(stack![
+            backdrop,
+            shade,
+            responsive(|size| self.screen(size)),
+            self.corner()
+        ])
+        .on_scroll(|delta| Message::Wheel(Screen::Stage, delta))
+        .on_move(Message::Pointer)
+        .into()
+    }
+
+    /// The stage's quiet buttons, in the bottom corner: back to the drive
+    /// from a copy, keep a copy of the disc, and down to the library.
+    fn corner(&self) -> Element<'_, Message> {
+        let label = |pad: &str, words: &str| -> Element<'_, Message> {
+            if self.pointing {
+                ui::quiet_text(words)
+            } else {
+                ui::prompt(
+                    &format!("{pad} {}", words.to_uppercase()),
+                    self.style,
+                    13.0,
+                    Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+                )
+            }
+        };
+        let mut buttons = row![].spacing(8).align_y(Vertical::Center);
+        if self.picked.is_some() && !self.in_game {
+            buttons = buttons.push(ui::quiet(
+                label("{back}", "Back to the drive"),
+                Message::ReturnToDrive,
+            ));
+        }
+        if self.keepable() {
+            buttons = buttons.push(ui::quiet(label("{alt}", "Keep a copy"), Message::KeepCopy));
+        }
+        if self.copying.is_none() && !self.in_game {
+            let library: Element<'_, Message> = if self.pointing {
+                ui::quiet_text("Your discs ↓")
+            } else {
+                label("{library}", "Your discs")
+            };
+            buttons = buttons.push(ui::quiet(library, Message::OpenLibrary));
+        }
+        container(buttons)
+            .width(Fill)
+            .height(Fill)
+            .align_right(Fill)
+            .align_bottom(Fill)
+            .padding([28, 32])
+            .into()
     }
 
     /// Everything over the backdrop, arranged for the room there is.
@@ -1117,6 +1463,7 @@ impl Spectra {
 
     fn disc(&self) -> iced::widget::Shader<Message, disc::Disc> {
         shader(disc::Disc {
+            slot: STAGE,
             pose: self.motion.pose(),
             label: self.art.label.clone(),
             accent: self.art.accent,
@@ -1164,7 +1511,14 @@ impl Spectra {
                     .color(Color::from_rgba(1.0, 1.0, 1.0, 0.78)),
             ]
             .push(details.map(|details| dim(&details, 0.5)))
-            .push(album.note.as_deref().map(|note| dim(note, 0.38)))
+            .push(album.note.as_deref().map(|note| {
+                ui::prompt(
+                    note,
+                    self.style,
+                    scale.detail,
+                    Color::from_rgba(1.0, 1.0, 1.0, 0.38),
+                )
+            }))
             .spacing(scale.gap / 4.0),
         )
         .padding([0.0, LIST_PAD])
@@ -1258,17 +1612,12 @@ impl Spectra {
         if scale.gap < 20.0 || !self.album.playable || self.album.tracks.is_empty() {
             return space().into();
         }
-        let hints = if self.kept && !self.opened {
-            "↑↓ Choose    ✕ Play    L1 R1 Skip    Start Pause    ○ Stop    View Your discs"
-        } else {
-            "↑↓ Choose    ✕ Play    L1 R1 Skip    Start Pause    ○ Stop"
-        };
-        container(
-            text(hints)
-                .font(FONT)
-                .size(13)
-                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.4)),
-        )
+        container(ui::prompt(
+            "{up}{down} Choose    {accept} Play    {prev}{next} Skip    {start} Pause    {back} Stop",
+            self.style,
+            13.0,
+            Color::from_rgba(1.0, 1.0, 1.0, 0.4),
+        ))
         .padding([0.0, LIST_PAD])
         .into()
     }
@@ -1366,14 +1715,18 @@ fn key(event: keyboard::Event) -> Option<Remote> {
     match key.as_ref() {
         Key::Named(Named::ArrowUp) => Some(Remote::Up),
         Key::Named(Named::ArrowDown) => Some(Remote::Down),
-        Key::Named(Named::ArrowLeft) => Some(Remote::Previous),
-        Key::Named(Named::ArrowRight) => Some(Remote::Next),
+        Key::Named(Named::ArrowLeft) => Some(Remote::Left),
+        Key::Named(Named::ArrowRight) => Some(Remote::Right),
+        Key::Named(Named::PageUp) => Some(Remote::Previous),
+        Key::Named(Named::PageDown) => Some(Remote::Next),
+        Key::Named(Named::Delete) => Some(Remote::Menu),
         Key::Named(Named::Enter) => Some(Remote::Select),
         Key::Named(Named::Space) => Some(Remote::PlayPause),
         Key::Named(Named::Backspace) => Some(Remote::Back),
         Key::Named(Named::Escape) => Some(Remote::Quit),
         Key::Character("c") => Some(Remote::Keep),
         Key::Character("l") => Some(Remote::Library),
+        Key::Character("m") => Some(Remote::Menu),
         _ => None,
     }
 }

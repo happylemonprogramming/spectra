@@ -102,32 +102,30 @@ impl Album {
         }
     }
 
-    /// The discs kept as copies, to pick one and play it.
-    pub fn shelf(entries: &[Entry]) -> Self {
-        let mut album = Self::message("Your discs", "Insert a disc, or play one you've kept");
-        album.details = Some(match entries.len() {
-            1 => "1 copy".into(),
-            n => format!("{n} copies"),
-        });
-        album.note = Some("✕ or Enter to play".into());
-        album.tracks = entries
-            .iter()
-            .map(|e| Track {
-                title: match (&e.meta.artist, e.is_album()) {
-                    (Some(artist), true) => format!("{}  ·  {artist}", e.meta.title),
-                    _ => e.meta.title.clone(),
-                },
-                seconds: 0,
-                detail: Some(
-                    if e.is_album() {
-                        "Music"
-                    } else {
-                        e.meta.system.map_or("Disc", GameSystem::name)
-                    }
-                    .to_string(),
+    /// A kept game, put on the stage from the library.
+    pub fn from_kept_game(entry: &Entry) -> Self {
+        let mut album = Self::message(
+            &entry.meta.title,
+            &[
+                Some(
+                    entry
+                        .meta
+                        .system
+                        .map_or("Disc", GameSystem::name)
+                        .to_string(),
                 ),
-            })
-            .collect();
+                entry.meta.publisher.clone(),
+                entry.meta.year.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("  ·  "),
+        );
+        album.details = [entry.meta.serial.clone(), entry.meta.region.clone()]
+            .into_iter()
+            .flatten()
+            .reduce(|a, b| format!("{a}  ·  {b}"));
         album
     }
 
@@ -280,7 +278,7 @@ fn cd_tracks(toc: &spectra_core::Toc) -> Vec<Track> {
 
 /// A cover for an album that has none: a soft diagonal sweep through the
 /// spectrum.
-fn placeholder_cover() -> RgbaImage {
+pub fn placeholder_cover() -> RgbaImage {
     const SIZE: u32 = 512;
     RgbaImage::from_fn(SIZE, SIZE, |x, y| {
         let t = (x + y) as f32 / (2 * SIZE) as f32;
