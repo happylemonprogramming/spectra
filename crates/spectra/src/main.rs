@@ -827,9 +827,10 @@ impl Spectra {
             _ => {}
         }
         let count = self.album.tracks.len();
-        // Down from the last track, or from a disc with none, goes down to
-        // the library, as the screens are stacked.
-        if matches!(remote, Remote::Down) && (count == 0 || self.focus + 1 >= count) {
+        // Down from a disc with no tracks goes down to the library, as the
+        // screens are stacked. From the last track it stays: scrolling to
+        // the end of a list should not leave it.
+        if matches!(remote, Remote::Down) && count == 0 {
             return self.open_library();
         }
         if count == 0 {
