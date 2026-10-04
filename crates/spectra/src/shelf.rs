@@ -485,6 +485,9 @@ impl Shelf {
                 .size(13)
                 .color(accent)
                 .into()
+        } else if crate::soundtrack::is_entry(entry) {
+            // Said under every soundtrack: its game sits beside it.
+            text("Soundtrack").font(FONT).size(13).color(accent).into()
         } else if !face.printed {
             text(entry.meta.title.clone())
                 .font(FONT)

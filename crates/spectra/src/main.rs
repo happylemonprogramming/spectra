@@ -1015,11 +1015,11 @@ impl Spectra {
                 source,
                 spans,
             } = Arc::unwrap_or_clone(music);
+            // Its game's cover, as on the shelf.
             let mut album = Album::from_soundtrack(&entry, tracks);
-            if let Some(cover) = pictures.cover.or_else(|| pictures.face.clone()) {
+            if let Some(cover) = pictures.cover.or(pictures.face) {
                 album.cover = cover;
             }
-            album.face = pictures.face;
             self.picked = Some(entry.clone());
             album.note = Some(self.ready_note());
             self.launch = None;
@@ -1992,6 +1992,12 @@ fn shelf_faces(missing: Vec<library::Entry>) -> Task<Message> {
         Task::perform(
             blocking(move || {
                 let pictures = artwork::for_copy(&entry);
+                // A soundtrack wears its game's cover, not the game disc's
+                // own print, so the two are told apart on the shelf.
+                if soundtrack::is_entry(&entry) {
+                    let cover = pictures.cover.or(pictures.face);
+                    return Some(Arc::new(Face::new(cover.as_ref(), None)));
+                }
                 Some(Arc::new(Face::new(
                     pictures.cover.as_ref(),
                     pictures.face.as_ref(),
