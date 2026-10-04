@@ -1,17 +1,19 @@
 //! How the disc moves, ported from Rainbow Player's `discScene.ts`.
 //!
 //! One change of principle: Rainbow Player flips its disc end over end for as
-//! long as the page is open. Here it shows off both faces twice on arrival,
-//! then settles label-forward and goes completely still - nothing is drawn,
+//! long as the page is open. Here it turns all the way round twice on
+//! arrival, the read side sweeping past and the label held between, then
+//! settles label-forward and goes completely still - nothing is drawn,
 //! and the GPU idles, until something happens. It spins while playing, the
 //! way a disc does in a drive.
 
-/// A half-turn, eased.
-const FLIP_SECONDS: f32 = 1.15;
-/// How long each face is held to camera between flips.
+/// A whole turn, eased. Whole rather than half, so the read side goes by
+/// and the label is the face that waits.
+const TURN_SECONDS: f32 = 1.8;
+/// How long the label is held to camera between turns.
 const HOLD_SECONDS: f32 = 2.1;
-/// Flips on arrival: label, read side, label.
-const SHOWCASE_FLIPS: u8 = 2;
+/// Turns on arrival.
+const SHOWCASE_TURNS: u8 = 2;
 const PLAYING_RPM: f32 = 320.0;
 /// A disc on the shelf that is not in focus, against one that is.
 const SHELF_REST: f32 = 0.84;
@@ -35,7 +37,7 @@ pub struct Motion {
     flip_to: f32,
     flip_t: f32,
     hold: f32,
-    flips_left: u8,
+    turns_left: u8,
     sway_t: f32,
     sway: f32,
     yaw: f32,
@@ -78,7 +80,7 @@ impl Motion {
             flip_to: 0.0,
             flip_t: 1.0,
             hold: 0.6,
-            flips_left: if reduced { 0 } else { SHOWCASE_FLIPS },
+            turns_left: if reduced { 0 } else { SHOWCASE_TURNS },
             sway_t: 0.0,
             sway: 0.0,
             yaw: 0.0,
@@ -97,7 +99,7 @@ impl Motion {
     /// and smaller than the one in focus.
     pub fn shelved(reduced: bool) -> Self {
         let mut motion = Self::new(reduced);
-        motion.flips_left = 0;
+        motion.turns_left = 0;
         motion.zoom = SHELF_REST;
         motion.zoom_to = SHELF_REST;
         motion
@@ -105,51 +107,45 @@ impl Motion {
 
     /// The shelf's focus arrived or left. The disc that has just been
     /// reached turns straight away, rather than sitting through a hold first;
-    /// one that is left finishes its turn and rests label side out.
+    /// one that is left finishes the turn it is in, which brings the label
+    /// back round.
     pub fn set_focused(&mut self, focused: bool) {
         self.zoom_to = if focused { 1.0 } else { SHELF_REST };
         if focused {
             if !self.reduced {
-                self.flips_left = SHOWCASE_FLIPS;
+                self.turns_left = SHOWCASE_TURNS;
                 self.hold = self.hold.min(0.15);
             }
         } else {
-            // An odd number of half-turns so far leaves the read side out:
-            // one more brings the label back round.
-            let halves = (self.flip_to / std::f32::consts::PI).round() as i32;
-            self.flips_left = u8::from(halves % 2 != 0);
-            self.hold = self.hold.min(0.15);
+            self.turns_left = 0;
         }
     }
 
     pub fn set_spinning(&mut self, on: bool) {
         self.spinning = on;
         if on {
-            // Settle on whichever face is showing rather than whip around.
-            self.flips_left = 0;
-            self.flip_to = (self.flip_to / std::f32::consts::PI).round() * std::f32::consts::PI;
-            self.flip_from = self.flip_to;
-            self.flip_t = 1.0;
+            // No more turns: the one under way finishes label-forward.
+            self.turns_left = 0;
         }
     }
 
     fn showcasing(&self) -> bool {
-        self.flips_left > 0 || self.flip_t < 1.0
+        self.turns_left > 0 || self.flip_t < 1.0
     }
 
     pub fn step(&mut self, dt: f32) {
         if self.flip_t >= 1.0 {
-            if self.flips_left > 0 {
+            if self.turns_left > 0 {
                 self.hold -= dt;
                 if self.hold <= 0.0 {
                     self.flip_from = self.flip_to;
-                    self.flip_to = self.flip_from + std::f32::consts::PI;
+                    self.flip_to = self.flip_from + std::f32::consts::TAU;
                     self.flip_t = 0.0;
-                    self.flips_left -= 1;
+                    self.turns_left -= 1;
                 }
             }
         } else {
-            self.flip_t = (self.flip_t + dt / FLIP_SECONDS).min(1.0);
+            self.flip_t = (self.flip_t + dt / TURN_SECONDS).min(1.0);
             if self.flip_t >= 1.0 {
                 self.hold = HOLD_SECONDS;
             }
@@ -231,13 +227,12 @@ mod tests {
     fn a_shelved_disc_rests_label_out_after_losing_focus() {
         let mut m = Motion::shelved(false);
         m.set_focused(true);
-        // Part way through the showcase: one half-turn in.
-        run(&mut m, 1.6);
+        // Part way through the first turn, read side to camera.
+        run(&mut m, 1.1);
         m.set_focused(false);
         run(&mut m, 15.0);
         assert!(!m.moving(), "still moving after losing focus");
-        let halves = (m.flip_to / std::f32::consts::PI).round() as i32;
-        assert_eq!(halves % 2, 0, "rests read side out");
+        assert_eq!(m.pose().turn.cos().signum(), 1.0, "rests read side out");
         assert_eq!(m.pose().zoom, SHELF_REST);
     }
 
