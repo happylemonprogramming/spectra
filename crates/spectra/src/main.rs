@@ -28,6 +28,7 @@ mod soundtrack;
 mod ui;
 mod watch;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -131,8 +132,8 @@ enum Message {
     Audio(audio::Event),
     /// MusicBrainz's answer for the audio CD with this disc ID.
     Release(String, Box<musicbrainz::Found>),
-    /// The music on the kept game with this ID, if it has any.
-    Soundtrack(String, Option<Box<soundtrack::Soundtrack>>),
+    /// The music found on kept games, by their IDs.
+    Soundtracks(Vec<(String, Option<Arc<soundtrack::Soundtrack>>)>),
     OpenLibrary,
     CloseLibrary,
     /// From a copy on the stage back to the disc in the drive.
@@ -273,6 +274,9 @@ struct Spectra {
     screen: Screen,
     slide: Slide,
     shelf: Shelf,
+    /// Each kept game listened to so far, by ID, and the music it has. A
+    /// game being listened to is here already, with none yet.
+    soundtracks: HashMap<String, Option<Arc<soundtrack::Soundtrack>>>,
     /// What the prompts are drawn as: keys, or the pad last used.
     style: ui::Style,
     /// The mouse is what is in use, so there is a pointer to show where
@@ -422,6 +426,7 @@ impl Spectra {
                 t: 1.0,
             },
             shelf: Shelf::new(options.reduced_motion),
+            soundtracks: HashMap::new(),
             style: ui::Style::Keys,
             pointing: false,
             cursor: Point::ORIGIN,
@@ -556,26 +561,11 @@ impl Spectra {
                 }
                 Task::none()
             }
-            Message::Soundtrack(id, soundtrack) => {
-                // Only if that game is still the one on the stage.
-                let Some(soundtrack) = soundtrack else {
-                    return Task::none();
-                };
-                if self.kept_game_on_stage().as_deref() != Some(id.as_str()) {
-                    return Task::none();
-                }
-                let soundtrack::Soundtrack {
-                    tracks,
-                    source,
-                    spans,
-                } = *soundtrack;
-                self.album.tracks = tracks;
-                self.album.playable = true;
-                // Not a rewind: the game may be running, and the disc with it.
-                self.glow = vec![0.0; self.album.tracks.len()];
-                self.glow[0] = 1.0;
-                self.focus = 0;
-                self.start_player(source, spans)
+            Message::Soundtracks(found) => {
+                self.soundtracks.extend(found);
+                // Each one found goes on the shelf beside its game.
+                let missing = self.shelf.load(self.shelf_entries());
+                shelf_faces(missing)
             }
             Message::Keeping(Keeping::Progress(done, total)) => {
                 if let Some(copying) = &self.copying {
@@ -612,10 +602,6 @@ impl Spectra {
                     && let Some(toc) = entry.toc()
                 {
                     task = self.start_player(audio::Source::Image(entry.bin()), audio::spans(&toc));
-                } else if let Ok(entry) = &result
-                    && entry.meta.system.is_some()
-                {
-                    task = load_soundtrack(entry);
                 }
                 let ready = self.ready_note();
                 self.album.note = Some(match result {
@@ -831,9 +817,7 @@ impl Spectra {
             Remote::Back if self.playing.is_none() && self.picked.is_some() => {
                 return self.return_to_drive();
             }
-            // A game with music listed keeps Start for the music.
-            Remote::Select if self.launch.is_some() => return self.start_game(),
-            Remote::PlayPause if self.launch.is_some() && self.album.tracks.is_empty() => {
+            Remote::Select | Remote::PlayPause if self.launch.is_some() => {
                 return self.start_game();
             }
             Remote::Select | Remote::PlayPause if self.film_uri.is_some() => {
@@ -941,24 +925,56 @@ impl Spectra {
         if self.copying.is_some() || self.in_game || self.film.is_some() {
             return Task::none();
         }
-        let missing = self.shelf.load(library::list());
+        let missing = self.shelf.load(self.shelf_entries());
         self.shelf.notice = None;
         self.screen = Screen::Library;
         self.slide.go(1.0, self.reduced_motion);
         self.shelf.shown(true);
-        Task::batch(missing.into_iter().map(|entry| {
-            let id = entry.meta.id.clone();
-            Task::perform(
-                blocking(move || {
-                    let pictures = artwork::for_copy(&entry);
-                    Some(Arc::new(Face::new(
-                        pictures.cover.as_ref(),
-                        pictures.face.as_ref(),
-                    )))
-                }),
-                move |face| Message::ShelfFace(id.clone(), face),
-            )
-        }))
+        Task::batch([shelf_faces(missing), self.listen_to_games()])
+    }
+
+    /// The library as the shelf shows it: every copy, and after each game
+    /// with music, its soundtrack.
+    fn shelf_entries(&self) -> Vec<library::Entry> {
+        library::list()
+            .into_iter()
+            .flat_map(|entry| {
+                let music = self
+                    .soundtracks
+                    .get(&entry.meta.id)
+                    .is_some_and(Option::is_some)
+                    .then(|| soundtrack::entry(&entry));
+                std::iter::once(entry).chain(music)
+            })
+            .collect()
+    }
+
+    /// Listen for music on the kept games not yet listened to, off the UI
+    /// thread; their soundtracks join the shelf when it is done.
+    fn listen_to_games(&mut self) -> Task<Message> {
+        let games: Vec<library::Entry> = self
+            .shelf
+            .entries
+            .iter()
+            .filter(|e| e.meta.system.is_some() && !soundtrack::is_entry(e))
+            .filter(|e| !self.soundtracks.contains_key(&e.meta.id))
+            .cloned()
+            .collect();
+        if games.is_empty() {
+            return Task::none();
+        }
+        for game in &games {
+            self.soundtracks.insert(game.meta.id.clone(), None);
+        }
+        Task::perform(
+            blocking(move || {
+                games
+                    .iter()
+                    .map(|game| (game.meta.id.clone(), soundtrack::load(game).map(Arc::new)))
+                    .collect()
+            }),
+            Message::Soundtracks,
+        )
     }
 
     fn close_library(&mut self) -> Task<Message> {
@@ -985,6 +1001,33 @@ impl Spectra {
         self.disc_id = None;
         self.film_uri = None;
         self.film_label = None;
+        if soundtrack::is_entry(&entry) {
+            let Some(music) = self
+                .soundtracks
+                .get(soundtrack::game_id(&entry))
+                .cloned()
+                .flatten()
+            else {
+                return Task::none();
+            };
+            let soundtrack::Soundtrack {
+                tracks,
+                source,
+                spans,
+            } = Arc::unwrap_or_clone(music);
+            let mut album = Album::from_soundtrack(&entry, tracks);
+            if let Some(cover) = pictures.cover.or_else(|| pictures.face.clone()) {
+                album.cover = cover;
+            }
+            album.face = pictures.face;
+            self.picked = Some(entry.clone());
+            album.note = Some(self.ready_note());
+            self.launch = None;
+            self.show(album);
+            let player = self.start_player(source, spans);
+            self.play(0);
+            return Task::batch([close, player, self.scroll_to_top()]);
+        }
         if entry.is_album() {
             let Some(toc) = entry.toc() else {
                 self.shelf.notice = Some("That copy would not open".into());
@@ -1029,16 +1072,25 @@ impl Spectra {
             });
         album.note = Some(self.ready_note());
         self.show(album);
-        let music = load_soundtrack(&entry);
         if self.launch.is_none() {
-            return Task::batch([close, music]);
+            return close;
         }
-        Task::batch([close, music, self.start_game()])
+        Task::batch([close, self.start_game()])
     }
 
     /// Delete pressed on a copy: the first press arms it, the second
     /// throws the copy away.
     fn delete(&mut self, index: usize) -> Task<Message> {
+        if self
+            .shelf
+            .entries
+            .get(index)
+            .is_some_and(soundtrack::is_entry)
+        {
+            self.shelf.menu = None;
+            self.shelf.notice = Some("A soundtrack goes when its game is deleted".into());
+            return Task::none();
+        }
         let Some(entry) = self.shelf.delete(index) else {
             // Armed: it disarms by itself if nobody confirms.
             let Some(id) = self.shelf.armed.clone() else {
@@ -1053,11 +1105,8 @@ impl Spectra {
             return Task::none();
         }
         let mut task = Task::none();
-        if self
-            .picked
-            .as_ref()
-            .is_some_and(|p| p.meta.id == entry.meta.id)
-        {
+        // The copy itself on the stage, or its soundtrack: both are gone.
+        if self.picked.as_ref().is_some_and(|p| p.dir == entry.dir) {
             task = self.return_to_drive();
         } else if self.picked.is_none() && self.disc.is_some() {
             // The disc in the drive may have been the copy: it plays from the
@@ -1066,7 +1115,7 @@ impl Spectra {
             self.film_uri = self.drive_state.as_ref().and_then(film_uri);
             self.album.note = Some(self.ready_note());
         }
-        let _ = self.shelf.load(library::list());
+        let _ = self.shelf.load(self.shelf_entries());
         task
     }
 
@@ -1174,19 +1223,13 @@ impl Spectra {
                 move |pictures| Message::Pictures(serial.clone(), pictures),
             ))
         });
-        // A kept game's music, from its copy.
-        let music = self
-            .kept_game_on_stage()
-            .and_then(|id| library::find(&id))
-            .map(|entry| load_soundtrack(&entry));
         let top = self.scroll_to_top();
         Task::batch(
             [top]
                 .into_iter()
                 .chain(pictures)
                 .chain(film_task)
-                .chain(audio_tasks)
-                .chain(music),
+                .chain(audio_tasks),
         )
     }
 
@@ -1216,7 +1259,7 @@ impl Spectra {
             } else {
                 "to the drive"
             };
-            return if entry.is_album() {
+            return if entry.is_album() || soundtrack::is_entry(entry) {
                 format!("Your copy  ·  {{back}} Stop, then {{back}} again {back}")
             } else if entry.is_film() {
                 format!("Your copy  ·  {{accept}} Play in VLC  ·  {{back}} Back {back}")
@@ -1255,18 +1298,6 @@ impl Spectra {
             }
             Some(_) => "{accept} Play  ·  {alt} Keep a copy".into(),
             None => "{accept} Play".into(),
-        }
-    }
-
-    /// The library ID of the kept game on the stage: picked from the
-    /// library, or in the drive with a copy kept.
-    fn kept_game_on_stage(&self) -> Option<String> {
-        match &self.picked {
-            Some(entry) => entry.meta.system.is_some().then(|| entry.meta.id.clone()),
-            None => {
-                let disc = self.disc.as_ref().filter(|d| d.game.is_some())?;
-                library::id(&disc.report).filter(|id| library::find(id).is_some())
-            }
         }
     }
 
@@ -1426,12 +1457,6 @@ impl Spectra {
                 return Task::none();
             }
         };
-        // The game has its own music.
-        if let Some(player) = &self.player {
-            player.stop();
-            self.playing = None;
-            self.paused = false;
-        }
         self.in_game = true;
         self.motion.set_spinning(true);
         self.album.note = Some("Playing in RetroArch  ·  Esc twice to quit".into());
@@ -1864,13 +1889,8 @@ impl Spectra {
         if scale.gap < 20.0 || !self.album.playable || self.album.tracks.is_empty() {
             return space().into();
         }
-        let hints = if self.launch.is_some() {
-            "{up}{down} Choose    {start} Play music    {prev}{next} Skip    {back} Stop"
-        } else {
-            "{up}{down} Choose    {accept} Play    {prev}{next} Skip    {start} Pause    {back} Stop"
-        };
         container(ui::prompt(
-            hints,
+            "{up}{down} Choose    {accept} Play    {prev}{next} Skip    {start} Pause    {back} Stop",
             self.style,
             13.0,
             Color::from_rgba(1.0, 1.0, 1.0, 0.4),
@@ -1965,14 +1985,21 @@ fn blocking<T: Default + Send + 'static>(
     async move { rx.await.unwrap_or_default() }
 }
 
-/// Listen through a kept game's copy for its music, off the UI thread.
-fn load_soundtrack(entry: &library::Entry) -> Task<Message> {
-    let id = entry.meta.id.clone();
-    let entry = entry.clone();
-    Task::perform(
-        blocking(move || soundtrack::load(&entry).map(Box::new)),
-        move |found| Message::Soundtrack(id.clone(), found),
-    )
+/// Faces for copies new to the shelf, made off the UI thread.
+fn shelf_faces(missing: Vec<library::Entry>) -> Task<Message> {
+    Task::batch(missing.into_iter().map(|entry| {
+        let id = entry.meta.id.clone();
+        Task::perform(
+            blocking(move || {
+                let pictures = artwork::for_copy(&entry);
+                Some(Arc::new(Face::new(
+                    pictures.cover.as_ref(),
+                    pictures.face.as_ref(),
+                )))
+            }),
+            move |face| Message::ShelfFace(id.clone(), face),
+        )
+    }))
 }
 
 /// What VLC opens for the film in the drive: its kept copy if there is one,

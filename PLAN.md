@@ -352,10 +352,17 @@ on Linux, so an Apple TV without Moonlight cannot be reached.
 
 ## Experiment: a game's music
 
-On trial, on the `game-music` branch: a kept game's soundtrack as its track
-list, played like an album. A, as before, starts the game; Start plays the
-music. If it does not earn its place, `soundtrack.rs` in both crates and the
-calls to them come out together.
+On trial, on the `game-music` branch: a kept game's soundtrack, as a disc
+of its own on the shelf beside the game - "Tomb Raider (Soundtrack)" - that
+plays like an album, from the game's copy. The game is as it was. The shelf
+listens to each game once a session, in the background, and the soundtrack
+joins it when found; nothing is written, and it goes with its game. If it
+does not earn its place, `soundtrack.rs` in both crates and the calls to
+them come out together.
+
+Tried first and dropped: the music as the game's own track list. A started
+the game from a track, and picking the game started it before the music
+could be reached.
 
 - PS1: the CD audio tracks after the data, sorted by listening
   (`spectra_core::soundtrack`): silence is dropped, and so is speech -

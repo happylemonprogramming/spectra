@@ -293,6 +293,10 @@ pub fn byline(entry: &Entry) -> String {
             .collect::<Vec<_>>()
             .join("  ·  ");
     }
+    if crate::soundtrack::is_entry(entry) {
+        let system = entry.meta.system.map_or("Game", GameSystem::name);
+        return format!("Soundtrack  ·  {system}");
+    }
     if entry.is_album() {
         return [entry.meta.artist.clone(), Some("Music".into())]
             .into_iter()

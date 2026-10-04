@@ -151,6 +151,20 @@ impl Album {
         album
     }
 
+    /// A kept game's soundtrack: its game's title, and the music found.
+    pub fn from_soundtrack(game: &Entry, tracks: Vec<Track>) -> Self {
+        let system = game.meta.system.map_or("Game", GameSystem::name);
+        let mut album = Self::message(&game.meta.title, &format!("Soundtrack  ·  {system}"));
+        album.year = game
+            .meta
+            .year
+            .as_deref()
+            .and_then(|y| y.get(..4)?.parse().ok());
+        album.tracks = tracks;
+        album.playable = !album.tracks.is_empty();
+        album
+    }
+
     /// Call an audio CD by its names, from MusicBrainz or a copy. The names
     /// are only the audio tracks'; the TOC already timed them.
     pub fn name(&mut self, names: &Names) {
