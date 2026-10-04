@@ -988,8 +988,8 @@ impl Spectra {
         Task::none()
     }
 
-    /// Put a kept copy on the stage in place of the drive's disc, and play
-    /// it: an album from its first track, a game straight away.
+    /// Put a kept copy on the stage in place of the drive's disc: an album
+    /// to be played when a track is chosen, a game or a film straight away.
     fn pick(&mut self, index: usize) -> Task<Message> {
         let Some(entry) = self.shelf.entries.get(index).cloned() else {
             return Task::none();
@@ -1026,7 +1026,6 @@ impl Spectra {
             self.launch = None;
             self.show(album);
             let player = self.start_player(source, spans);
-            self.play(0);
             return Task::batch([close, player, self.scroll_to_top()]);
         }
         if entry.is_album() {
@@ -1041,7 +1040,6 @@ impl Spectra {
             self.launch = None;
             self.show(album);
             let player = self.start_player(audio::Source::Image(entry.bin()), audio::spans(&toc));
-            self.play(0);
             return Task::batch([close, player, self.scroll_to_top()]);
         }
         if entry.is_film() {
@@ -1261,7 +1259,7 @@ impl Spectra {
                 "to the drive"
             };
             return if entry.is_album() || soundtrack::is_entry(entry) {
-                format!("Your copy  ·  {{back}} Stop, then {{back}} again {back}")
+                format!("Your copy  ·  {{accept}} Play  ·  {{back}} Back {back}")
             } else if entry.is_film() {
                 format!("Your copy  ·  {{accept}} Play in VLC  ·  {{back}} Back {back}")
             } else if self.launch.is_none() {
