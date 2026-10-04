@@ -374,17 +374,19 @@ for free.
 AirPlay is the gap: there is no mature open-source AirPlay mirroring sender
 on Linux, so an Apple TV without Moonlight cannot be reached.
 
-- [ ] Detect `sunshine` and offer Omarchy's `omarchy-install-service-sunshine`
+- [x] Detect `sunshine` and offer Omarchy's `omarchy-install-service-sunshine`
       when it is missing; never install it unasked
-- [ ] "Play on TV": create a 1920×1080 headless output
+- [x] "Play on TV": create a 1920×1080 headless output
       (`hyprctl output create headless`), move Spectra and the engine it
       launches there, and stream or cast that output. A straight mirror of a
-      16:10 laptop letterboxes on a 16:9 TV
+      16:10 laptop letterboxes on a 16:9 TV. Done as `SPECTRA-TV`, sized as
+      the TV asks when Sunshine starts it (`spectra tv on` as an app's prep
+      command), with Sunshine's `output_name` naming it
 - [ ] Without Sunshine, cast the output through the screencast portal
       (`gnome-network-displays`, Google Cast first, then Miracast)
 - [ ] Measure input-to-photon latency on both paths with a PS2 game, and
       record it in `docs/spikes.md`
-- [ ] While streaming, keep the machine awake: hold a systemd inhibitor so
+- [x] While streaming, keep the machine awake: hold a systemd inhibitor so
       the computer does not suspend mid-film
 
 ## Experiment: a game's music

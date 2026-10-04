@@ -36,6 +36,13 @@ Usage:
   spectra status [--json] What is on the stage, the drive, and what plays
   spectra windows [--json]
                           Every open window, the current one marked *
+  spectra tv on | off [--size WxH@FPS] [--json]
+                          Over to the TV's screen, which Sunshine streams to
+                          Moonlight, with what Spectra starts, or back from
+                          it. Sunshine runs this as Spectra's prep command;
+                          T in the window gets it ready. on goes to the
+                          window that got it ready, or opens one. The size is
+                          the TV's, read from Sunshine, or 1920x1080@60
   spectra quit [--json]   Close the window
 
 Commands go to the current window - the one last looked at - or to the
@@ -84,7 +91,7 @@ fn options(args: &[String]) -> Result<(Options, Vec<String>), String> {
 
 const COMMANDS: &[&str] = &[
     "help", "--help", "-h", "open", "library", "play", "pause", "resume", "toggle", "next",
-    "previous", "prev", "stop", "status", "windows", "quit",
+    "previous", "prev", "stop", "status", "windows", "tv", "quit",
 ];
 
 /// Run a command. None when the arguments are for opening the window in
@@ -121,6 +128,13 @@ pub fn run(args: &[String]) -> Option<i32> {
         "open" => open(&options, rest.iter().any(|a| a == "--reduced-motion")),
         "library" => list(json),
         "windows" => list_windows(json),
+        "tv" => match tv_request(rest) {
+            Ok(request) => tv(&options, &request),
+            Err(e) => {
+                eprintln!("spectra: {e}");
+                2
+            }
+        },
         "play" => match play_request(rest) {
             Ok(request) => {
                 let window = match target(options.window) {
@@ -207,6 +221,90 @@ fn list_windows(json: bool) -> i32 {
         println!("{mark} {:<8} {}", status.window, summary(status));
     }
     0
+}
+
+/// `on` or `off`, and the size of the TV's screen: given, or what Sunshine
+/// says the TV asked for when it runs this before a stream.
+fn tv_request(args: &[String]) -> Result<Request, String> {
+    let mut on = None;
+    let mut size = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => {}
+            "on" => on = Some(true),
+            "off" => on = Some(false),
+            "--size" => {
+                let given = args
+                    .next()
+                    .ok_or("--size needs WIDTHxHEIGHT, as 1920x1080@60")?;
+                size = Some(
+                    crate::tv::mode(given)
+                        .ok_or(format!("--size {given}: give it as 1920x1080@60"))?,
+                );
+            }
+            other => return Err(format!("tv takes on or off, not {other}")),
+        }
+    }
+    let on = on.ok_or("tv takes on or off")?;
+    let sunshine = || {
+        let var = |name| std::env::var(name).ok();
+        let (w, h) = (
+            var("SUNSHINE_CLIENT_WIDTH")?,
+            var("SUNSHINE_CLIENT_HEIGHT")?,
+        );
+        let fps = var("SUNSHINE_CLIENT_FPS").unwrap_or_else(|| "60".into());
+        crate::tv::mode(&format!("{w}x{h}@{fps}"))
+    };
+    let mode = if on { size.or_else(sunshine) } else { None };
+    Ok(Request::Tv { on, mode })
+}
+
+/// On the TV: the window named, the current one, or a new one. Off: the
+/// window that has the TV, wherever it is; with none, a screen left by a
+/// window that went without taking it away is cleared, and that is done.
+fn tv(options: &Options, request: &Request) -> i32 {
+    let json = options.json;
+    let window = match request {
+        Request::Tv { on: false, .. } => match options.window.or_else(crate::tv::holder) {
+            Some(window) => target(Some(window)),
+            None => {
+                crate::tv::clear_leftover();
+                if json {
+                    println!("{}", serde_json::json!({ "ok": true, "running": false }));
+                } else {
+                    println!("Spectra is not on the TV");
+                }
+                return 0;
+            }
+        },
+        _ => match options.window.map_or_else(
+            || waiting_for_tv().or_else(|| target(None)),
+            |named| target(Some(named)),
+        ) {
+            _ if options.new => start(false).ok(),
+            Some(window) => Some(window),
+            None if options.window.is_some() => None,
+            None => match start(false) {
+                Ok(window) => Some(window),
+                Err(e) => return fail(&e, json),
+            },
+        },
+    };
+    match window {
+        Some(window) => send(window, request, json),
+        None => not_running(options),
+    }
+}
+
+/// The window that got the TV ready, which Moonlight opening Spectra is for.
+fn waiting_for_tv() -> Option<u32> {
+    windows::running().into_iter().find(|&window| {
+        control::send(window, &Request::Status)
+            .and_then(Result::ok)
+            .and_then(|reply| reply.status)
+            .is_some_and(|status| status.tv == "ready" || status.tv == "starting")
+    })
 }
 
 fn play_request(args: &[String]) -> Result<Request, String> {
@@ -448,6 +546,8 @@ fn say(request: &Request, reply: &Reply) {
     match request {
         Request::Quit => println!("Closed Spectra"),
         Request::Status => describe(status),
+        Request::Tv { on: true, .. } => println!("On the TV"),
+        Request::Tv { on: false, .. } => println!("Back from the TV"),
         _ => println!("{}", summary(status)),
     }
 }
@@ -491,6 +591,12 @@ fn describe(s: &Status) {
     println!("Screen: {}", s.screen);
     if s.copying {
         println!("Keeping a copy of the disc");
+    }
+    match s.tv.as_str() {
+        "on" => println!("On the TV"),
+        "ready" => println!("TV: ready for Moonlight to open Spectra"),
+        "starting" => println!("TV: Sunshine is getting ready"),
+        _ => {}
     }
     if let Some(note) = &s.note {
         println!("Note: {note}");
@@ -668,5 +774,27 @@ mod tests {
         );
         assert!(play_request(&args(&["disc", "--track", "0"])).is_err());
         assert!(play_request(&args(&["disc", "--loud"])).is_err());
+    }
+
+    #[test]
+    fn tv_reads_on_or_off_and_a_size() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            tv_request(&args(&["on", "--size", "3840x2160@60"])),
+            Ok(Request::Tv {
+                on: true,
+                mode: Some("3840x2160@60".into())
+            })
+        );
+        assert_eq!(
+            tv_request(&args(&["off", "--json"])),
+            Ok(Request::Tv {
+                on: false,
+                mode: None
+            })
+        );
+        assert!(tv_request(&args(&[])).is_err());
+        assert!(tv_request(&args(&["sideways"])).is_err());
+        assert!(tv_request(&args(&["on", "--size", "huge"])).is_err());
     }
 }

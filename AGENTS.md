@@ -26,6 +26,7 @@ out to let the user decide. The binary goes to `~/.local/bin/spectra`.
 | `spectra stop` | Stop the music, or close the film |
 | `spectra status [--json]` | What is on the stage, what plays, the drive |
 | `spectra windows [--json]` | Every open window and what it plays; the current one marked `*` |
+| `spectra tv on \| off [--size WxH@FPS]` | Over to the TV's screen, which Sunshine streams to Moonlight, or back. `on` opens a window first if none is open; `off` finds the window that is on the TV |
 | `spectra quit` | Close the window |
 
 `play` takes:
@@ -103,6 +104,7 @@ Every control command with `--json`:
     "playing": 3,               // track number, or null
     "paused": false, "elapsed": 42,
     "in_game": false, "in_film": false, "copying": false,
+    "tv": "off",                // "starting", "ready" (for Moonlight), "on" (on the TV's screen)
     "note": "Your copy  ·  Backspace Stop, then Backspace again to the drive"
   } }
 ```
@@ -142,6 +144,15 @@ every couple of seconds until `drive` is `disc` (or `empty` /
 - **Games and films are someone else's window.** While `in_game` is true,
   commands are refused until the user quits the game (hold Start, or Esc
   twice). While `in_film` is true, pause/next/previous/stop drive VLC.
+- **The TV is the user's living room.** T in the window starts Sunshine
+  (if it is not running) and waits for Moonlight. `spectra tv on`, which
+  Sunshine runs as Spectra's prep command, makes a screen (`SPECTRA-TV` in
+  Hyprland) and puts Spectra, fullscreen, and the films and games it starts
+  there; focus stays where the user is working. Nobody sees that screen but
+  the TV: only turn it on when a stream is starting. One window has the TV at
+  a time. It reads the TV's size from `SUNSHINE_CLIENT_WIDTH`, `_HEIGHT` and
+  `_FPS`. If a window goes without `tv off`, a helper takes the screen away.
+  Needs Hyprland and Sunshine, and the error says so.
 - **Keeping a copy** (C in the window) reads the whole disc, minutes for a
   CD; while `copying` is true commands are refused. Keeping and deleting
   copies are the user's choices: `spectra-discid --keep` keeps one from a
@@ -172,6 +183,8 @@ crates/spectra/         the app (iced on wgpu)
   src/control.rs        the socket the command line talks to; Request and Status
   src/windows.rs        several windows: which is current, finding them, the drive lock
   src/audio.rs          CD audio through cpal; game.rs RetroArch; film.rs VLC
+  src/tv.rs             on the TV: a screen of its own, streamed by Sunshine
+  src/hyprland.rs       Hyprland's events, windows and screens
 scripts/check.sh        fmt, clippy -D warnings, tests: run before calling work done
 scripts/install.sh      the installer
 ```

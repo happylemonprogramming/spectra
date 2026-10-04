@@ -51,7 +51,30 @@ Open Spectra from the app launcher and put a disc in. Keyboard or gamepad:
 | C | Y | Keep a copy of the disc |
 | L or M | Select | The library of kept copies |
 | Backspace | B | Stop, or back |
+| T | | Get the TV ready, or stop |
 | Esc | | Quit |
+
+## On the TV
+
+With [Sunshine](https://github.com/LizardByte/Sunshine) on the computer and
+Moonlight on the TV, Spectra plays on the TV while the computer's own screen
+stays yours. Press T: Spectra starts Sunshine if it is not running and says
+when it is ready. Open Spectra in Moonlight on the TV, and only then does
+Spectra move to a screen of its own, as large as the TV asks for, with the
+films and games it starts. End the stream and it comes back; T again stops
+Sunshine. Opening Spectra from the launcher while it is on the TV brings it
+back too.
+
+Once, Sunshine is pointed at Spectra's screen, in
+`~/.config/sunshine/sunshine.conf`:
+
+```
+capture = wlr
+output_name = SPECTRA-TV
+```
+
+and Spectra is added to Sunshine's apps, with `spectra tv on` to do and
+`spectra tv off` to undo. Hyprland only, for now.
 
 ## From a terminal, or an agent
 
@@ -65,6 +88,7 @@ spectra play disc                # whatever is in the drive
 spectra pause; spectra next; spectra status
 spectra play "blue lines" --new  # a second window, playing beside the first
 spectra windows                  # every window; commands take --window PID
+spectra tv on                    # over to the TV, through Sunshine; tv off, back
 spectra quit
 ```
 

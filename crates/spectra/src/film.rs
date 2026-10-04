@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use spectra_core::DiscKind;
 
-use crate::game;
+use crate::{game, hyprland};
 
 /// Long enough for a slow drive to spin up and a disc to reach its menu.
 const WINDOW_WAIT: Duration = Duration::from_secs(30);
@@ -52,6 +52,9 @@ pub enum Key {
     PlayPause,
     PreviousChapter,
     NextChapter,
+    /// Ten seconds back or on.
+    JumpBack,
+    JumpForward,
     DiscMenu,
 }
 
@@ -66,6 +69,8 @@ impl Key {
             Self::PlayPause => "key-play-pause",
             Self::PreviousChapter => "key-chapter-prev",
             Self::NextChapter => "key-chapter-next",
+            Self::JumpBack => "key-jump-short",
+            Self::JumpForward => "key-jump+short",
             Self::DiscMenu => "key-disc-menu",
         }
     }
@@ -140,7 +145,10 @@ impl Film {
 
         let (signals, rx) = mpsc::channel();
         // Listening before VLC starts, so its window cannot open unseen.
-        let events = hyprland::events(signals.clone());
+        let events = {
+            let signals = signals.clone();
+            hyprland::events(move |line| signals.send(Signal::Hyprland(line)).is_ok())
+        };
 
         let mut command = Command::new(program);
         command
@@ -181,6 +189,44 @@ impl Film {
             let _ = writeln!(socket, "key {}", key.action());
         }
     }
+
+    /// A remote with one button for both: pick in the disc's menu, pause
+    /// or play the film. VLC is asked which is showing - its title 0 is the
+    /// menu - off the UI thread, as it takes a moment to say.
+    pub fn click(&self) {
+        let socket = self.socket.clone();
+        std::thread::spawn(move || {
+            let key = if in_menu(&socket) {
+                Key::Activate
+            } else {
+                Key::PlayPause
+            };
+            if let Ok(mut socket) = UnixStream::connect(&socket) {
+                let _ = writeln!(socket, "key {}", key.action());
+            }
+        });
+    }
+}
+
+/// VLC is showing the disc's menu. Not knowing - VLC paused says only to
+/// press pause - counts as the film, so a click plays it again.
+fn in_menu(socket: &Path) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    if writeln!(stream, "title").is_err() {
+        return false;
+    }
+    BufReader::new(stream)
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| {
+            let title = line.trim().strip_prefix("Currently playing title ")?;
+            title.split('/').next()?.trim().parse::<u32>().ok()
+        })
+        == Some(0)
 }
 
 impl Drop for Film {
@@ -221,7 +267,7 @@ fn supervise(
                     && let Some(found) = hyprland::window_of(pid)
                 {
                     if window.as_ref() != Some(&found.address) {
-                        hyprland::present(&found);
+                        present(&found);
                     }
                     window = Some(found.address);
                     closed = None;
@@ -301,109 +347,15 @@ fn keep_awake(pid: u32) {
     }
 }
 
-/// Just enough of Hyprland: its events, its windows, and two dispatches.
-/// Elsewhere none of this happens, and VLC's own full screen is relied on.
-mod hyprland {
-    use super::Signal;
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixStream;
-    use std::path::PathBuf;
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-
-    pub struct Window {
-        pub address: String,
-        fullscreen: bool,
+/// Full screen, and in front. On the TV it goes there instead, and focus
+/// stays on the screen the user is working at.
+fn present(window: &hyprland::Window) {
+    if !crate::tv::on() {
+        hyprland::present(window);
+        return;
     }
-
-    fn dir() -> Option<PathBuf> {
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-        let instance = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
-        Some(PathBuf::from(runtime).join("hypr").join(instance))
-    }
-
-    /// Hyprland's events, a line each, until the returned socket is shut.
-    pub fn events(tx: mpsc::Sender<Signal>) -> Option<UnixStream> {
-        let socket = UnixStream::connect(dir()?.join(".socket2.sock")).ok()?;
-        let reader = socket.try_clone().ok()?;
-        std::thread::spawn(move || {
-            for line in BufReader::new(reader).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(Signal::Hyprland(line)).is_err() {
-                    break;
-                }
-            }
-        });
-        Some(socket)
-    }
-
-    /// Events give addresses without the `0x` that `hyprctl clients` has.
-    pub fn plain(address: &str) -> &str {
-        address.trim().trim_start_matches("0x")
-    }
-
-    /// The window that this process has open.
-    pub fn window_of(pid: u32) -> Option<Window> {
-        let output = Command::new("hyprctl")
-            .args(["-j", "clients"])
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        let clients: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        let client = clients
-            .as_array()?
-            .iter()
-            .find(|client| client["pid"].as_u64() == Some(u64::from(pid)))?;
-        Some(Window {
-            address: plain(client["address"].as_str()?).to_string(),
-            fullscreen: client["fullscreen"].as_u64().unwrap_or(0) != 0,
-        })
-    }
-
-    /// Run a dispatch, written for Hyprland's Lua config first and its
-    /// older one if that is refused.
-    fn dispatch(lua: &str, legacy: &[&str]) {
-        let out = Command::new("hyprctl")
-            .args(["dispatch", lua])
-            .stderr(Stdio::null())
-            .output();
-        let ok = out.is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "ok");
-        if !ok {
-            let _ = Command::new("hyprctl")
-                .arg("dispatch")
-                .args(legacy)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
-
-    /// Focus the window and fill the screen with it.
-    pub fn present(window: &Window) {
-        let target = format!("address:0x{}", window.address);
-        dispatch(
-            &format!("hl.dsp.focus({{ window = \"{target}\" }})"),
-            &["focuswindow", &target],
-        );
-        if !window.fullscreen {
-            dispatch(
-                &format!(
-                    "hl.dsp.window.fullscreen({{ mode = \"fullscreen\", window = \"{target}\" }})"
-                ),
-                &["fullscreen", "0"],
-            );
-        }
-    }
-
-    /// Back to Spectra's own window once the film is over.
-    pub fn focus_pid(pid: u32) {
-        if dir().is_none() {
-            return;
-        }
-        let target = format!("pid:{pid}");
-        dispatch(
-            &format!("hl.dsp.focus({{ window = \"{target}\" }})"),
-            &["focuswindow", &target],
-        );
+    hyprland::move_to(window, crate::tv::SCREEN);
+    if !window.fullscreen {
+        hyprland::fullscreen(window);
     }
 }

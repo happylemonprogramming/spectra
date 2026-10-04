@@ -17,6 +17,7 @@ mod album;
 mod art;
 mod artwork;
 mod audio;
+mod card;
 mod cli;
 mod control;
 mod disc;
@@ -24,12 +25,15 @@ mod film;
 mod filmdb;
 mod game;
 mod gamepad;
+mod hyprland;
+mod moonlight;
 mod motion;
 mod musicbrainz;
 mod net;
 mod platform;
 mod shelf;
 mod soundtrack;
+mod tv;
 mod ui;
 mod watch;
 mod windows;
@@ -104,6 +108,8 @@ pub enum Remote {
     Menu,
     /// Over to the kept copies, and back to the stage.
     Library,
+    /// Over to the TV's screen, and back.
+    Tv,
     Quit,
 }
 
@@ -120,6 +126,8 @@ enum Message {
     Remote(Remote),
     /// A gamepad, and which kind, for the prompts.
     Pad(ui::Pad, Remote),
+    /// The TV's remote, through Moonlight, while on the TV.
+    TvRemote(Remote),
     /// A track clicked.
     Pick(usize),
     /// The track list scrolled or changed size.
@@ -145,6 +153,10 @@ enum Message {
     /// From a copy on the stage back to the disc in the drive.
     ReturnToDrive,
     KeepCopy,
+    /// Get the TV ready, or stop: come back from it, or stop waiting.
+    Tv,
+    /// Sunshine is taking connections, or did not start.
+    TvReady(bool),
     ShelfFocus(usize),
     ShelfPick(usize),
     ShelfMenu(usize),
@@ -298,6 +310,13 @@ struct Spectra {
     cursor: Point,
     wheel: Wheel,
     reduced_motion: bool,
+    /// On the TV's screen, streamed by Sunshine.
+    tv: Option<tv::Tv>,
+    /// Sunshine, for the TV to connect to, and whether it is ready.
+    host: Option<tv::Host>,
+    host_ready: bool,
+    /// Under Hyprland, where there can be a TV's screen.
+    tv_possible: bool,
 }
 
 /// Where the screens are: 0 the stage, 1 the library, eased between.
@@ -446,6 +465,10 @@ impl Spectra {
             cursor: Point::ORIGIN,
             wheel: Wheel::default(),
             reduced_motion: options.reduced_motion,
+            tv: None,
+            host: None,
+            host_ready: false,
+            tv_possible: hyprland::running(),
         };
         app.rewind();
         // A window just opened is the one its user is looking at.
@@ -712,6 +735,22 @@ impl Spectra {
             Message::CloseLibrary => self.close_library(),
             Message::ReturnToDrive => self.return_to_drive(),
             Message::KeepCopy => self.keep_copy(),
+            Message::Tv => self.toggle_tv(),
+            Message::TvReady(_) if self.host.is_none() => Task::none(),
+            Message::TvReady(true) => {
+                self.host_ready = true;
+                tv::notify(
+                    "Spectra is ready for the TV",
+                    "Open Spectra in Moonlight on the TV",
+                );
+                Task::none()
+            }
+            Message::TvReady(false) => {
+                self.host = None;
+                self.album.note =
+                    Some("Sunshine didn't start - see ~/.config/sunshine/sunshine.log".into());
+                Task::none()
+            }
             Message::ShelfScrolled(viewport) => {
                 self.shelf.scrolled(viewport);
                 Task::none()
@@ -763,6 +802,11 @@ impl Spectra {
                 self.pointing = false;
                 self.remote(remote)
             }
+            Message::TvRemote(remote) if self.film.is_some() => self.tv_film_remote(remote),
+            Message::TvRemote(remote) => {
+                self.pointing = false;
+                self.remote(remote)
+            }
             Message::Focused => {
                 windows::claim();
                 Task::none()
@@ -787,7 +831,20 @@ impl Spectra {
             Request::Status => return (Ok(()), Task::none()),
             Request::Quit => {
                 let _ = std::fs::remove_file(windows::socket(std::process::id()));
-                return (Ok(()), iced::exit());
+                return (Ok(()), self.quit());
+            }
+            // Whatever is playing goes along: the TV is only where it shows.
+            // Off is the stream ending: Sunshine stays ready for another.
+            Request::Tv { on, mode } => {
+                if on && self.tv.is_none() {
+                    match tv::Tv::start(mode.as_deref()) {
+                        Ok(tv) => self.tv = Some(tv),
+                        Err(why) => return (Err(why), Task::none()),
+                    }
+                } else if !on {
+                    self.tv = None;
+                }
+                return (Ok(()), Task::none());
             }
             _ if self.copying.is_some() => {
                 return (
@@ -843,7 +900,7 @@ impl Spectra {
             Request::Next => self.skip(true),
             Request::Previous => self.skip(false),
             Request::Stop => self.stop(),
-            Request::Status | Request::Quit | Request::Play { .. } => {}
+            Request::Status | Request::Quit | Request::Play { .. } | Request::Tv { .. } => {}
         }
         (Ok(()), self.reveal_focus())
     }
@@ -906,17 +963,21 @@ impl Spectra {
                     return (Err("that copy would not open".into()), faces);
                 }
                 task = Task::batch([faces, picked]);
-                // A film or game starts as it goes on the stage. An album
-                // waits there for a track, so one is played below: the one
-                // asked for, or the first.
+                // Picked, everything waits on the stage; asked to play, it
+                // starts here. An album plays below: the track asked for, or
+                // the first.
                 if !album {
-                    if self.film_uri.is_none() && self.launch.is_none() {
+                    let start = if self.film_uri.is_some() {
+                        self.start_film()
+                    } else if self.launch.is_some() {
+                        self.start_game()
+                    } else {
                         return (
                             Err("no emulator for this console is installed".into()),
                             task,
                         );
-                    }
-                    return self.started(task);
+                    };
+                    return self.started(Task::batch([task, start]));
                 }
                 if track.is_none() {
                     self.focus = 0;
@@ -1022,6 +1083,13 @@ impl Spectra {
             in_game: self.in_game,
             in_film: self.film.is_some(),
             copying: self.copying.is_some(),
+            tv: match (&self.tv, &self.host) {
+                (Some(_), _) => "on",
+                (None, Some(_)) if self.host_ready => "ready",
+                (None, Some(_)) => "starting",
+                (None, None) => "off",
+            }
+            .into(),
             note: self
                 .album
                 .note
@@ -1037,6 +1105,9 @@ impl Spectra {
         // buttons are the game's.
         if self.in_game {
             return Task::none();
+        }
+        if let Remote::Tv = remote {
+            return self.toggle_tv();
         }
         if self.film.is_some() {
             return self.film_remote(remote);
@@ -1071,7 +1142,7 @@ impl Spectra {
             Remote::Select | Remote::PlayPause => return self.pick(self.shelf.focus),
             Remote::Menu => return self.delete(self.shelf.focus),
             Remote::Back | Remote::Library | Remote::Quit => return self.close_library(),
-            Remote::Keep | Remote::Previous | Remote::Next => return Task::none(),
+            Remote::Keep | Remote::Previous | Remote::Next | Remote::Tv => return Task::none(),
         };
         match moved {
             Moved::Out => self.close_library(),
@@ -1090,7 +1161,7 @@ impl Spectra {
                     }
                     Task::none()
                 }
-                Remote::Quit => iced::exit(),
+                Remote::Quit => self.quit(),
                 _ => Task::none(),
             };
         }
@@ -1108,7 +1179,7 @@ impl Spectra {
             Remote::Select | Remote::PlayPause if self.film_uri.is_some() => {
                 return self.start_film();
             }
-            Remote::Quit => return iced::exit(),
+            Remote::Quit => return self.quit(),
             _ => {}
         }
         let count = self.album.tracks.len();
@@ -1132,7 +1203,7 @@ impl Spectra {
             Remote::Previous | Remote::Left => self.skip(false),
             Remote::Next | Remote::Right => self.skip(true),
             Remote::Back => self.stop(),
-            Remote::Keep | Remote::Menu | Remote::Library | Remote::Quit => {}
+            Remote::Keep | Remote::Menu | Remote::Library | Remote::Tv | Remote::Quit => {}
         }
         self.reveal_focus()
     }
@@ -1348,7 +1419,8 @@ impl Spectra {
             self.film_uri = Some(format!("dvd://{}", entry.iso().display()));
             album.note = Some(self.ready_note());
             self.show(album);
-            return Task::batch([close, self.start_film()]);
+            // On the stage, as an album is, to be played there - or on the TV.
+            return close;
         }
         let mut album = Album::from_kept_game(&entry);
         if let Some(cover) = pictures.cover.or_else(|| pictures.face.clone()) {
@@ -1366,10 +1438,7 @@ impl Spectra {
             });
         album.note = Some(self.ready_note());
         self.show(album);
-        if self.launch.is_none() {
-            return close;
-        }
-        Task::batch([close, self.start_game()])
+        close
     }
 
     /// Delete pressed on a copy: the first press arms it, the second
@@ -1835,10 +1904,75 @@ impl Spectra {
                 self.film = None;
                 return Task::none();
             }
-            Remote::Keep | Remote::Library => return Task::none(),
+            Remote::Keep | Remote::Library | Remote::Tv => return Task::none(),
         };
         if let Some(film) = &self.film {
             film.press(key);
+        }
+        Task::none()
+    }
+
+    /// Get the TV ready: Sunshine, for Moonlight to open Spectra, which is
+    /// when the window goes over. Pressed again, it is all stopped: back
+    /// from the TV, or no longer waiting for it. Why not, if it cannot be,
+    /// goes under the title.
+    fn toggle_tv(&mut self) -> Task<Message> {
+        if self.tv.is_some() || self.host.is_some() {
+            self.tv = None;
+            self.host = None;
+            self.host_ready = false;
+            return Task::none();
+        }
+        match tv::Host::start() {
+            Ok(host) => {
+                self.host = Some(host);
+                self.host_ready = false;
+                Task::perform(blocking(tv::wait_until_ready), Message::TvReady)
+            }
+            Err(why) => {
+                self.album.note = Some(why);
+                Task::none()
+            }
+        }
+    }
+
+    /// Close the window, taking the TV's screen away first if it has it.
+    fn quit(&mut self) -> Task<Message> {
+        self.tv = None;
+        self.host = None;
+        iced::exit()
+    }
+
+    /// The TV's remote, while a film plays there. It has only a ring and a
+    /// click, so each does what fits both a disc's menu and the film: the
+    /// ring moves through a menu and, left and right, skips ten seconds in
+    /// the film; the click picks in a menu and pauses or plays the film.
+    /// Holding the click ends the film.
+    fn tv_film_remote(&mut self, remote: Remote) -> Task<Message> {
+        let keys: &[film::Key] = match remote {
+            Remote::Up => &[film::Key::Up],
+            Remote::Down => &[film::Key::Down],
+            Remote::Left => &[film::Key::Left, film::Key::JumpBack],
+            Remote::Right => &[film::Key::Right, film::Key::JumpForward],
+            Remote::Select => {
+                if let Some(film) = &self.film {
+                    film.click();
+                }
+                return Task::none();
+            }
+            Remote::PlayPause => &[film::Key::PlayPause],
+            Remote::Previous => &[film::Key::PreviousChapter],
+            Remote::Next => &[film::Key::NextChapter],
+            Remote::Back | Remote::Quit => {
+                self.film = None;
+                return Task::none();
+            }
+            Remote::Menu | Remote::Keep | Remote::Library | Remote::Tv => return Task::none(),
+        };
+        if let Some(film) = &self.film {
+            for &key in keys {
+                film.press(key);
+            }
         }
         Task::none()
     }
@@ -1910,6 +2044,12 @@ impl Spectra {
         ]);
         let remote = if self.watching {
             Subscription::batch([remote, watch::subscription().map(Message::Drive)])
+        } else {
+            remote
+        };
+        // Only the window on the TV hears it, and only while it is there.
+        let remote = if self.tv.is_some() {
+            Subscription::batch([remote, moonlight::subscription().map(Message::TvRemote)])
         } else {
             remote
         };
@@ -1991,7 +2131,8 @@ impl Spectra {
     }
 
     /// The stage's quiet buttons, in the bottom corner: back to the drive
-    /// from a copy, keep a copy of the disc, and down to the library.
+    /// from a copy, keep a copy of the disc, over to the TV and back, and
+    /// down to the library.
     fn corner(&self) -> Element<'_, Message> {
         let label = |pad: &str, words: &str| -> Element<'_, Message> {
             if self.pointing {
@@ -2014,6 +2155,17 @@ impl Spectra {
         }
         if self.keepable() {
             buttons = buttons.push(ui::quiet(label("{alt}", "Keep a copy"), Message::KeepCopy));
+        }
+        if self.tv_possible && !self.in_game {
+            let words = match (&self.tv, &self.host) {
+                (Some(_), _) => "On the TV  ·  Stop",
+                (None, Some(_)) if self.host_ready => {
+                    "Ready: open Spectra in Moonlight on the TV  ·  Stop"
+                }
+                // Sunshine takes a moment or two: not worth a word of its own.
+                (None, _) => "Play on the TV",
+            };
+            buttons = buttons.push(ui::quiet(ui::quiet_text(words), Message::Tv));
         }
         if self.copying.is_none() && !self.in_game && self.film.is_none() {
             let library: Element<'_, Message> = if self.pointing {
@@ -2489,6 +2641,7 @@ fn key(event: keyboard::Event) -> Option<Remote> {
         Key::Character("c") => Some(Remote::Keep),
         Key::Character("l") => Some(Remote::Library),
         Key::Character("m") => Some(Remote::Menu),
+        Key::Character("t") => Some(Remote::Tv),
         _ => None,
     }
 }
@@ -2513,8 +2666,15 @@ fn prefer_vulkan() {
     }
 }
 
+/// Run as the TV's card instead of a window: see `card`.
+pub const TV_CARD: &str = "--tv-card";
+
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == [TV_CARD] {
+        prefer_vulkan();
+        return card::run();
+    }
     if let Some(code) = cli::run(&args) {
         std::process::exit(code);
     }
