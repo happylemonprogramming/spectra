@@ -28,14 +28,22 @@ scripts/install.sh               # build and install
 scripts/install.sh --uninstall   # remove it; kept copies stay
 ```
 
-The installer also sets up everything that plays discs, after asking, so
-that every disc plays offline from then on: about 100 MB. On Arch:
+The installer also sets up what plays discs, after asking, so that they
+play offline from then on: about 45 MB. Only what has been tested on real
+discs is installed. On Arch:
 
 | For | What |
 | --- | --- |
-| Films | VLC without its interface, its DVD and Blu-ray pieces, and `libdvdcss` |
-| PS2 games | Play!, built with Spectra's fixes |
-| PS1, Saturn, Sega CD, PC Engine CD, Neo Geo CD games | RetroArch, with the `pcsx_rearmed`, `mednafen_saturn`, `yabause`, `genesis_plus_gx`, `mednafen_pce` and `neocd` cores. Most of these consoles want their firmware too, from your own console: see [Firmware](#firmware) |
+| Music CDs | Nothing more: Spectra plays them itself |
+| DVDs | VLC without its interface, its DVD pieces, and `libdvdcss` |
+| PS1 games | RetroArch, with the `pcsx_rearmed` core |
+| PS2 games | RetroArch, with Play! built with Spectra's fixes |
+
+Saturn, Sega CD, PC Engine CD and Neo Geo CD games are routed but untested:
+with RetroArch's `mednafen_saturn` (or `yabause`), `genesis_plus_gx`,
+`mednafen_pce` or `neocd` core installed by hand, and for most of them the
+console's firmware from your own console (see [Firmware](#firmware)), they
+may play.
 
 `--no-engines` installs Spectra alone. Elsewhere, it says what to install.
 For full drive access, load the `sg` kernel module: `sudo modprobe sg`.

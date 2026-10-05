@@ -12,8 +12,8 @@ command -v spectra || curl -fsSL https://__SPECTRA_RAW_URL__/scripts/install.sh 
 ```
 
 `--yes` installs missing packages with sudo without asking, and sets up
-RetroArch, its cores, Play! and VLC so every disc plays offline (about
-100 MB); leave it out to let the user decide. The binary goes to `~/.local/bin/spectra`.
+VLC for DVDs and RetroArch with the PS1 and PS2 cores, so those play
+offline (about 45 MB); leave it out to let the user decide. The binary goes to `~/.local/bin/spectra`.
 
 ## Commands
 

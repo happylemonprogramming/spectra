@@ -20,11 +20,13 @@
 # to install missing build packages (a C compiler, pkg-config, the ALSA and
 # udev headers), and Rust is installed with rustup when there is none.
 #
-# Then everything that plays discs is set up now, while there is a network,
-# so that afterwards every disc plays without one: RetroArch and its cores,
-# Spectra's build of Play!, and VLC with what DVDs need. On Arch, from its
-# packages; the cores Arch does not package come from libretro's buildbot,
-# as RetroArch's own updater fetches them. About 100 MB in all.
+# Then what plays discs is set up now, while there is a network, so that
+# afterwards every disc Spectra has been tested on plays without one: VLC
+# with what DVDs need, and RetroArch with PCSX-ReARMed for PS1 and Spectra's
+# build of Play! for PS2. Only what has played a real disc is installed;
+# other consoles wait until it has. On Arch, from its packages; PCSX-ReARMed,
+# which Arch does not package, comes from libretro's buildbot, as RetroArch's
+# own updater fetches it. About 45 MB in all.
 set -euo pipefail
 
 # Filled in once the repository has a home.
@@ -187,17 +189,17 @@ notes=()
 ls /dev/sg* >/dev/null 2>&1 ||
 	notes+=("Load the sg module for full drive access: sudo modprobe sg, and to keep it: echo sg | sudo tee /etc/modules-load.d/sg.conf")
 
-# What Arch packages: RetroArch, the cores it has, VLC trimmed to what discs
-# need (docs/spikes.md, spike 6), and the tools to build Play!.
+# What Arch packages: RetroArch, VLC trimmed to what DVDs need (docs/spikes.md,
+# spike 6; Blu-ray waits for a disc to test), and the tools to build Play!.
 arch_packages=(
-	retroarch libretro-genesis-plus-gx libretro-beetle-pce libretro-yabause
-	vlc-cli vlc-plugin-dvd vlc-plugin-bluray vlc-plugin-ffmpeg vlc-plugin-a52dec
+	retroarch
+	vlc-cli vlc-plugin-dvd vlc-plugin-ffmpeg vlc-plugin-a52dec
 	vlc-plugin-pulse vlc-plugin-freetype libdvdcss
 	cmake ninja
 )
-# What it does not, from libretro's buildbot: PS1, Saturn, Neo Geo CD.
+# What it does not, from libretro's buildbot: PS1.
 buildbot=https://buildbot.libretro.com/nightly/linux/x86_64/latest
-buildbot_cores=(pcsx_rearmed_libretro.so mednafen_saturn_libretro.so neocd_libretro.so)
+buildbot_cores=(pcsx_rearmed_libretro.so)
 
 has_core() {
 	local dir
@@ -248,7 +250,7 @@ if [ "$engines" = yes ]; then
 		# pacman -T names what is not installed, without the network.
 		mapfile -t missing < <(pacman -T "${arch_packages[@]}" || true)
 		;;
-	*) notes+=("Install RetroArch, VLC and libdvdcss with your package manager, and the genesis_plus_gx, mednafen_pce and yabause cores from RetroArch's Online Updater") ;;
+	*) notes+=("Install RetroArch, VLC and libdvdcss with your package manager") ;;
 	esac
 	for core in "${buildbot_cores[@]}"; do has_core "$core" || fetch+=("$core"); done
 	play=no
