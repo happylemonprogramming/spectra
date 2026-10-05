@@ -30,6 +30,7 @@ mod net;
 mod platform;
 mod shelf;
 mod soundtrack;
+mod theme;
 mod ui;
 mod watch;
 mod windows;
@@ -40,24 +41,22 @@ use std::time::{Duration, Instant};
 
 use iced::alignment::Vertical;
 use iced::font::Weight;
-use iced::gradient::Linear;
 use iced::keyboard::{self, Key, key::Named};
-use iced::mouse::ScrollDelta;
 use iced::widget::scrollable::{AbsoluteOffset, Direction, Scrollbar, Viewport};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Id, button, column, container, image, mouse_area, operation, pin, progress_bar, responsive,
-    row, scrollable, shader, space, stack, text,
+    Id, button, column, container, image, mouse_area, operation, progress_bar, responsive, row,
+    scrollable, shader, space, stack, text,
 };
 use iced::{
-    Background, Border, Color, ContentFit, Element, Fill, Font, Point, Radians, Shadow, Shrink,
-    Size, Subscription, Task, Theme, Vector, window,
+    Background, Border, Color, ContentFit, Element, Fill, Font, Point, Shadow, Shrink, Size,
+    Subscription, Task, Theme, Vector, window,
 };
 
 use album::Album;
 use art::{Art, Face};
 use motion::Motion;
-use shelf::{Moved, Shelf};
+use shelf::{Section, Shelf, Spot};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -66,7 +65,8 @@ use spectra_core::drive::Drive;
 use spectra_core::{DiscKind, GameIdentity, Report, library};
 use watch::DriveState;
 
-const FONT: Font = Font::with_name("Adwaita Sans");
+/// Silkscreen, a pixel face, built in: see `theme.rs`.
+const FONT: Font = Font::with_name("Silkscreen");
 const BOLD: Font = Font {
     weight: Weight::Bold,
     ..FONT
@@ -104,7 +104,10 @@ pub enum Remote {
     Menu,
     /// Over to the kept copies, and back to the stage.
     Library,
-    Quit,
+    /// A folder's own key: S, V or G.
+    Folder(Section),
+    /// The drive's own key, D: its disc onto the stage.
+    Drive,
 }
 
 /// The two screens, the stage above the library.
@@ -143,10 +146,20 @@ enum Message {
     OpenLibrary,
     CloseLibrary,
     /// From a copy on the stage back to the disc in the drive.
-    ReturnToDrive,
     KeepCopy,
     ShelfFocus(usize),
     ShelfPick(usize),
+    /// The pointer over a spot on the desktop, and a click on one.
+    DeskFocus(usize),
+    DeskOpen(usize),
+    /// A copy onto the desktop, or off it.
+    ShelfPin(usize),
+    OpenFolder(Section),
+    CloseFolder,
+    /// Every window put away: the desktop.
+    ShowDesktop,
+    /// The stage's window closed.
+    CloseStage,
     ShelfMenu(usize),
     ShelfDelete(usize),
     MenuClose,
@@ -155,7 +168,6 @@ enum Message {
     ShelfFace(String, Option<Arc<Face>>),
     /// A delete nobody confirmed in time.
     Disarm(String),
-    Wheel(Screen, ScrollDelta),
     /// The pointer moved: the mouse is in use, and here.
     Pointer(Point),
     /// A command from outside, and where its answer goes.
@@ -220,10 +232,10 @@ impl Scale {
     fn for_size(size: Size) -> Self {
         if size.height >= 600.0 && size.width >= 560.0 {
             Self {
-                title: 42.0,
-                artist: 22.0,
-                detail: 15.0,
-                track: 18.0,
+                title: 32.0,
+                artist: 18.0,
+                detail: 13.0,
+                track: 15.0,
                 row: 46.0,
                 gap: 24.0,
             }
@@ -280,6 +292,13 @@ struct Spectra {
     /// A kept copy on the stage in place of the drive's disc, picked from
     /// the library. Back returns to the drive.
     picked: Option<library::Entry>,
+    /// Whether the stage's window is open: once something has been opened
+    /// on it, until its window is closed. A disc sitting in the drive does
+    /// not open it by itself.
+    stage_open: bool,
+    /// The drive as the wall shows it while a copy has the stage, and so
+    /// the stage's own art and words are the copy's.
+    drive_shown: Option<DriveShown>,
     /// What the drive last said, kept while a copy is on the stage so that
     /// Back can return to the disc.
     drive_state: Option<DriveState>,
@@ -296,7 +315,6 @@ struct Spectra {
     /// things are and prompts can step back.
     pointing: bool,
     cursor: Point,
-    wheel: Wheel,
     reduced_motion: bool,
 }
 
@@ -334,21 +352,12 @@ impl Slide {
     }
 }
 
-/// The wheel, turned into single steps between the screens: at most one
-/// per gesture, so a flick of a trackpad and the momentum after it move one
-/// screen, not several. As Rainbow Player's `useWheelStep`.
-#[derive(Default)]
-struct Wheel {
-    last: Option<Instant>,
-    travel: f32,
-    live: bool,
+/// The disc in the drive, as its icon on the desktop shows it.
+#[derive(Clone)]
+struct DriveShown {
+    disc: Option<art::Icon>,
+    title: String,
 }
-
-/// A pause this long between wheel events ends one gesture.
-const GESTURE_GAP: Duration = Duration::from_millis(250);
-/// How far a gesture travels before it counts, so a brush of a trackpad does
-/// not.
-const STEP_PX: f32 = 60.0;
 
 struct Launch {
     emulator: game::Emulator,
@@ -432,6 +441,8 @@ impl Spectra {
             elapsed: 0,
             disc_id: None,
             picked: None,
+            stage_open: false,
+            drive_shown: None,
             drive_state: None,
             screen: Screen::Stage,
             slide: Slide {
@@ -439,12 +450,11 @@ impl Spectra {
                 to: 0.0,
                 t: 1.0,
             },
-            shelf: Shelf::new(options.reduced_motion),
+            shelf: Shelf::new(),
             soundtracks: HashMap::new(),
             style: ui::Style::Keys,
             pointing: false,
             cursor: Point::ORIGIN,
-            wheel: Wheel::default(),
             reduced_motion: options.reduced_motion,
         };
         app.rewind();
@@ -453,7 +463,18 @@ impl Spectra {
         if options.play {
             app.play(0);
         }
-        (app, Task::none())
+        // The wall is home. An album file opened by name has no drive and
+        // no wall; it goes straight on the stage.
+        if !app.watching {
+            return (app, Task::none());
+        }
+        app.slide = Slide {
+            from: 1.0,
+            to: 1.0,
+            t: 1.0,
+        };
+        let wall = app.open_library();
+        (app, wall)
     }
 
     /// Put an album on screen, from the top, with nothing playing.
@@ -511,9 +532,6 @@ impl Spectra {
                     }
                 }
                 self.slide.step(dt);
-                if self.library_visible() {
-                    self.shelf.step(dt);
-                }
                 Task::none()
             }
             Message::Scrolled(viewport) => {
@@ -530,14 +548,28 @@ impl Spectra {
                 }
             }
             Message::Drive(state) => {
+                let arrived = matches!(state, DriveState::Disc { .. })
+                    && !matches!(self.drive_state, Some(DriveState::Disc { .. }));
                 self.drive_state = Some(state.clone());
-                // A kept copy is on the stage: the drive waits until Back.
-                // Otherwise the stage follows the drive, even under the
-                // library, so it is current when the library slides away.
-                if self.picked.is_some() {
-                    return Task::none();
+                // A disc going in is the thing to look at: the wall turns to
+                // the drive, on its top shelf.
+                if arrived && self.screen == Screen::Library {
+                    self.shelf.focus_drive();
                 }
-                self.show_drive(state)
+                let look = Task::none();
+                // A kept copy is on the stage: it keeps it, and the wall
+                // shows the disc by its name alone until it is chosen.
+                if self.picked.is_some() {
+                    let album = Album::from_drive(&state);
+                    self.drive_shown = Some(DriveShown {
+                        disc: matches!(state, DriveState::Disc { .. }).then(|| Face::blank().icon),
+                        title: album.title,
+                    });
+                    return look;
+                }
+                // Otherwise the stage follows the drive, under the wall, so it
+                // is ready when the disc is chosen.
+                Task::batch([self.show_drive(state), look])
             }
             Message::Audio(event) => {
                 match event {
@@ -703,14 +735,17 @@ impl Spectra {
                 Task::none()
             }
             Message::Pointer(at) => {
+                // Only a pointer that has moved is in use. The wall
+                // scrolling under one left resting still reports it, at the
+                // same place, and must not take the focus from the keys.
+                if at != self.cursor {
+                    self.pointing = true;
+                }
                 self.cursor = at;
-                self.pointing = true;
                 Task::none()
             }
-            Message::Wheel(screen, delta) => self.wheel(screen, delta),
             Message::OpenLibrary => self.open_library(),
             Message::CloseLibrary => self.close_library(),
-            Message::ReturnToDrive => self.return_to_drive(),
             Message::KeepCopy => self.keep_copy(),
             Message::ShelfScrolled(viewport) => {
                 self.shelf.scrolled(viewport);
@@ -721,23 +756,58 @@ impl Spectra {
                     .set_face(id, face.unwrap_or_else(|| Arc::new(Face::blank())));
                 Task::none()
             }
-            Message::ShelfFocus(index) => {
-                if self.shelf.menu.is_some() {
-                    return Task::none();
+            Message::DeskFocus(at) => {
+                if self.pointing && self.shelf.menu.is_none() && self.desk_active() {
+                    self.shelf.point_desk(at);
                 }
-                self.shelf.focus_on(index)
+                Task::none()
+            }
+            Message::DeskOpen(at) => {
+                self.shelf.menu = None;
+                // A click on the desktop puts away the window in front of it.
+                self.shelf.open = None;
+                self.screen = Screen::Library;
+                self.shelf.point_desk(at);
+                self.activate()
+            }
+            Message::ShelfPin(index) => {
+                self.shelf.toggle_pin(index);
+                Task::none()
+            }
+            Message::OpenFolder(section) => self.open_folder(section),
+            Message::CloseFolder => {
+                self.shelf.close_folder();
+                Task::none()
+            }
+            Message::CloseStage => {
+                // Closing the window stops what plays in it.
+                self.stop();
+                self.stage_open = false;
+                self.open_library()
+            }
+            Message::ShowDesktop => {
+                self.shelf.close_folder();
+                self.open_library()
+            }
+            Message::ShelfFocus(index) => {
+                if self.pointing && self.shelf.menu.is_none() {
+                    // From the pointer: the folder does not scroll under it.
+                    self.shelf.point_folder(index);
+                }
+                Task::none()
             }
             Message::ShelfPick(index) => {
                 self.shelf.menu = None;
                 self.pick(index)
             }
             Message::ShelfMenu(index) => {
-                let focus = self.shelf.focus_on(index);
+                self.shelf.focus_entry(index);
                 self.shelf.menu = Some(shelf::Menu {
                     index,
-                    at: self.cursor,
+                    at: Some(self.cursor),
+                    item: 0,
                 });
-                focus
+                Task::none()
             }
             Message::MenuClose => {
                 self.shelf.menu = None;
@@ -1041,6 +1111,13 @@ impl Spectra {
         if self.film.is_some() {
             return self.film_remote(remote);
         }
+        // A folder's key opens it from anywhere: the stage, or the desktop.
+        if let Remote::Folder(section) = remote {
+            return self.open_folder(section);
+        }
+        if matches!(remote, Remote::Drive) {
+            return self.open_drive();
+        }
         match self.screen {
             Screen::Library => self.library_remote(remote),
             Screen::Stage => self.stage_remote(remote),
@@ -1048,35 +1125,97 @@ impl Spectra {
     }
 
     fn library_remote(&mut self, remote: Remote) -> Task<Message> {
-        // A menu is up: it has the controls until it goes.
+        // A menu is up: it has the keys until it goes.
         if let Some(menu) = self.shelf.menu {
-            return match remote {
+            match remote {
+                Remote::Up => self.shelf.menu_step(-1),
+                Remote::Down => self.shelf.menu_step(1),
                 Remote::Select | Remote::PlayPause => {
-                    self.shelf.menu = None;
-                    self.pick(menu.index)
+                    let index = menu.index;
+                    return match self.shelf.acts(index)[menu.item] {
+                        shelf::Act::Play => {
+                            self.shelf.menu = None;
+                            self.pick(index)
+                        }
+                        shelf::Act::Pin | shelf::Act::Unpin => {
+                            self.shelf.toggle_pin(index);
+                            Task::none()
+                        }
+                        shelf::Act::Delete => self.delete(index),
+                    };
                 }
-                Remote::Menu => self.delete(menu.index),
                 _ => {
                     self.shelf.menu = None;
                     self.shelf.armed = None;
-                    Task::none()
                 }
-            };
+            }
+            return Task::none();
         }
-        let (moved, task) = match remote {
-            Remote::Left => self.shelf.left(),
-            Remote::Right => self.shelf.right(),
-            Remote::Up => self.shelf.up(),
-            Remote::Down => self.shelf.down(),
-            Remote::Select | Remote::PlayPause => return self.pick(self.shelf.focus),
-            Remote::Menu => return self.delete(self.shelf.focus),
-            Remote::Back | Remote::Library | Remote::Quit => return self.close_library(),
-            Remote::Keep | Remote::Previous | Remote::Next => return Task::none(),
-        };
-        match moved {
-            Moved::Out => self.close_library(),
-            Moved::To | Moved::Nowhere => task,
+        match remote {
+            Remote::Left => self.shelf.step(-1, 0),
+            Remote::Right => self.shelf.step(1, 0),
+            Remote::Up => self.shelf.step(0, -1),
+            Remote::Down => self.shelf.step(0, 1),
+            Remote::Select | Remote::PlayPause => self.activate(),
+            Remote::Menu => {
+                if let Some(index) = self.shelf.focused_index() {
+                    self.shelf.menu = Some(shelf::Menu {
+                        index,
+                        at: None,
+                        item: 0,
+                    });
+                }
+                Task::none()
+            }
+            // Back closes the folder; on the desktop, back to the stage, if
+            // anything is on it.
+            Remote::Back | Remote::Library => {
+                if self.shelf.close_folder() {
+                    Task::none()
+                } else {
+                    self.close_library()
+                }
+            }
+            Remote::Keep | Remote::Previous | Remote::Next | Remote::Folder(_) | Remote::Drive => {
+                Task::none()
+            }
         }
+    }
+
+    /// Enter on what is chosen: the drive's disc onto the stage, a folder
+    /// open, a copy onto the stage.
+    fn activate(&mut self) -> Task<Message> {
+        match self.shelf.chosen() {
+            Some(Spot::Drive) => self.pick_drive(),
+            Some(Spot::Folder(section)) => self.open_folder(section),
+            Some(Spot::Copy(index)) => self.pick(index),
+            None => Task::none(),
+        }
+    }
+
+    /// The drive, from its key: its disc onto the stage, or with none in,
+    /// the desktop with the drive chosen, saying why.
+    fn open_drive(&mut self) -> Task<Message> {
+        if self.disc_in_drive() {
+            return self.pick_drive();
+        }
+        self.shelf.close_folder();
+        self.shelf.focus_drive();
+        self.open_library()
+    }
+
+    /// A folder's window, from its icon, its key, or the taskbar.
+    fn open_folder(&mut self, section: Section) -> Task<Message> {
+        let opened = self.open_library();
+        if self.screen != Screen::Library {
+            return opened;
+        }
+        Task::batch([opened, self.shelf.open_folder(section)])
+    }
+
+    /// Whether the desktop has the keys: no window is in front of it.
+    fn desk_active(&self) -> bool {
+        self.screen == Screen::Library && self.shelf.open.is_none()
     }
 
     fn stage_remote(&mut self, remote: Remote) -> Task<Message> {
@@ -1090,7 +1229,6 @@ impl Spectra {
                     }
                     Task::none()
                 }
-                Remote::Quit => iced::exit(),
                 _ => Task::none(),
             };
         }
@@ -1099,16 +1237,15 @@ impl Spectra {
             // Only the disc in the drive can be kept.
             Remote::Keep if self.picked.is_none() => return self.keep_copy(),
             Remote::Keep => return Task::none(),
-            Remote::Back if self.playing.is_none() && self.picked.is_some() => {
-                return self.return_to_drive();
-            }
+            // Back from whatever is on the stage, not playing, is back to
+            // the wall it was chosen from.
+            Remote::Back if self.playing.is_none() => return self.open_library(),
             Remote::Select | Remote::PlayPause if self.launch.is_some() => {
                 return self.start_game();
             }
             Remote::Select | Remote::PlayPause if self.film_uri.is_some() => {
                 return self.start_film();
             }
-            Remote::Quit => return iced::exit(),
             _ => {}
         }
         let count = self.album.tracks.len();
@@ -1132,7 +1269,7 @@ impl Spectra {
             Remote::Previous | Remote::Left => self.skip(false),
             Remote::Next | Remote::Right => self.skip(true),
             Remote::Back => self.stop(),
-            Remote::Keep | Remote::Menu | Remote::Library | Remote::Quit => {}
+            Remote::Keep | Remote::Menu | Remote::Library | Remote::Folder(_) | Remote::Drive => {}
         }
         self.reveal_focus()
     }
@@ -1171,50 +1308,6 @@ impl Spectra {
         }
     }
 
-    /// A step of the wheel: down from the stage to the library, and up from
-    /// the top of the library back to the stage. A gesture that starts with
-    /// the shelf scrolled down only scrolls it, so scrolling the grid back
-    /// up does not carry straight on out of the library.
-    fn wheel(&mut self, screen: Screen, delta: ScrollDelta) -> Task<Message> {
-        if screen != self.screen || self.slide.moving() || self.shelf.menu.is_some() {
-            return Task::none();
-        }
-        let now = Instant::now();
-        if self
-            .wheel
-            .last
-            .is_none_or(|last| now.duration_since(last) > GESTURE_GAP)
-        {
-            self.wheel.travel = 0.0;
-            self.wheel.live = match screen {
-                Screen::Stage => true,
-                Screen::Library => self.shelf.at_top(),
-            };
-        }
-        self.wheel.last = Some(now);
-        if !self.wheel.live {
-            return Task::none();
-        }
-        // Downwards is positive here; iced's wheel is the other way round.
-        self.wheel.travel -= match delta {
-            ScrollDelta::Lines { y, .. } => y * 16.0,
-            ScrollDelta::Pixels { y, .. } => y,
-        };
-        if self.wheel.travel.abs() < STEP_PX {
-            return Task::none();
-        }
-        self.wheel.live = false;
-        match (screen, self.wheel.travel > 0.0) {
-            (Screen::Stage, true) => self.open_library(),
-            (Screen::Library, false) => self.close_library(),
-            _ => Task::none(),
-        }
-    }
-
-    fn library_visible(&self) -> bool {
-        self.screen == Screen::Library || self.slide.moving()
-    }
-
     /// Slide down to the library, with its shelf brought up to date and
     /// faces made for any copy new to it.
     fn open_library(&mut self) -> Task<Message> {
@@ -1225,7 +1318,6 @@ impl Spectra {
         self.shelf.notice = None;
         self.screen = Screen::Library;
         self.slide.go(1.0, self.reduced_motion);
-        self.shelf.shown(true);
         Task::batch([shelf_faces(missing), self.listen_to_games()])
     }
 
@@ -1235,11 +1327,15 @@ impl Spectra {
         library::list()
             .into_iter()
             .flat_map(|entry| {
-                let music = self
-                    .soundtracks
-                    .get(&entry.meta.id)
-                    .is_some_and(Option::is_some)
-                    .then(|| soundtrack::entry(&entry));
+                // Found to have music now, or the last time it was listened
+                // to, while it is being listened to again.
+                let music = match self.soundtracks.get(&entry.meta.id) {
+                    Some(Some(_)) => true,
+                    _ => {
+                        entry.meta.system.is_some() && soundtrack::remembered(&entry) == Some(true)
+                    }
+                }
+                .then(|| soundtrack::entry(&entry));
                 std::iter::once(entry).chain(music)
             })
             .collect()
@@ -1266,21 +1362,65 @@ impl Spectra {
             blocking(move || {
                 games
                     .iter()
-                    .map(|game| (game.meta.id.clone(), soundtrack::load(game).map(Arc::new)))
+                    .map(|game| {
+                        let found = soundtrack::load(game).map(Arc::new);
+                        soundtrack::remember(game, found.is_some());
+                        (game.meta.id.clone(), found)
+                    })
                     .collect()
             }),
             Message::Soundtracks,
         )
     }
 
+    /// Back to the stage from the wall: only if something is on it.
     fn close_library(&mut self) -> Task<Message> {
-        if self.screen == Screen::Stage {
+        if self.screen == Screen::Stage || self.on_stage().is_none() {
             return Task::none();
         }
         self.screen = Screen::Stage;
+        self.stage_open = true;
         self.slide.go(0.0, self.reduced_motion);
-        self.shelf.shown(false);
+        self.shelf.menu = None;
         Task::none()
+    }
+
+    /// What is on the stage, by name: a copy chosen from the wall, or the
+    /// disc in the drive. None when it would only say there is no disc.
+    fn on_stage(&self) -> Option<&str> {
+        if let Some(entry) = &self.picked {
+            return Some(entry.meta.title.as_str());
+        }
+        self.disc_in_drive().then_some(self.album.title.as_str())
+    }
+
+    /// The drive as the wall's top shelf shows it.
+    fn drive_shown(&self) -> DriveShown {
+        if self.picked.is_some()
+            && let Some(shown) = &self.drive_shown
+        {
+            return shown.clone();
+        }
+        DriveShown {
+            disc: matches!(self.drive_state, Some(DriveState::Disc { .. }))
+                .then(|| self.art.icon.clone()),
+            title: self.album.title.clone(),
+        }
+    }
+
+    /// The drive's disc, chosen on the wall: on to the stage, in place of
+    /// any copy there.
+    fn pick_drive(&mut self) -> Task<Message> {
+        self.shelf.focus_drive();
+        if !self.disc_in_drive() {
+            return Task::none();
+        }
+        let shown = if self.picked.is_some() {
+            self.return_to_drive()
+        } else {
+            Task::none()
+        };
+        Task::batch([shown, self.close_library()])
     }
 
     /// Put a kept copy on the stage in place of the drive's disc: an album
@@ -1289,7 +1429,15 @@ impl Spectra {
         let Some(entry) = self.shelf.entries.get(index).cloned() else {
             return Task::none();
         };
-        let _ = self.shelf.focus_on(index);
+        // The stage's art and words are about to be the copy's: the wall
+        // keeps the drive's, for its top shelf.
+        if self.picked.is_none() {
+            self.drive_shown = Some(self.drive_shown());
+        }
+        self.shelf.focus_entry(index);
+        // On the stage before leaving the wall, which goes only to a stage
+        // with something on it.
+        self.picked = Some(entry.clone());
         let close = self.close_library();
         let pictures = artwork::for_copy(&entry);
         self.player = None;
@@ -1548,19 +1696,14 @@ impl Spectra {
     /// written `{accept}`, and drawn as the controller in hand has them.
     fn ready_note(&self) -> String {
         if let Some(entry) = &self.picked {
-            let back = if self.disc_in_drive() {
-                "for the disc in the drive"
-            } else {
-                "to the drive"
-            };
             return if entry.is_album() || soundtrack::is_entry(entry) {
-                format!("Your copy  ·  {{accept}} Play  ·  {{back}} Back {back}")
+                "Your copy  ·  {accept} Play".into()
             } else if entry.is_film() {
-                format!("Your copy  ·  {{accept}} Play in VLC  ·  {{back}} Back {back}")
+                "Your copy  ·  {accept} Play in VLC".into()
             } else if self.launch.is_none() {
-                format!("No emulator for this console is installed  ·  {{back}} Back {back}")
+                "No emulator for this console is installed".into()
             } else {
-                format!("Your copy  ·  {{accept}} Play  ·  {{back}} Back {back}")
+                "Your copy  ·  {accept} Play".into()
             };
         }
         if self.film_uri.is_some() {
@@ -1831,11 +1974,13 @@ impl Spectra {
             Remote::Next => film::Key::NextChapter,
             Remote::Menu => film::Key::DiscMenu,
             // Back always gets out: dropping the film ends VLC.
-            Remote::Back | Remote::Quit => {
+            Remote::Back => {
                 self.film = None;
                 return Task::none();
             }
-            Remote::Keep | Remote::Library => return Task::none(),
+            Remote::Keep | Remote::Library | Remote::Folder(_) | Remote::Drive => {
+                return Task::none();
+            }
         };
         if let Some(film) = &self.film {
             film.press(key);
@@ -1895,7 +2040,6 @@ impl Spectra {
                         .iter()
                         .enumerate()
                         .any(|(i, &g)| g != if i == self.focus { 1.0 } else { 0.0 })))
-            || (self.library_visible() && self.shelf.moving())
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1922,117 +2066,202 @@ impl Spectra {
         }
     }
 
-    /// The stage above the library. At rest only the one on screen is
-    /// built; while sliding, both, stacked, moved up by as much of a
-    /// screen as the slide has gone.
+    /// The desktop: the sky, its icons, the window in front of them if one
+    /// is open - a folder, or the stage - and the taskbar along the bottom.
     fn view(&self) -> Element<'_, Message> {
-        responsive(move |size| {
-            let at = self.slide.at();
-            if at <= 0.0 {
-                return self.stage();
+        let sky = image(theme::backdrop())
+            .width(Fill)
+            .height(Fill)
+            .content_fit(ContentFit::Cover)
+            .filter_method(image::FilterMethod::Nearest);
+        let desk = responsive(move |size| {
+            let cx = self.desk_context();
+            let margin = (size.width.min(size.height) * 0.035).clamp(8.0, 32.0);
+            // Room on the right and below for the window's hard shadow.
+            // Every window the one size: the desktop, less a margin and room
+            // for its shadow, and no wider than a track list needs.
+            let standard = Size::new(
+                (size.width - 2.0 * margin - 6.0).clamp(1.0, 1280.0),
+                (size.height - 2.0 * margin - 6.0).max(1.0),
+            );
+            let window = match self.screen {
+                Screen::Library => self
+                    .shelf
+                    .folder_window(standard, &cx)
+                    .map(|(title, contents)| (standard, title, contents, Message::CloseFolder)),
+                Screen::Stage => Some((
+                    standard,
+                    self.album.title.clone(),
+                    self.stage(),
+                    Message::CloseStage,
+                )),
+            };
+            let mut layers = stack![self.shelf.desktop(size, &cx)];
+            if let Some((body, title, contents, close)) = window {
+                layers = layers.push(
+                    container(
+                        container(theme::window(title, contents, Some(close)))
+                            .width(body.width)
+                            .height(body.height),
+                    )
+                    .center(Fill),
+                );
             }
-            if at >= 1.0 {
-                return self.library(size);
+            if let Some(menu) = self.shelf.menu {
+                layers = layers.push(self.shelf.menu_view(menu, size));
             }
-            let both = column![
-                container(self.stage()).width(Fill).height(size.height),
-                container(self.library(size))
-                    .width(Fill)
-                    .height(size.height),
-            ];
-            container(pin(both).y(-at * size.height))
-                .width(Fill)
-                .height(Fill)
-                .clip(true)
-                .into()
+            // The one place the pointer is followed from, so a menu opens
+            // where it was asked for, whatever it was asked of.
+            mouse_area(layers).on_move(Message::Pointer).into()
+        });
+        stack![sky, column![desk, self.taskbar()]].into()
+    }
+
+    /// What the desktop and its folders need to draw themselves.
+    fn desk_context(&self) -> shelf::Context<'_> {
+        let shown = self.drive_shown();
+        let title = match &self.drive_state {
+            None | Some(DriveState::NoDrive) => "No drive".to_string(),
+            Some(DriveState::Empty) => "Drive: empty".into(),
+            Some(DriveState::Reading) => "Reading…".into(),
+            Some(DriveState::Unreadable(_)) => "Can't read it".into(),
+            Some(DriveState::Disc { .. }) => shown.title,
+        };
+        shelf::Context {
+            style: self.style,
+            picked: self.picked.as_ref().map(|p| p.meta.id.as_str()),
+            pointing: self.pointing,
+            desk_active: self.desk_active(),
+            drive: shelf::Drive {
+                icon: shown.disc,
+                title,
+            },
+        }
+    }
+
+    /// The taskbar: Spectra's button, which shows the desktop, and a button
+    /// for each window, the one in front pressed in. The drive is on the
+    /// desktop, and D: one place for it is enough.
+    fn taskbar(&self) -> Element<'_, Message> {
+        let start = button(
+            row![
+                text("◉").font(FONT).size(14).color(Color::WHITE),
+                text("SPECTRA").font(BOLD).size(13).color(Color::WHITE),
+            ]
+            .spacing(6)
+            .align_y(Vertical::Center),
+        )
+        .padding([6, 14])
+        .on_press(Message::ShowDesktop)
+        .style(|_, status| button::Style {
+            background: Some(Background::Color(
+                if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                    Color::from_rgb8(0x3c, 0xb8, 0x52)
+                } else {
+                    Color::from_rgb8(0x2e, 0x9e, 0x44)
+                },
+            )),
+            border: Border {
+                color: theme::INK,
+                width: 2.0,
+                radius: 999.0.into(),
+            },
+            shadow: theme::hard_shadow(2.0),
+            ..button::Style::default()
+        });
+        let folder = self.shelf.open.map(|section| {
+            theme::button_text(
+                section.name(),
+                Some(Message::OpenFolder(section)),
+                self.screen == Screen::Library,
+            )
+        });
+        let stage = self.on_stage().filter(|_| self.stage_open).map(|title| {
+            let playing = if self.playing.is_some() { "▶ " } else { "" };
+            theme::button_text(
+                &format!("{playing}{}", shorten(title, 18)),
+                Some(Message::CloseLibrary),
+                self.screen == Screen::Stage,
+            )
+        });
+        container(
+            row![start]
+                .push(folder)
+                .push(stage)
+                .spacing(8)
+                .align_y(Vertical::Center),
+        )
+        .padding([5, 8])
+        .width(Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(theme::SILVER)),
+            border: Border {
+                color: Color::WHITE,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            shadow: Shadow {
+                color: Color::WHITE,
+                offset: Vector::new(0.0, -2.0),
+                blur_radius: 0.0,
+            },
+            ..Default::default()
         })
         .into()
     }
 
-    fn library(&self, size: Size) -> Element<'_, Message> {
-        self.shelf.view(
-            size,
-            shelf::Context {
-                style: self.style,
-                picked: self.picked.as_ref().map(|p| p.meta.id.as_str()),
-                disc_in_drive: self.disc_in_drive(),
-                pointing: self.pointing,
-            },
-        )
-    }
-
+    /// The stage, in its window: the disc and what is on it, and a bar of
+    /// what can be done with it along the bottom.
     fn stage(&self) -> Element<'_, Message> {
-        let backdrop = image(self.art.backdrop.clone())
-            .width(Fill)
-            .height(Fill)
-            .content_fit(ContentFit::Cover);
-        let shade = container(space())
-            .width(Fill)
-            .height(Fill)
-            .style(|_| container::Style {
-                background: Some(Background::Gradient(
-                    Linear::new(Radians(std::f32::consts::FRAC_PI_2))
-                        .add_stop(0.0, Color::from_rgba8(6, 6, 12, 0.62))
-                        .add_stop(0.55, Color::from_rgba8(6, 6, 12, 0.76))
-                        .add_stop(1.0, Color::from_rgba8(6, 6, 12, 0.9))
-                        .into(),
-                )),
-                ..Default::default()
-            });
-        mouse_area(stack![
-            backdrop,
-            shade,
-            responsive(|size| self.screen(size)),
-            self.corner()
+        mouse_area(column![
+            container(responsive(|size| self.screen(size))).height(Fill),
+            self.actions(),
         ])
-        .on_scroll(|delta| Message::Wheel(Screen::Stage, delta))
-        .on_move(Message::Pointer)
         .into()
     }
 
-    /// The stage's quiet buttons, in the bottom corner: back to the drive
-    /// from a copy, keep a copy of the disc, and down to the library.
-    fn corner(&self) -> Element<'_, Message> {
+    /// Along the bottom of the stage's window: keep a copy of the disc, and
+    /// back to your discs.
+    fn actions(&self) -> Element<'_, Message> {
         let label = |pad: &str, words: &str| -> Element<'_, Message> {
             if self.pointing {
-                ui::quiet_text(words)
+                text(words.to_uppercase()).font(FONT).size(12).into()
             } else {
                 ui::prompt(
                     &format!("{pad} {}", words.to_uppercase()),
                     self.style,
-                    13.0,
-                    Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+                    12.0,
+                    theme::faint(0.8),
                 )
             }
         };
-        let mut buttons = row![].spacing(8).align_y(Vertical::Center);
-        if self.picked.is_some() && !self.in_game && self.film.is_none() {
-            buttons = buttons.push(ui::quiet(
-                label("{back}", "Back to the drive"),
-                Message::ReturnToDrive,
+        let mut buttons = row![].spacing(10).align_y(Vertical::Center);
+        if self.keepable() {
+            buttons = buttons.push(theme::button_with(
+                label("{alt}", "Keep a copy"),
+                Some(Message::KeepCopy),
+                false,
             ));
         }
-        if self.keepable() {
-            buttons = buttons.push(ui::quiet(label("{alt}", "Keep a copy"), Message::KeepCopy));
-        }
         if self.copying.is_none() && !self.in_game && self.film.is_none() {
-            let library: Element<'_, Message> = if self.pointing {
-                ui::quiet_text("Your discs ↓")
-            } else {
-                label("{library}", "Your discs")
-            };
-            buttons = buttons.push(ui::quiet(library, Message::OpenLibrary));
+            buttons = buttons.push(theme::button_with(
+                label("{back}", "My discs"),
+                Some(Message::OpenLibrary),
+                false,
+            ));
         }
         container(buttons)
+            .padding([8, 10])
             .width(Fill)
-            .height(Fill)
             .align_right(Fill)
-            .align_bottom(Fill)
-            .padding([28, 32])
+            .style(|_| container::Style {
+                background: Some(Background::Color(theme::SILVER)),
+                ..Default::default()
+            })
             .into()
     }
 
-    /// Everything over the backdrop, arranged for the room there is.
+    /// Everything in the stage's window, arranged for the room there is.
     fn screen(&self, size: Size) -> Element<'_, Message> {
         let scale = Scale::for_size(size);
         match Layout::for_size(size) {
@@ -2088,10 +2317,6 @@ impl Spectra {
         }
     }
 
-    fn accent(&self) -> Color {
-        Color::from_rgb(self.art.accent[0], self.art.accent[1], self.art.accent[2])
-    }
-
     fn disc(&self) -> iced::widget::Shader<Message, disc::Disc> {
         shader(disc::Disc {
             slot: STAGE,
@@ -2128,28 +2353,26 @@ impl Spectra {
             text(line.to_string())
                 .font(FONT)
                 .size(scale.detail)
-                .color(Color::from_rgba(1.0, 1.0, 1.0, alpha))
+                .color(theme::faint((alpha + 0.2).min(1.0)))
         };
         container(
             column![
                 text(&album.title)
                     .font(BOLD)
                     .size(scale.title)
-                    .color(Color::WHITE),
+                    .color(theme::INK),
                 text(&album.artist)
                     .font(FONT)
                     .size(scale.artist)
-                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.78)),
+                    .color(theme::faint(0.93)),
             ]
             .push(details.map(|details| dim(&details, 0.5)))
-            .push(album.note.as_deref().map(|note| {
-                ui::prompt(
-                    note,
-                    self.style,
-                    scale.detail,
-                    Color::from_rgba(1.0, 1.0, 1.0, 0.38),
-                )
-            }))
+            .push(
+                album
+                    .note
+                    .as_deref()
+                    .map(|note| ui::prompt(note, self.style, scale.detail, theme::faint(0.53))),
+            )
             .spacing(scale.gap / 4.0),
         )
         .padding([0.0, LIST_PAD])
@@ -2157,7 +2380,6 @@ impl Spectra {
     }
 
     fn tracks(&self, scale: Scale) -> Element<'_, Message> {
-        let accent = self.accent();
         let rows = self.album.tracks.iter().enumerate().map(|(i, track)| {
             let glow = self.glow[i];
             let is_playing = self.playing == Some(i);
@@ -2166,14 +2388,27 @@ impl Spectra {
                 (true, true) => "❚❚".to_string(),
                 _ => format!("{}", i + 1),
             };
-            let strong =
-                Color::from_rgba(1.0, 1.0, 1.0, 0.72 + 0.28 * glow.max(f32::from(is_playing)));
+            // The chosen row is picked out in blue, its words white, as a
+            // chosen row in a list box was.
+            let mix = |a: Color, b: Color| Color {
+                r: a.r + (b.r - a.r) * glow,
+                g: a.g + (b.g - a.g) * glow,
+                b: a.b + (b.b - a.b) * glow,
+                a: a.a + (b.a - a.a) * glow,
+            };
+            let white = Color::from_rgb(1.0, 1.0, 1.0);
+            let strong = mix(theme::INK, white);
+            let quiet = mix(theme::faint(0.55), Color { a: 0.8, ..white });
             let line = row![
                 text(marker)
                     .font(FONT)
                     .size(scale.track - 3.0)
                     .width(scale.track * 1.9)
-                    .color(if is_playing { accent } else { strong }),
+                    .color(if is_playing {
+                        mix(theme::BLUE, white)
+                    } else {
+                        strong
+                    }),
                 container(
                     text(&track.title)
                         .font(if is_playing { BOLD } else { FONT })
@@ -2192,7 +2427,7 @@ impl Spectra {
                 }))
                 .font(FONT)
                 .size(scale.track - 3.0)
-                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5)),
+                .color(quiet),
             ]
             .spacing(8)
             .align_y(Vertical::Center);
@@ -2202,29 +2437,7 @@ impl Spectra {
                 .height(scale.row)
                 .center_y(scale.row)
                 .style(move |_| container::Style {
-                    background: Some(Background::Color(
-                        Color {
-                            a: 0.07 + 0.13 * glow,
-                            ..accent
-                        }
-                        .scale_alpha(glow),
-                    )),
-                    border: Border {
-                        color: Color {
-                            a: 0.55 * glow,
-                            ..accent
-                        },
-                        width: 1.0,
-                        radius: (scale.row * 0.26).into(),
-                    },
-                    shadow: Shadow {
-                        color: Color {
-                            a: 0.45 * glow,
-                            ..accent
-                        },
-                        offset: Vector::ZERO,
-                        blur_radius: 22.0 * glow,
-                    },
+                    background: Some(Background::Color(theme::BLUE.scale_alpha(glow))),
                     ..Default::default()
                 });
             mouse_area(row).on_press(Message::Pick(i)).into()
@@ -2233,8 +2446,18 @@ impl Spectra {
             .id(TRACKS)
             .on_scroll(Message::Scrolled)
             .direction(Direction::Vertical(
-                Scrollbar::new().width(3).scroller_width(3).margin(2),
-            ));
+                Scrollbar::new().width(8).scroller_width(8).margin(2),
+            ))
+            .style(|look, status| {
+                let mut style = scrollable::default(look, status);
+                style.vertical_rail.scroller.background = Background::Color(theme::SILVER);
+                style.vertical_rail.scroller.border = Border {
+                    color: theme::INK,
+                    width: 2.0,
+                    radius: 0.0.into(),
+                };
+                style
+            });
         // Filling what the header and the player leave, so a long list
         // scrolls rather than pushing the player off the screen; but no
         // taller than its rows, so a short one does not stretch.
@@ -2251,7 +2474,7 @@ impl Spectra {
             "{up}{down} Choose    {accept} Play    {prev}{next} Skip    {start} Pause    {back} Stop",
             self.style,
             13.0,
-            Color::from_rgba(1.0, 1.0, 1.0, 0.4),
+            theme::faint(0.55),
         ))
         .padding([0.0, LIST_PAD])
         .into()
@@ -2276,22 +2499,15 @@ impl Spectra {
 
     /// Previous, play or pause, and next, as buttons.
     fn transport(&self) -> iced::widget::Row<'_, Message> {
-        let accent = self.accent();
         let control = |glyph: &'static str, remote: Remote| {
-            button(text(glyph).font(FONT).size(15).center())
-                .width(40)
-                .height(40)
-                .on_press(Message::Remote(remote))
-                .style(move |_, status| button::Style {
-                    background: matches!(status, button::Status::Hovered | button::Status::Pressed)
-                        .then_some(Background::Color(Color { a: 0.3, ..accent })),
-                    text_color: Color::WHITE,
-                    border: Border {
-                        radius: 20.0.into(),
-                        ..Border::default()
-                    },
-                    ..button::Style::default()
-                })
+            theme::button_with(
+                text(glyph).font(FONT).size(13).center(),
+                Some(Message::Remote(remote)),
+                false,
+            )
+            .width(40)
+            .height(36)
+            .padding(0)
         };
         let playing = self.playing.is_some() && !self.paused;
         row![
@@ -2306,16 +2522,16 @@ impl Spectra {
     fn progress(&self) -> Option<Element<'_, Message>> {
         let (track, elapsed) = self.now()?;
         let total = track.seconds.max(1);
-        let accent = self.accent();
         Some(
             progress_bar(0.0..=total as f32, elapsed.min(total) as f32)
-                .girth(4)
+                .girth(10)
                 .style(move |_| progress_bar::Style {
-                    background: Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.15)),
-                    bar: Background::Color(accent),
+                    background: Background::Color(Color::WHITE),
+                    bar: Background::Color(theme::BLUE),
                     border: Border {
-                        radius: 2.0.into(),
-                        ..Border::default()
+                        color: theme::INK,
+                        width: 2.0,
+                        radius: 0.0.into(),
                     },
                 })
                 .into(),
@@ -2328,7 +2544,7 @@ impl Spectra {
         let Some((track, elapsed)) = self.now() else {
             return space().into();
         };
-        let dim = Color::from_rgba(1.0, 1.0, 1.0, 0.6);
+        let dim = theme::faint(0.75);
         let about = column![
             row![
                 container(
@@ -2336,7 +2552,7 @@ impl Spectra {
                         .font(FONT)
                         .size(scale.detail)
                         .wrapping(Wrapping::None)
-                        .color(Color::WHITE),
+                        .color(theme::INK),
                 )
                 .width(Fill)
                 .clip(true),
@@ -2375,12 +2591,12 @@ impl Spectra {
                     .font(BOLD)
                     .size(text_size)
                     .wrapping(Wrapping::None)
-                    .color(Color::WHITE),
+                    .color(theme::INK),
                 text(&self.album.artist)
                     .font(FONT)
                     .size(text_size - 2.0)
                     .wrapping(Wrapping::None)
-                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.7)),
+                    .color(theme::faint(0.85)),
             ]
             .spacing(2)
         };
@@ -2423,6 +2639,16 @@ fn blocking<T: Default + Send + 'static>(
     async move { rx.await.unwrap_or_default() }
 }
 
+/// A title cut to fit a taskbar button, as taskbars cut them: `Midnight
+/// Club - St…`.
+fn shorten(title: &str, most: usize) -> String {
+    if title.chars().count() <= most {
+        return title.to_string();
+    }
+    let cut: String = title.chars().take(most - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
 /// Seconds as a player shows them: `4:28`.
 fn clock(seconds: u32) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
@@ -2434,11 +2660,8 @@ fn shelf_faces(missing: Vec<library::Entry>) -> Task<Message> {
         let id = entry.meta.id.clone();
         Task::perform(
             blocking(move || {
-                let pictures = artwork::for_copy(&entry);
-                Some(Arc::new(Face::new(
-                    pictures.cover.as_ref(),
-                    pictures.face.as_ref(),
-                )))
+                let face = artwork::face_for_copy(&entry);
+                Some(Arc::new(face))
             }),
             move |face| Message::ShelfFace(id.clone(), face),
         )
@@ -2485,10 +2708,16 @@ fn key(event: keyboard::Event) -> Option<Remote> {
         Key::Named(Named::Enter) => Some(Remote::Select),
         Key::Named(Named::Space) => Some(Remote::PlayPause),
         Key::Named(Named::Backspace) => Some(Remote::Back),
-        Key::Named(Named::Escape) => Some(Remote::Quit),
+        // Escape is Back, as it is in most windows; closing Spectra is the
+        // desktop's business (Super+W, say).
+        Key::Named(Named::Escape) => Some(Remote::Back),
         Key::Character("c") => Some(Remote::Keep),
         Key::Character("l") => Some(Remote::Library),
         Key::Character("m") => Some(Remote::Menu),
+        Key::Character("s") => Some(Remote::Folder(Section::Sounds)),
+        Key::Character("v") => Some(Remote::Folder(Section::Videos)),
+        Key::Character("g") => Some(Remote::Folder(Section::Games)),
+        Key::Character("d") => Some(Remote::Drive),
         _ => None,
     }
 }
@@ -2522,7 +2751,9 @@ fn main() -> iced::Result {
     iced::application(Spectra::new, Spectra::update, Spectra::view)
         .title("Spectra")
         .subscription(Spectra::subscription)
-        .theme(|_: &Spectra| Theme::Dark)
+        .theme(|_: &Spectra| Theme::Light)
+        .font(theme::FONTS[0])
+        .font(theme::FONTS[1])
         .default_font(FONT)
         .window(window::Settings {
             size: Size::new(1280.0, 760.0),
@@ -2542,6 +2773,15 @@ fn main() -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_title_is_cut_with_an_ellipsis_and_a_short_one_is_not() {
+        assert_eq!(
+            shorten("Midnight Club - Street Racing", 14),
+            "Midnight Club…"
+        );
+        assert_eq!(shorten("Tomb Raider", 14), "Tomb Raider");
+    }
 
     fn layout(w: f32, h: f32) -> Layout {
         Layout::for_size(Size::new(w, h))

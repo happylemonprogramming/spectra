@@ -1,127 +1,178 @@
-//! The library: every kept copy, as a shelf of discs below the stage.
+//! The desktop, and the folders on it.
 //!
-//! After Rainbow Player's `LibraryShelf.tsx` and `shelfScene.ts`. The discs
-//! sit in a grid that wraps to the window, each a small 3D disc of its own
-//! wearing its label. The one in focus turns end over end, as the disc on
-//! the stage does when it arrives, and is drawn a little larger; the others
-//! rest label side out. The art says which disc is which, so the line under
-//! each says only what is happening to it - unless it has no art, when it
-//! says its name.
+//! The desktop holds the drive, three folders - Sounds, Videos and Games -
+//! and whatever copies have been put there as favourites. A folder opens as
+//! a window of every copy of its kind; a favourite is still in its folder
+//! too. Icons go down the left of the desktop and then across, as desktop
+//! icons do, and are chosen as they were: a blue cast over the icon and its
+//! name picked out in blue.
 //!
-//! Each disc is its own shader widget, all drawn by the one pipeline; see
-//! `disc.rs`. Nothing moves once the focused disc has shown both faces, so
-//! an open library that is left alone draws nothing.
+//! A copy's icon is its disc, flat, drawn once and kept (see `artwork.rs`);
+//! the spinning disc is kept for the stage. Nothing here moves, so a desktop
+//! left alone draws nothing.
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use iced::alignment::{Horizontal, Vertical};
+use iced::widget::image::FilterMethod;
 use iced::widget::scrollable::{AbsoluteOffset, Direction, Scrollbar, Viewport};
 use iced::widget::{
-    Id, button, column, container, image, mouse_area, operation, pin, row, scrollable, shader,
-    space, stack, text,
+    Id, button, column, container, image, mouse_area, operation, pin, row, scrollable, space,
+    stack, text,
 };
-use iced::{
-    Background, Border, Color, ContentFit, Element, Fill, Point, Shadow, Size, Task, Vector,
-};
+use iced::{Background, Border, Color, Element, Fill, Point, Size, Task};
 use spectra_core::GameSystem;
-use spectra_core::library::Entry;
+use spectra_core::library::{self, Entry};
 
-use crate::art::Face;
-use crate::motion::Motion;
+use crate::art::{Face, Icon};
+use crate::theme::{self, BLUE, INK};
 use crate::ui::{self, Style};
-use crate::{BOLD, CD_PITCH, FONT, Message};
+use crate::{BOLD, FONT, Message};
 
-/// Narrowest a cell gets before the grid drops a column, as Rainbow
-/// Player's `minmax(280px, 1fr)`.
-const CELL_MIN: f32 = 280.0;
-const GAP_X: f32 = 32.0;
-const GAP_Y: f32 = 24.0;
-/// Room around each disc, inside its cell.
-const CELL_PAD: f32 = 8.0;
-/// The status line under each disc.
-const STATUS: f32 = 20.0;
-/// The side of the picture on each disc saying what it holds.
-const BADGE: f32 = 20.0;
-const HEADER_TOP: f32 = 40.0;
-const HEADER_BOTTOM: f32 = 24.0;
-const GRID_BOTTOM: f32 = 24.0;
-const GRID: &str = "shelf";
-/// Slots on the GPU for shelf discs start here; the stage's is 0.
-const SLOT_BIT: u64 = 1 << 63;
+/// A desktop icon's cell: the icon, and two lines of its name under it.
+const DESK_CELL: Size = Size::new(164.0, 168.0);
+const DESK_ICON: f32 = 112.0;
+const DESK_PAD: f32 = 16.0;
+/// A copy's cell in a folder.
+const FOLDER_CELL: Size = Size::new(176.0, 196.0);
+const FOLDER_ICON: f32 = 132.0;
+const PAD: f32 = 16.0;
+/// The name under an icon: two lines of the pixel face.
+const NAME: f32 = 40.0;
+const GRID: &str = "folder";
 
-/// A right-click menu on one disc.
+/// The folders, in the order they stand on the desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Section {
+    Sounds,
+    Videos,
+    Games,
+}
+
+impl Section {
+    pub const ALL: [Section; 3] = [Section::Sounds, Section::Videos, Section::Games];
+
+    fn of(entry: &Entry) -> Self {
+        match kind(entry) {
+            ui::Kind::Film => Self::Videos,
+            ui::Kind::Game => Self::Games,
+            ui::Kind::Music => Self::Sounds,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sounds => "Sounds",
+            Self::Videos => "Videos",
+            Self::Games => "Games",
+        }
+    }
+
+    /// The key that opens it, shown on its badge.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Sounds => "S",
+            Self::Videos => "V",
+            Self::Games => "G",
+        }
+    }
+
+    /// Its badge's colour, and the colour of the letter on it.
+    fn badge(self) -> (Color, Color) {
+        match self {
+            Self::Sounds => (Color::from_rgb8(0xf5, 0xd0, 0x1e), INK),
+            Self::Videos => (Color::from_rgb8(0xe8, 0x2c, 0x2c), Color::WHITE),
+            Self::Games => (Color::from_rgb8(0x24, 0x4c, 0xe0), Color::WHITE),
+        }
+    }
+}
+
+/// A place on the desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spot {
+    Drive,
+    Folder(Section),
+    /// A favourite: a copy, by its place in the library.
+    Copy(usize),
+}
+
+/// A right-click menu on one copy. `at` is where it was asked for, or
+/// None for the keys, which have it in the middle.
 #[derive(Debug, Clone, Copy)]
 pub struct Menu {
     pub index: usize,
-    pub at: Point,
+    pub at: Option<Point>,
+    /// The item the keys are on.
+    pub item: usize,
+}
+
+/// What a menu item does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    Play,
+    Pin,
+    Unpin,
+    Delete,
 }
 
 pub struct Shelf {
     pub entries: Vec<Entry>,
-    pub focus: usize,
     faces: HashMap<String, Arc<Face>>,
-    motions: HashMap<String, Motion>,
+    /// The copies on the desktop, by ID, in the order they were put there.
+    favourites: Vec<String>,
+    /// The folder open in its window, if one is.
+    pub open: Option<Section>,
+    /// The spot chosen on the desktop.
+    desk: usize,
+    /// The copy chosen in the open folder: its place in the folder.
+    inside: usize,
     /// A copy whose delete is waiting to be confirmed.
     pub armed: Option<String>,
     pub menu: Option<Menu>,
     /// Something that went wrong, said where it was asked for.
     pub notice: Option<String>,
     viewport: Option<Viewport>,
-    /// Columns and row pitch as last laid out: what up and down move by,
-    /// and how far the grid scrolls to show the focus.
-    columns: Cell<usize>,
-    pitch: Cell<f32>,
-    reduced: bool,
-}
-
-/// Where a move on the shelf went.
-pub enum Moved {
-    To,
-    /// Past the top row: back up to the stage.
-    Out,
-    Nowhere,
+    /// As last laid out: the desktop's icons to a column, and the folder's
+    /// to a row - what the arrows move by.
+    desk_rows: Cell<usize>,
+    folder_columns: Cell<usize>,
 }
 
 impl Shelf {
-    pub fn new(reduced: bool) -> Self {
+    pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            focus: 0,
             faces: HashMap::new(),
-            motions: HashMap::new(),
+            favourites: load_favourites(),
+            open: None,
+            desk: 0,
+            inside: 0,
             armed: None,
             menu: None,
             notice: None,
             viewport: None,
-            columns: Cell::new(1),
-            pitch: Cell::new(CELL_MIN + GAP_Y),
-            reduced,
+            desk_rows: Cell::new(1),
+            folder_columns: Cell::new(1),
         }
     }
 
-    /// Bring the shelf into line with the library on disk. Returns the
-    /// copies whose faces still have to be made.
+    /// Bring the desktop and folders into line with the library on disk.
+    /// Returns the copies whose faces still have to be made.
     pub fn load(&mut self, entries: Vec<Entry>) -> Vec<Entry> {
-        let focused = self.entries.get(self.focus).map(|e| e.meta.id.clone());
         self.entries = entries;
-        self.focus = focused
-            .and_then(|id| self.entries.iter().position(|e| e.meta.id == id))
-            .unwrap_or(0);
         let ids: Vec<_> = self.entries.iter().map(|e| e.meta.id.clone()).collect();
         self.faces.retain(|id, _| ids.contains(id));
-        self.motions.retain(|id, _| ids.contains(id));
-        for id in &ids {
-            self.motions
-                .entry(id.clone())
-                .or_insert_with(|| Motion::shelved(self.reduced));
-        }
         if self.armed.as_ref().is_some_and(|id| !ids.contains(id)) {
             self.armed = None;
         }
         self.menu = None;
+        self.desk = self.desk.min(self.spots().len() - 1);
+        if let Some(open) = self.open {
+            self.inside = self.inside.min(self.folder(open).len().saturating_sub(1));
+        }
         self.entries
             .iter()
             .filter(|e| !self.faces.contains_key(&e.meta.id))
@@ -135,99 +186,178 @@ impl Shelf {
         }
     }
 
-    pub fn focused(&self) -> Option<&Entry> {
-        self.entries.get(self.focus)
+    /// Every spot on the desktop, in order: the drive, the folders, then
+    /// the favourites that are still in the library.
+    pub fn spots(&self) -> Vec<Spot> {
+        let mut spots = vec![Spot::Drive];
+        spots.extend(Section::ALL.map(Spot::Folder));
+        spots.extend(
+            self.favourites
+                .iter()
+                .filter_map(|id| self.entries.iter().position(|e| &e.meta.id == id))
+                .map(Spot::Copy),
+        );
+        spots
     }
 
-    /// The shelf came on screen, or went: the focused disc shows itself
-    /// off, or settles.
-    pub fn shown(&mut self, shown: bool) {
-        if let Some(id) = self.focused().map(|e| e.meta.id.clone())
-            && let Some(motion) = self.motions.get_mut(&id)
-        {
-            motion.set_focused(shown);
+    /// The copies in a folder, by their places in the library: newest
+    /// first, as the library lists them.
+    fn folder(&self, section: Section) -> Vec<usize> {
+        (0..self.entries.len())
+            .filter(|&i| Section::of(&self.entries[i]) == section)
+            .collect()
+    }
+
+    /// What has the keys: a spot on the desktop, or a copy in the folder.
+    pub fn chosen(&self) -> Option<Spot> {
+        match self.open {
+            Some(open) => self.folder(open).get(self.inside).map(|&i| Spot::Copy(i)),
+            None => self.spots().get(self.desk).copied(),
         }
-        if !shown {
-            self.menu = None;
+    }
+
+    /// The copy chosen, if what is chosen is a copy.
+    pub fn focused_index(&self) -> Option<usize> {
+        match self.chosen()? {
+            Spot::Copy(index) => Some(index),
+            _ => None,
+        }
+    }
+
+    pub fn focused(&self) -> Option<&Entry> {
+        self.focused_index().map(|i| &self.entries[i])
+    }
+
+    /// The drive, chosen on the desktop: a disc has gone in.
+    pub fn focus_drive(&mut self) {
+        self.desk = 0;
+    }
+
+    pub fn open_folder(&mut self, section: Section) -> Task<Message> {
+        if self.open != Some(section) {
+            self.inside = 0;
+        }
+        self.open = Some(section);
+        self.menu = None;
+        self.armed = None;
+        self.notice = None;
+        operation::scroll_to(
+            Id::from(GRID),
+            AbsoluteOffset {
+                x: None,
+                y: Some(0.0),
+            },
+        )
+    }
+
+    /// The folder's window closed: the folder is chosen on the desktop.
+    pub fn close_folder(&mut self) -> bool {
+        let Some(open) = self.open.take() else {
+            return false;
+        };
+        if let Some(at) = self.spots().iter().position(|s| *s == Spot::Folder(open)) {
+            self.desk = at;
+        }
+        self.menu = None;
+        self.armed = None;
+        true
+    }
+
+    /// A copy chosen from outside, as the command line does: chosen in the
+    /// folder, if it is in the one open.
+    pub fn focus_entry(&mut self, index: usize) {
+        if let Some(open) = self.open
+            && let Some(at) = self.folder(open).iter().position(|&i| i == index)
+        {
+            self.inside = at;
+        }
+    }
+
+    /// A spot on the desktop under the pointer.
+    pub fn point_desk(&mut self, at: usize) {
+        if at < self.spots().len() && self.desk != at {
+            self.desk = at;
             self.armed = None;
         }
     }
 
-    pub fn focus_on(&mut self, index: usize) -> Task<Message> {
-        if index >= self.entries.len() || index == self.focus {
-            return Task::none();
-        }
-        for (i, focused) in [(self.focus, false), (index, true)] {
-            if let Some(motion) = self
-                .entries
-                .get(i)
-                .and_then(|e| self.motions.get_mut(&e.meta.id))
-            {
-                motion.set_focused(focused);
+    /// A copy in the folder under the pointer. Never scrolls: what the
+    /// pointer is on is in view already.
+    pub fn point_folder(&mut self, index: usize) {
+        self.focus_entry(index);
+    }
+
+    /// An arrow pressed: along the desktop's columns, or the folder's rows.
+    pub fn step(&mut self, dx: isize, dy: isize) -> Task<Message> {
+        self.armed = None;
+        match self.open {
+            Some(open) => {
+                let count = self.folder(open).len();
+                if count == 0 {
+                    return Task::none();
+                }
+                let columns = self.folder_columns.get().max(1) as isize;
+                let at = self.inside as isize;
+                let to = if dy != 0 {
+                    at + dy * columns
+                } else if (at % columns + dx).clamp(0, columns - 1) == at % columns + dx {
+                    at + dx
+                } else {
+                    at
+                };
+                // Down from a row with nothing straight below goes to the
+                // last copy, rather than nowhere.
+                let to = if dy > 0
+                    && to >= count as isize
+                    && at / columns < (count as isize - 1) / columns
+                {
+                    count as isize - 1
+                } else {
+                    to
+                };
+                if (0..count as isize).contains(&to) {
+                    self.inside = to as usize;
+                }
+                self.reveal_focus()
+            }
+            None => {
+                let count = self.spots().len() as isize;
+                let rows = self.desk_rows.get().max(1) as isize;
+                let at = self.desk as isize;
+                let to = if dx != 0 {
+                    at + dx * rows
+                } else if (at % rows + dy).clamp(0, rows - 1) == at % rows + dy {
+                    at + dy
+                } else {
+                    at
+                };
+                if (0..count).contains(&to) {
+                    self.desk = to as usize;
+                }
+                Task::none()
             }
         }
-        self.focus = index;
-        self.armed = None;
-        self.reveal_focus()
-    }
-
-    pub fn left(&mut self) -> (Moved, Task<Message>) {
-        if self.focus == 0 {
-            return (Moved::Nowhere, Task::none());
-        }
-        (Moved::To, self.focus_on(self.focus - 1))
-    }
-
-    pub fn right(&mut self) -> (Moved, Task<Message>) {
-        if self.focus + 1 >= self.entries.len() {
-            return (Moved::Nowhere, Task::none());
-        }
-        (Moved::To, self.focus_on(self.focus + 1))
-    }
-
-    pub fn up(&mut self) -> (Moved, Task<Message>) {
-        let cols = self.columns.get().max(1);
-        if self.focus < cols {
-            return (Moved::Out, Task::none());
-        }
-        (Moved::To, self.focus_on(self.focus - cols))
-    }
-
-    pub fn down(&mut self) -> (Moved, Task<Message>) {
-        let cols = self.columns.get().max(1);
-        let last_row = self.entries.len().saturating_sub(1) / cols;
-        if self.focus / cols >= last_row {
-            return (Moved::Nowhere, Task::none());
-        }
-        let to = (self.focus + cols).min(self.entries.len() - 1);
-        (Moved::To, self.focus_on(to))
     }
 
     pub fn scrolled(&mut self, viewport: Viewport) {
         self.viewport = Some(viewport);
     }
 
-    /// Whether the grid is scrolled to its top, where a wheel upwards goes
-    /// back to the stage.
-    pub fn at_top(&self) -> bool {
-        self.viewport.is_none_or(|v| v.absolute_offset().y <= 0.5)
-    }
-
-    /// Scroll just enough to show the focused disc.
+    /// Scroll the folder just enough to show the copy chosen, and not at
+    /// all if it is in view.
     fn reveal_focus(&self) -> Task<Message> {
         let Some(viewport) = self.viewport else {
             return Task::none();
         };
-        let cols = self.columns.get().max(1);
-        let pitch = self.pitch.get();
-        let top = (self.focus / cols) as f32 * pitch;
-        let bottom = top + pitch - GAP_Y;
+        let columns = self.folder_columns.get().max(1);
+        let top = PAD + (self.inside / columns) as f32 * FOLDER_CELL.height;
+        let bottom = top + FOLDER_CELL.height;
         let offset = viewport.absolute_offset().y;
         let height = viewport.bounds().height;
-        let y = if top < offset {
-            top
+        let y = if top < offset + PAD {
+            top - PAD
         } else if bottom > offset + height {
-            bottom - height + GRID_BOTTOM.min(height / 4.0)
+            bottom - height + PAD
         } else {
             return Task::none();
         };
@@ -240,16 +370,44 @@ impl Shelf {
         )
     }
 
-    pub fn step(&mut self, dt: f32) {
-        for motion in self.motions.values_mut() {
-            if motion.moving() {
-                motion.step(dt);
-            }
-        }
+    pub fn pinned(&self, id: &str) -> bool {
+        self.favourites.iter().any(|f| f == id)
     }
 
-    pub fn moving(&self) -> bool {
-        self.motions.values().any(Motion::moving)
+    /// Onto the desktop, or off it. Off it, the copy stays in its folder:
+    /// only Delete takes a copy away.
+    pub fn toggle_pin(&mut self, index: usize) {
+        let Some(id) = self.entries.get(index).map(|e| e.meta.id.clone()) else {
+            return;
+        };
+        if self.pinned(&id) {
+            self.favourites.retain(|f| *f != id);
+        } else {
+            self.favourites.push(id);
+        }
+        self.desk = self.desk.min(self.spots().len() - 1);
+        self.menu = None;
+        save_favourites(&self.favourites);
+    }
+
+    /// What a copy's menu offers.
+    pub fn acts(&self, index: usize) -> [Act; 3] {
+        let pinned = self
+            .entries
+            .get(index)
+            .is_some_and(|e| self.pinned(&e.meta.id));
+        [
+            Act::Play,
+            if pinned { Act::Unpin } else { Act::Pin },
+            Act::Delete,
+        ]
+    }
+
+    /// Up or down the menu, with the keys.
+    pub fn menu_step(&mut self, by: isize) {
+        if let Some(menu) = &mut self.menu {
+            menu.item = (menu.item as isize + by).clamp(0, 2) as usize;
+        }
     }
 
     /// Delete pressed once arms it; again, on the same copy, confirms.
@@ -267,27 +425,52 @@ impl Shelf {
     }
 }
 
-/// What the shelf needs from the rest of the app to draw itself.
+/// Where the desktop's favourites are kept: beside the library.
+fn favourites_file() -> Option<PathBuf> {
+    Some(library::root()?.parent()?.join("desktop.json"))
+}
+
+fn load_favourites() -> Vec<String> {
+    favourites_file()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_favourites(favourites: &[String]) {
+    let Some(path) = favourites_file() else {
+        return;
+    };
+    if let Ok(json) = serde_json::to_vec_pretty(favourites) {
+        // Whole or not at all: written aside, then put in place.
+        let part = path.with_extension("part");
+        if std::fs::write(&part, json).is_ok() {
+            let _ = std::fs::rename(&part, path);
+        }
+    }
+}
+
+/// What the desktop and the folders need from the rest of the app.
 pub struct Context<'a> {
     pub style: Style,
     /// The copy on the stage, if one is.
     pub picked: Option<&'a str>,
-    /// Whether Back returns to a disc in the drive.
-    pub disc_in_drive: bool,
     /// The mouse is in use, not keys or a pad.
     pub pointing: bool,
+    /// Whether the desktop has the keys: no window is in front of it.
+    pub desk_active: bool,
+    pub drive: Drive,
 }
 
-/// Which GPU slot a copy's disc draws into: stable across reloads, so its
-/// label stays uploaded, and never the stage's.
-fn slot(id: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    id.hash(&mut hasher);
-    hasher.finish() | SLOT_BIT
+/// The drive, as its icon shows it.
+pub struct Drive {
+    /// The disc in it, if one is.
+    pub icon: Option<Icon>,
+    pub title: String,
 }
 
-/// What a copy holds, for its badge. A soundtrack is music, though its copy
-/// is a game's.
+/// What a copy holds, for its folder. A soundtrack is music, though its
+/// copy is a game's.
 fn kind(entry: &Entry) -> ui::Kind {
     if entry.is_film() {
         ui::Kind::Film
@@ -335,306 +518,454 @@ pub fn byline(entry: &Entry) -> String {
     .join("  ·  ")
 }
 
+/// An icon, plain or chosen, `side` square.
+fn icon_image<'a>(icon: &Icon, chosen: bool, side: f32, pixels: bool) -> Element<'a, Message> {
+    icon_faded(icon, chosen, side, pixels, 1.0)
+}
+
+fn icon_faded<'a>(
+    icon: &Icon,
+    chosen: bool,
+    side: f32,
+    pixels: bool,
+    opacity: f32,
+) -> Element<'a, Message> {
+    let handle = if chosen { &icon.chosen } else { &icon.plain };
+    let picture = image(handle.clone())
+        .width(side)
+        .height(side)
+        .opacity(opacity);
+    if pixels {
+        picture.filter_method(FilterMethod::Nearest).into()
+    } else {
+        picture.into()
+    }
+}
+
+/// A name on the desktop: white, standing off the sky by a dark shadow;
+/// picked out in blue when chosen.
+fn desk_name<'a>(words: String, chosen: bool) -> Element<'a, Message> {
+    let line = |color: Color| {
+        text(words.clone())
+            .font(FONT)
+            .size(14)
+            .color(color)
+            .align_x(Horizontal::Center)
+    };
+    let words: Element<'_, Message> = if chosen {
+        container(line(Color::WHITE))
+            .padding([1, 4])
+            .style(|_| container::Style {
+                background: Some(Background::Color(BLUE)),
+                ..Default::default()
+            })
+            .into()
+    } else {
+        stack![
+            container(line(Color::from_rgba(0.0, 0.0, 0.15, 0.85))).padding(iced::Padding {
+                top: 2.0,
+                left: 6.0,
+                right: 2.0,
+                bottom: 0.0,
+            }),
+            container(line(Color::WHITE)).padding([1, 4]),
+        ]
+        .into()
+    };
+    container(words)
+        .width(DESK_CELL.width)
+        .height(NAME)
+        .align_x(Horizontal::Center)
+        .clip(true)
+        .into()
+}
+
+/// A name in a folder: ink on the window's grey; picked out in blue when
+/// chosen.
+fn name<'a>(words: String, chosen: bool, width: f32) -> Element<'a, Message> {
+    let words = text(words)
+        .font(FONT)
+        .size(12)
+        .color(if chosen { Color::WHITE } else { INK })
+        .align_x(Horizontal::Center);
+    container(
+        container(words)
+            .padding([1, 4])
+            .max_width(width)
+            .style(move |_| container::Style {
+                background: chosen.then_some(Background::Color(BLUE)),
+                ..Default::default()
+            }),
+    )
+    .width(width)
+    .height(NAME)
+    .align_x(Horizontal::Center)
+    .clip(true)
+    .into()
+}
+
+/// A key, on a round badge at an icon's corner: what opens it.
+fn key_badge<'a>(key: &'static str, (back, ink): (Color, Color)) -> Element<'a, Message> {
+    container(text(key).font(BOLD).size(16).color(ink).center())
+        .width(BADGE)
+        .height(BADGE)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(back)),
+            border: Border {
+                color: INK,
+                width: 2.0,
+                radius: (BADGE / 2.0).into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+const BADGE: f32 = 32.0;
+/// Where a badge sits on its icon: low on the right.
+const BADGE_AT: f32 = DESK_ICON - BADGE - 2.0;
+/// The drive's badge: green, as its light is.
+const DRIVE_BADGE: (Color, Color) = (Color::from_rgb(0.18, 0.62, 0.27), Color::WHITE);
+
 impl Shelf {
-    pub fn view<'a>(&'a self, size: Size, cx: Context<'a>) -> Element<'a, Message> {
-        let pad_x = (size.width * 0.04).max(32.0);
-        let glow = image(ui::glow())
+    /// The desktop's icons, down the left and then across `size`.
+    pub fn desktop<'a>(&'a self, size: Size, cx: &Context<'a>) -> Element<'a, Message> {
+        let rows = (((size.height - 2.0 * DESK_PAD) / DESK_CELL.height).floor() as usize).max(1);
+        self.desk_rows.set(rows);
+        let spots = self.spots();
+        let columns = spots.chunks(rows).enumerate().map(|(c, chunk)| {
+            column(
+                chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(r, spot)| self.desk_icon(c * rows + r, *spot, cx)),
+            )
+            .into()
+        });
+        container(row(columns))
+            .padding(DESK_PAD)
             .width(Fill)
             .height(Fill)
-            .content_fit(ContentFit::Fill);
+            .into()
+    }
 
-        let back = if cx.disc_in_drive || cx.picked.is_some() {
-            "Back to the disc"
-        } else {
-            "Back"
-        };
-        let back: Element<'_, Message> = match cx.style {
-            ui::Style::Pad(_) if !cx.pointing => ui::prompt(
-                &format!("{{up}} {}", back.to_uppercase()),
-                cx.style,
-                13.0,
-                Color::from_rgba(1.0, 1.0, 1.0, 0.45),
-            ),
-            _ => ui::quiet_text(&format!("↑ {back}")),
-        };
-        let notice: Element<'_, Message> = match &self.notice {
-            Some(notice) => text(notice.clone())
-                .font(FONT)
-                .size(15)
-                .color(Color::from_rgb8(0xff, 0x9a, 0x9a))
+    fn desk_icon<'a>(&'a self, at: usize, spot: Spot, cx: &Context<'a>) -> Element<'a, Message> {
+        let chosen = cx.desk_active && self.desk == at;
+        let (picture, words): (Element<'_, Message>, String) = match spot {
+            Spot::Drive => {
+                let picture = match &cx.drive.icon {
+                    Some(disc) => icon_image(disc, chosen, DESK_ICON, false),
+                    // No disc: the drive itself, faded as a disabled icon
+                    // was, its name saying why. It can still be chosen, to
+                    // say so.
+                    None => icon_faded(&theme::drive_icon(), chosen, DESK_ICON, true, 0.45),
+                };
+                (
+                    stack![
+                        picture,
+                        pin(key_badge("D", DRIVE_BADGE)).x(BADGE_AT).y(BADGE_AT)
+                    ]
+                    .into(),
+                    cx.drive.title.clone(),
+                )
+            }
+            Spot::Folder(section) => (
+                stack![
+                    icon_image(&theme::folder_icon(), chosen, DESK_ICON, true),
+                    pin(key_badge(section.key(), section.badge()))
+                        .x(BADGE_AT)
+                        .y(BADGE_AT),
+                ]
                 .into(),
-            None => text(match self.entries.len() {
-                0 => "YOUR DISCS".to_string(),
-                n => format!("YOUR DISCS  ·  {n}"),
-            })
-            .font(FONT)
-            .size(13)
-            .color(Color::from_rgba(1.0, 1.0, 1.0, 0.35))
-            .into(),
+                section.name().to_string(),
+            ),
+            Spot::Copy(index) => {
+                let entry = &self.entries[index];
+                (
+                    icon_image(&self.face(entry).icon, chosen, DESK_ICON, false),
+                    entry.meta.title.clone(),
+                )
+            }
         };
-        let header = row![
-            container(notice).width(Fill),
-            ui::quiet(back, Message::CloseLibrary)
+        let picture = container(picture).width(DESK_ICON).height(DESK_ICON);
+        let cell = column![
+            container(picture)
+                .width(DESK_CELL.width)
+                .align_x(Horizontal::Center)
+                .padding(iced::Padding {
+                    top: 6.0,
+                    ..iced::Padding::ZERO
+                }),
+            desk_name(words, chosen),
         ]
-        .align_y(Vertical::Center)
-        .padding([0.0, pad_x]);
-
-        let body: Element<'_, Message> = if self.entries.is_empty() {
-            container(self.empty(cx.style, cx.pointing))
-                .padding([0.0, pad_x])
-                .width(Fill)
-                .into()
-        } else {
-            self.grid(size.width - 2.0 * pad_x, pad_x, &cx)
-        };
-
-        // Under the grid rather than over it, so a short window never puts
-        // the prompt across a disc.
-        let footer: Element<'_, Message> = if !cx.pointing && !self.entries.is_empty() {
-            container(ui::prompt(
-                "{accept} PLAY  ·  {select} DELETE  ·  {back} BACK",
-                cx.style,
-                13.0,
-                Color::from_rgba(1.0, 1.0, 1.0, 0.35),
-            ))
-            .center_x(Fill)
-            .padding([12, 0])
-            .into()
-        } else {
-            space().height(16).into()
-        };
-
-        let screen = column![
-            space().height(HEADER_TOP),
-            header,
-            space().height(HEADER_BOTTOM),
-            container(body).height(Fill),
-            footer,
-        ];
-        let mut layers = stack![glow, screen];
-        if let Some(menu) = self.menu {
-            layers = layers.push(self.menu_view(menu, size));
+        .width(DESK_CELL.width)
+        .height(DESK_CELL.height)
+        .spacing(4);
+        let mut area = mouse_area(cell)
+            .on_move(move |_| Message::DeskFocus(at))
+            .on_press(Message::DeskOpen(at));
+        if let Spot::Copy(index) = spot {
+            area = area.on_right_press(Message::ShelfMenu(index));
         }
-        mouse_area(layers)
-            .on_scroll(|delta| Message::Wheel(crate::Screen::Library, delta))
-            .on_move(Message::Pointer)
-            .into()
+        area.into()
     }
 
-    fn grid<'a>(&'a self, width: f32, pad_x: f32, cx: &Context<'a>) -> Element<'a, Message> {
-        let cols = (((width + GAP_X) / (CELL_MIN + GAP_X)).floor() as usize).max(1);
-        let cell = ((width - GAP_X * (cols - 1) as f32) / cols as f32).max(80.0);
-        let disc = cell - 2.0 * CELL_PAD;
-        self.columns.set(cols);
-        self.pitch.set(disc + STATUS + 4.0 + 2.0 * CELL_PAD + GAP_Y);
-
-        let rows = self.entries.chunks(cols).enumerate().map(|(r, chunk)| {
-            let mut line = row![].spacing(GAP_X);
-            for (c, entry) in chunk.iter().enumerate() {
-                line = line.push(self.cell(r * cols + c, entry, cell, disc, cx));
-            }
-            // Keep a short last row on the grid, not stretched across it.
-            for _ in chunk.len()..cols {
-                line = line.push(space().width(cell));
-            }
-            line.into()
-        });
-        scrollable(column(rows).spacing(GAP_Y).padding(iced::Padding {
-            top: 0.0,
-            right: pad_x,
-            bottom: GRID_BOTTOM,
-            left: pad_x,
-        }))
-        .id(GRID)
-        .on_scroll(Message::ShelfScrolled)
-        .direction(Direction::Vertical(Scrollbar::hidden()))
-        .into()
+    fn face(&self, entry: &Entry) -> Arc<Face> {
+        self.faces
+            .get(&entry.meta.id)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Face::blank()))
     }
 
-    fn cell<'a>(
+    /// The open folder's window: its title, and what is in it, `size`
+    /// being the window's.
+    pub fn folder_window<'a>(
         &'a self,
-        index: usize,
-        entry: &'a Entry,
-        cell: f32,
-        disc: f32,
+        size: Size,
         cx: &Context<'a>,
-    ) -> Element<'a, Message> {
-        let id = entry.meta.id.as_str();
-        let face = self.faces.get(id);
-        let blank;
-        let face = match face {
-            Some(face) => face.as_ref(),
-            None => {
-                blank = Face::blank();
-                &blank
-            }
-        };
-        let pose = self.motions.get(id).map(Motion::pose).unwrap_or_default();
-        let accent = Color::from_rgb(face.accent[0], face.accent[1], face.accent[2]);
-        let disc_widget = shader(crate::disc::Disc {
-            slot: slot(id),
-            pose,
-            label: face.label.clone(),
-            accent: face.accent,
-            pitch: CD_PITCH,
-        })
-        .width(disc)
-        .height(disc);
-
-        let dim = Color::from_rgba(1.0, 1.0, 1.0, 0.35);
-        let red = Color::from_rgb8(0xff, 0x8a, 0x8a);
-        let status: Element<'_, Message> = if self.armed.as_deref() == Some(id) {
-            if cx.pointing {
-                text("Delete? Once more to confirm")
+    ) -> Option<(String, Element<'a, Message>)> {
+        let open = self.open?;
+        let copies = self.folder(open);
+        let title = format!("{} ({})", open.name(), copies.len());
+        let columns =
+            (((size.width - 2.0 * PAD - 16.0) / FOLDER_CELL.width).floor() as usize).max(1);
+        let notice = self.notice.as_ref().map(|notice| {
+            container(
+                text(notice.clone())
                     .font(FONT)
                     .size(13)
-                    .color(red)
-                    .into()
-            } else {
-                ui::prompt("{select} again to delete", cx.style, 13.0, red)
-            }
-        } else if cx.picked == Some(id) {
-            text("On the stage")
-                .font(FONT)
-                .size(13)
-                .color(accent)
-                .into()
-        } else if !face.printed {
-            text(entry.meta.title.clone())
-                .font(FONT)
-                .size(13)
-                .color(dim)
-                .wrapping(text::Wrapping::None)
-                .into()
-        } else {
-            space().into()
-        };
-
-        let focused = index == self.focus;
-        // The focus is the disc turning; a ring as well only for keys and
-        // pads, which have no pointer to show where they are.
-        let ring = focused && !cx.pointing;
-        let content = column![
-            disc_widget,
-            container(status)
-                .height(STATUS)
+                    .color(Color::from_rgb8(0xc0, 0x10, 0x10)),
+            )
+            .padding([8.0, PAD])
+        });
+        self.folder_columns.set(columns);
+        let grid: Element<'_, Message> = if copies.is_empty() {
+            container(self.empty(open, cx))
+                .padding(PAD)
                 .width(Fill)
-                .align_x(Horizontal::Center)
-                .clip(true)
-        ]
-        .spacing(4)
-        .align_x(Horizontal::Center);
-        let content = container(content).padding(CELL_PAD).width(cell);
-        // What the disc holds, on a dark chip at its lower right; a layer of
-        // its own over the disc, as the ring is.
-        let chip = container(image(kind(entry).icon()).width(BADGE).height(BADGE))
-            .padding(BADGE / 3.0)
-            .style(|_| container::Style {
-                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))),
-                border: Border {
-                    radius: BADGE.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-        let badge = container(chip)
-            .width(cell)
-            .height(disc + CELL_PAD)
-            .padding(CELL_PAD)
-            .align_right(Fill)
-            .align_bottom(Fill);
-        let content = stack![content, badge];
-        // The ring is a layer of its own over the cell: drawn in the disc's
-        // layer, a bordered quad blacks out the disc's surroundings.
-        let boxed: Element<'_, Message> = if ring {
-            stack![
-                content,
-                container(space())
-                    .width(Fill)
-                    .height(Fill)
-                    .style(|_| container::Style {
-                        border: Border {
-                            color: Color::from_rgba(1.0, 1.0, 1.0, 0.5),
-                            width: 2.0,
-                            radius: 16.0.into(),
-                        },
-                        ..Default::default()
-                    }),
-            ]
-            .into()
+                .into()
         } else {
-            content.into()
+            let rows = copies.chunks(columns).enumerate().map(|(r, chunk)| {
+                row(chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(c, &index)| self.folder_icon(r * columns + c, index, cx)))
+                .into()
+            });
+            scrollable(column(rows).padding(PAD))
+                .id(GRID)
+                .on_scroll(Message::ShelfScrolled)
+                .direction(Direction::Vertical(
+                    Scrollbar::new().width(10).scroller_width(10).margin(2),
+                ))
+                .style(|look, status| {
+                    let mut style = scrollable::default(look, status);
+                    style.vertical_rail.background =
+                        Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.06)));
+                    style.vertical_rail.scroller.background = Background::Color(theme::SILVER);
+                    style.vertical_rail.scroller.border = Border {
+                        color: INK,
+                        width: 2.0,
+                        radius: 0.0.into(),
+                    };
+                    style
+                })
+                .width(Fill)
+                .height(Fill)
+                .into()
         };
-        mouse_area(boxed)
-            .on_enter(Message::ShelfFocus(index))
+        let body = column![]
+            .push(notice)
+            .push(container(grid).height(Fill))
+            .push(self.status(cx));
+        Some((title, body.into()))
+    }
+
+    fn folder_icon<'a>(
+        &'a self,
+        at: usize,
+        index: usize,
+        cx: &Context<'a>,
+    ) -> Element<'a, Message> {
+        let entry = &self.entries[index];
+        let chosen = self.inside == at;
+        let mut words = entry.meta.title.clone();
+        if cx.picked == Some(entry.meta.id.as_str()) {
+            words = format!("▶ {words}");
+        }
+        let cell = column![
+            container(icon_image(
+                &self.face(entry).icon,
+                chosen,
+                FOLDER_ICON,
+                false
+            ))
+            .width(FOLDER_CELL.width)
+            .align_x(Horizontal::Center)
+            .padding(iced::Padding {
+                top: 8.0,
+                ..iced::Padding::ZERO
+            }),
+            name(words, chosen, FOLDER_CELL.width - 8.0),
+        ]
+        .width(FOLDER_CELL.width)
+        .height(FOLDER_CELL.height)
+        .align_x(Horizontal::Center)
+        .spacing(4);
+        mouse_area(cell)
+            .on_move(move |_| Message::ShelfFocus(index))
             .on_press(Message::ShelfPick(index))
             .on_right_press(Message::ShelfMenu(index))
             .into()
     }
 
-    fn empty<'a>(&'a self, style: Style, pointing: bool) -> Element<'a, Message> {
-        let words: Element<'_, Message> = if pointing {
-            text("Nothing kept yet. With a disc in the drive, choose Keep a copy in the bottom corner.")
-                .font(FONT)
-                .size(15)
-                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.45))
-                .align_x(Horizontal::Center)
-                .into()
-        } else {
-            ui::prompt(
-                "Nothing kept yet. With a disc in the drive, press {alt} to keep a copy.",
-                style,
-                15.0,
-                Color::from_rgba(1.0, 1.0, 1.0, 0.45),
-            )
+    /// The status bar along the bottom of a folder: what is chosen, and
+    /// what the keys do to it.
+    fn status<'a>(&'a self, cx: &Context<'a>) -> Element<'a, Message> {
+        let (what, about) = match self.focused() {
+            Some(entry) => (entry.meta.title.clone(), byline(entry)),
+            None => (String::new(), String::new()),
         };
-        let card = stack![
-            ui::Dashed {
-                color: Color::from_rgba(1.0, 1.0, 1.0, 0.15),
-                radius: 12.0,
-            },
-            container(container(words).max_width(448))
-                .padding([48, 32])
-                .center_x(Fill),
-        ];
-        container(card).width(Fill).height(160).into()
+        let red = Color::from_rgb8(0xc0, 0x10, 0x10);
+        let armed = self
+            .focused()
+            .is_some_and(|e| self.armed.as_deref() == Some(e.meta.id.as_str()));
+        let keys: Option<Element<'_, Message>> = if armed {
+            Some(if cx.pointing {
+                text("Delete? Once more to confirm")
+                    .font(FONT)
+                    .size(12)
+                    .color(red)
+                    .into()
+            } else {
+                ui::prompt("{select} again to delete", cx.style, 12.0, red)
+            })
+        } else if cx.pointing || self.focused().is_none() {
+            None
+        } else {
+            Some(ui::prompt(
+                "{accept} Play  {select} Menu  {back} Close",
+                cx.style,
+                12.0,
+                theme::faint(0.7),
+            ))
+        };
+        let line = row![
+            theme::sunken(
+                row![
+                    text(what)
+                        .font(BOLD)
+                        .size(12)
+                        .wrapping(text::Wrapping::None),
+                    text(about)
+                        .font(FONT)
+                        .size(12)
+                        .color(theme::faint(0.6))
+                        .wrapping(text::Wrapping::None),
+                ]
+                .spacing(12)
+            )
+            .width(Fill)
+            .clip(true),
+        ]
+        .push(keys.map(theme::sunken))
+        .spacing(4)
+        .align_y(Vertical::Center);
+        container(line)
+            .padding(4)
+            .width(Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(theme::SILVER)),
+                ..Default::default()
+            })
+            .into()
     }
 
-    fn menu_view<'a>(&'a self, menu: Menu, size: Size) -> Element<'a, Message> {
+    fn empty<'a>(&'a self, open: Section, cx: &Context<'a>) -> Element<'a, Message> {
+        let words = format!(
+            "No {} kept yet. With a disc in the drive, {}.",
+            open.name().to_lowercase(),
+            if cx.pointing {
+                "choose Keep a copy"
+            } else {
+                "press {alt} to keep a copy"
+            }
+        );
+        let card = stack![
+            ui::Dashed {
+                color: theme::faint(0.3),
+                radius: 4.0,
+            },
+            container(
+                container(ui::prompt(&words, cx.style, 13.0, theme::faint(0.6))).max_width(448)
+            )
+            .padding([40, 32])
+            .center_x(Fill),
+        ];
+        container(card).width(Fill).height(140).into()
+    }
+
+    /// A copy's menu, over everything: at the pointer, or in the middle of
+    /// `size` for the keys.
+    pub fn menu_view<'a>(&'a self, menu: Menu, size: Size) -> Element<'a, Message> {
         let Some(entry) = self.entries.get(menu.index) else {
             return space().into();
         };
-        const WIDTH: f32 = 256.0;
-        const HEIGHT: f32 = 132.0;
+        const WIDTH: f32 = 260.0;
+        const HEIGHT: f32 = 150.0;
         let armed = self.armed.as_deref() == Some(entry.meta.id.as_str());
-        let item = |words: String, color: Color, hover: Color, message: Message| {
-            button(text(words).font(FONT).size(14).color(color))
-                .width(Fill)
-                .padding([6, 10])
-                .on_press(message)
-                .style(move |_, status| button::Style {
-                    background: matches!(status, button::Status::Hovered | button::Status::Pressed)
-                        .then_some(Background::Color(hover)),
-                    border: Border {
-                        radius: 6.0.into(),
-                        ..Border::default()
-                    },
-                    ..button::Style::default()
-                })
-        };
+        let items = self
+            .acts(menu.index)
+            .into_iter()
+            .enumerate()
+            .map(|(i, act)| {
+                let (words, color, message) = match act {
+                    Act::Play => ("▶ Play".to_string(), INK, Message::ShelfPick(menu.index)),
+                    Act::Pin => ("Add to desktop".into(), INK, Message::ShelfPin(menu.index)),
+                    Act::Unpin => (
+                        "Remove from desktop".into(),
+                        INK,
+                        Message::ShelfPin(menu.index),
+                    ),
+                    Act::Delete => (
+                        if armed {
+                            "Delete? Again to confirm".into()
+                        } else {
+                            "Delete".into()
+                        },
+                        Color::from_rgb8(0xc0, 0x10, 0x10),
+                        Message::ShelfDelete(menu.index),
+                    ),
+                };
+                let keyed = menu.at.is_none() && menu.item == i;
+                button(text(words.to_uppercase()).font(FONT).size(13))
+                    .width(Fill)
+                    .padding([6, 10])
+                    .on_press(message)
+                    .style(move |_, status| {
+                        let hot = keyed
+                            || matches!(status, button::Status::Hovered | button::Status::Pressed);
+                        button::Style {
+                            background: hot.then_some(Background::Color(BLUE)),
+                            text_color: if hot { Color::WHITE } else { color },
+                            ..button::Style::default()
+                        }
+                    })
+                    .into()
+            });
         let panel = container(
             column![
                 container(
                     column![
                         text(entry.meta.title.clone())
                             .font(BOLD)
-                            .size(14)
-                            .color(Color::WHITE)
+                            .size(13)
+                            .color(INK)
                             .wrapping(text::Wrapping::None),
                         text(byline(entry))
                             .font(FONT)
-                            .size(12)
-                            .color(Color::from_rgba(1.0, 1.0, 1.0, 0.5))
+                            .size(11)
+                            .color(theme::faint(0.6))
                             .wrapping(text::Wrapping::None),
                     ]
                     .spacing(2)
@@ -642,50 +973,35 @@ impl Shelf {
                 .padding([6, 10])
                 .clip(true),
                 container(space())
-                    .height(1)
+                    .height(2)
                     .width(Fill)
                     .style(|_| container::Style {
-                        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.1))),
+                        background: Some(Background::Color(INK)),
                         ..Default::default()
                     }),
-                item(
-                    "▶  Play".into(),
-                    Color::WHITE,
-                    Color::from_rgba(1.0, 1.0, 1.0, 0.1),
-                    Message::ShelfPick(menu.index),
-                ),
-                item(
-                    if armed {
-                        "Delete? Choose again to confirm".into()
-                    } else {
-                        "Delete".into()
-                    },
-                    Color::from_rgb8(0xff, 0x8a, 0x8a),
-                    Color::from_rgba8(0xff, 0x6b, 0x6b, 0.15),
-                    Message::ShelfDelete(menu.index),
-                ),
             ]
-            .spacing(4),
+            .extend(items)
+            .spacing(2),
         )
         .width(WIDTH)
-        .padding(4)
+        .padding(2)
         .style(|_| container::Style {
-            background: Some(Background::Color(Color::from_rgba8(0x0e, 0x0e, 0x16, 0.95))),
+            background: Some(Background::Color(theme::PAPER)),
             border: Border {
-                color: Color::from_rgba(1.0, 1.0, 1.0, 0.1),
-                width: 1.0,
-                radius: 8.0.into(),
+                color: INK,
+                width: 2.0,
+                radius: 0.0.into(),
             },
-            shadow: Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                offset: Vector::new(0.0, 8.0),
-                blur_radius: 24.0,
-            },
+            shadow: theme::hard_shadow(4.0),
             ..Default::default()
         });
         // Kept on screen, whichever corner it was asked for in.
-        let x = menu.at.x.min(size.width - WIDTH - 8.0).max(8.0);
-        let y = menu.at.y.min(size.height - HEIGHT - 8.0).max(8.0);
+        let at = menu.at.unwrap_or(Point::new(
+            (size.width - WIDTH) / 2.0,
+            (size.height - HEIGHT) / 2.0,
+        ));
+        let x = at.x.min(size.width - WIDTH - 8.0).max(8.0);
+        let y = at.y.min(size.height - HEIGHT - 8.0).max(8.0);
         stack![
             // A click anywhere else puts the menu away.
             mouse_area(container(space()).width(Fill).height(Fill))
@@ -694,5 +1010,42 @@ impl Shelf {
             pin(panel).x(x).y(y),
         ]
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_desktop_starts_with_the_drive_and_three_folders() {
+        let mut shelf = Shelf::new();
+        shelf.favourites.clear();
+        assert_eq!(
+            shelf.spots(),
+            vec![
+                Spot::Drive,
+                Spot::Folder(Section::Sounds),
+                Spot::Folder(Section::Videos),
+                Spot::Folder(Section::Games),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_arrows_go_down_the_desktop_then_across() {
+        let mut shelf = Shelf::new();
+        shelf.favourites.clear();
+        shelf.desk_rows.set(2);
+        let _ = shelf.step(0, 1);
+        assert_eq!(shelf.chosen(), Some(Spot::Folder(Section::Sounds)));
+        let _ = shelf.step(0, 1);
+        assert_eq!(
+            shelf.chosen(),
+            Some(Spot::Folder(Section::Sounds)),
+            "the column ends"
+        );
+        let _ = shelf.step(1, 0);
+        assert_eq!(shelf.chosen(), Some(Spot::Folder(Section::Games)));
     }
 }

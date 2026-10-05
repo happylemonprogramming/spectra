@@ -1,9 +1,5 @@
 //! Everything derived from a cover, computed once when the album arrives.
-//!
-//! None of this happens per frame. The blurred backdrop in particular is a
-//! tiny image blurred on the CPU and stretched by the GPU's texture filter:
-//! a full-screen blur shader would look the same and cost fill rate on every
-//! frame, which an old laptop would feel.
+//! None of this happens per frame.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,8 +10,6 @@ use image::{Rgba, RgbaImage};
 /// Label texture size. The disc never covers more than about a thousand
 /// pixels, and mipmaps take care of it when smaller.
 const LABEL_SIZE: u32 = 1024;
-/// A shelf disc is a few hundred pixels across.
-const SHELF_LABEL_SIZE: u32 = 512;
 /// Inside this fraction of the radius a pressed disc is bare, clear hub.
 pub const HUB_RATIO: f32 = 0.31;
 
@@ -34,7 +28,8 @@ impl std::fmt::Debug for Label {
 
 pub struct Art {
     pub label: Arc<Label>,
-    pub backdrop: iced::widget::image::Handle,
+    /// The disc, flat, as an icon: for the drive's place on the desktop.
+    pub icon: Icon,
     /// The cover, small, for layouts with no room for the disc.
     pub thumbnail: iced::widget::image::Handle,
     /// The cover's characteristic colour, for tinting the room and the UI.
@@ -47,61 +42,112 @@ impl Art {
     pub fn new(cover: &RgbaImage, face: Option<&RgbaImage>) -> Self {
         let square = square(cover);
         let printed = face.map(cut_out);
+        let printed = printed.as_ref().unwrap_or(&square);
         Self {
-            label: Arc::new(label(printed.as_ref().unwrap_or(&square), LABEL_SIZE)),
-            backdrop: backdrop(&square),
+            icon: Icon::new(&disc_icon(printed)),
+            label: Arc::new(label(printed, LABEL_SIZE)),
             thumbnail: thumbnail(&square),
             accent: accent(&square),
         }
     }
 }
 
-/// What a disc on the shelf wears: its label, small, and the colour of its
-/// light. Without a cover or a scan it is a bare disc.
-pub struct Face {
-    pub label: Arc<Label>,
-    pub accent: [f32; 3],
-    /// Whether there was any art; a bare disc needs its name said.
-    pub printed: bool,
+/// A desktop icon, as it is and as it looks chosen: under a blue cast, as
+/// a chosen icon was.
+#[derive(Debug, Clone)]
+pub struct Icon {
+    pub plain: iced::widget::image::Handle,
+    pub chosen: iced::widget::image::Handle,
 }
 
-impl std::fmt::Debug for Face {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Face({:?}, printed: {})", self.label, self.printed)
+impl Icon {
+    pub fn new(image: &RgbaImage) -> Self {
+        let mut blue = image.clone();
+        for px in blue.pixels_mut() {
+            if px[3] > 0 {
+                px[0] = (f32::from(px[0]) * 0.5) as u8;
+                px[1] = (f32::from(px[1]) * 0.5) as u8;
+                px[2] = (f32::from(px[2]) * 0.5 + 127.0) as u8;
+            }
+        }
+        let handle = |i: &RgbaImage| {
+            iced::widget::image::Handle::from_rgba(i.width(), i.height(), i.as_raw().clone())
+        };
+        Self {
+            plain: handle(image),
+            chosen: handle(&blue),
+        }
     }
+}
+
+/// What a copy shows on the desktop and in its folder: its disc, flat.
+/// Without art, a bare disc.
+#[derive(Debug)]
+pub struct Face {
+    pub icon: Icon,
 }
 
 impl Face {
-    pub fn new(cover: Option<&RgbaImage>, scan: Option<&RgbaImage>) -> Self {
-        let square = cover.map(square);
-        let printed = scan.map(cut_out).or_else(|| square.clone());
-        match printed {
-            Some(printed) => Self {
-                label: Arc::new(label(&printed, SHELF_LABEL_SIZE)),
-                accent: accent(square.as_ref().unwrap_or(&printed)),
-                printed: true,
-            },
-            None => Self::blank(),
+    /// From an icon already drawn: what the cache of icons keeps.
+    pub fn from_icon(icon: RgbaImage) -> Self {
+        Self {
+            icon: Icon::new(&icon),
         }
     }
 
-    /// Clear polycarbonate, with nothing printed on it.
     pub fn blank() -> Self {
-        static BLANK: std::sync::OnceLock<Arc<Label>> = std::sync::OnceLock::new();
-        let label = BLANK
-            .get_or_init(|| {
-                Arc::new(Label {
-                    id: next_id(),
-                    levels: vec![RgbaImage::new(1, 1)],
-                })
-            })
-            .clone();
+        static BLANK: std::sync::OnceLock<Icon> = std::sync::OnceLock::new();
         Self {
-            label,
-            accent: [0.62, 0.52, 1.0],
-            printed: false,
+            icon: BLANK
+                .get_or_init(|| Icon::new(&disc_icon(&RgbaImage::new(1, 1))))
+                .clone(),
         }
     }
+}
+
+/// The side of a disc icon, drawn at about twice the size it is shown.
+pub const ICON: u32 = 160;
+
+/// A disc as a desktop icon: flat, face on, its print out to a silver rim,
+/// a clear hub with its hole, a dark outline, and a hard shadow down and to
+/// the right - pixel art's way of standing a thing off the desktop.
+pub fn disc_icon(print: &RgbaImage) -> RgbaImage {
+    const SHADOW: f32 = 6.0;
+    let print = imageops::resize(print, ICON, ICON, FilterType::Triangle);
+    let c = ICON as f32 / 2.0 - SHADOW / 2.0;
+    let r = c - 2.0;
+    let mut out = RgbaImage::new(ICON, ICON);
+    for (x, y, px) in out.enumerate_pixels_mut() {
+        let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+        let d = (fx - c).hypot(fy - c) / r;
+        let shade = (fx - c - SHADOW).hypot(fy - c - SHADOW) / r;
+        let ring = |d: f32| (0.12..=1.0).contains(&d);
+        *px = if ring(d) {
+            let rgba = if d > 0.965 || d < 0.14 {
+                [26, 26, 26, 255]
+            } else if d > 0.93 {
+                [200, 205, 212, 255]
+            } else if d > HUB_RATIO {
+                let p = print.get_pixel(x.min(ICON - 1), y.min(ICON - 1));
+                // Unprinted is clear plastic, which shows grey here.
+                let a = f32::from(p[3]) / 255.0;
+                let clear = [206.0, 212.0, 220.0];
+                let mixed: [u8; 3] =
+                    std::array::from_fn(|i| (f32::from(p[i]) * a + clear[i] * (1.0 - a)) as u8);
+                [mixed[0], mixed[1], mixed[2], 255]
+            } else if d > HUB_RATIO - 0.025 {
+                [150, 156, 166, 255]
+            } else {
+                [222, 227, 234, 255]
+            };
+            image::Rgba(rgba)
+        } else if ring(shade) {
+            image::Rgba([0, 0, 64, 90])
+        } else {
+            image::Rgba([0, 0, 0, 0])
+        };
+    }
+    out
 }
 
 fn next_id() -> u64 {
@@ -110,7 +156,7 @@ fn next_id() -> u64 {
 }
 
 /// The largest centred square: covers are nearly square, scans sometimes not.
-fn square(cover: &RgbaImage) -> RgbaImage {
+pub fn square(cover: &RgbaImage) -> RgbaImage {
     let side = cover.width().min(cover.height());
     let (x, y) = ((cover.width() - side) / 2, (cover.height() - side) / 2);
     imageops::crop_imm(cover, x, y, side, side).to_image()
@@ -119,7 +165,7 @@ fn square(cover: &RgbaImage) -> RgbaImage {
 /// A scan of a disc, cropped to the disc. Scans come as cut-outs on a
 /// transparent background, so the disc is wherever the scan is opaque. An
 /// opaque scan is taken as it is.
-fn cut_out(scan: &RgbaImage) -> RgbaImage {
+pub fn cut_out(scan: &RgbaImage) -> RgbaImage {
     let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
     for (x, y, px) in scan.enumerate_pixels() {
         if px[3] >= 128 {
@@ -168,14 +214,6 @@ fn label(square: &RgbaImage, size: u32) -> Label {
     }
 }
 
-/// The cover, tiny and heavily blurred. Stretched to the window it becomes a
-/// soft wash of the album's colours.
-fn backdrop(square: &RgbaImage) -> iced::widget::image::Handle {
-    let small = imageops::resize(square, 48, 48, FilterType::Triangle);
-    let blurred = imageops::blur(&small, 5.0);
-    iced::widget::image::Handle::from_rgba(blurred.width(), blurred.height(), blurred.into_raw())
-}
-
 /// Enough pixels for a thumbnail at twice its largest size.
 fn thumbnail(square: &RgbaImage) -> iced::widget::image::Handle {
     let small = imageops::resize(square, 192, 192, FilterType::CatmullRom);
@@ -184,7 +222,7 @@ fn thumbnail(square: &RgbaImage) -> iced::widget::image::Handle {
 
 /// The most characterful colour: an average weighted towards saturated,
 /// bright pixels, so a mostly black cover with a red logo reads as red.
-fn accent(square: &RgbaImage) -> [f32; 3] {
+pub fn accent(square: &RgbaImage) -> [f32; 3] {
     let small = imageops::resize(square, 24, 24, FilterType::Triangle);
     let (mut sum, mut weight) = ([0.0f32; 3], 0.0f32);
     for &Rgba([r, g, b, _]) in small.pixels() {

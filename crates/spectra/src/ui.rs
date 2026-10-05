@@ -1,5 +1,5 @@
-//! Pieces of the screen the stage and the library share: button prompts
-//! drawn as the buttons look, quiet buttons, and the library's own light.
+//! Pieces of the screen the stage and your discs share: button prompts,
+//! drawn as the buttons look, and a dashed edge.
 //!
 //! The prompts are Kenney's Input Prompts (CC0), as Rainbow Player uses
 //! them, rasterised once to small PNGs in `assets/prompts` and built in: a
@@ -13,8 +13,8 @@ use iced::advanced::mouse;
 use iced::advanced::renderer::{self, Quad};
 use iced::advanced::widget::{Tree, Widget};
 use iced::alignment::Vertical;
-use iced::widget::{button, image, row, text};
-use iced::{Background, Border, Color, Element, Length, Rectangle, Size};
+use iced::widget::{image, row, text};
+use iced::{Color, Element, Length, Rectangle, Size};
 
 use crate::{FONT, Message};
 
@@ -96,6 +96,22 @@ impl Glyph {
             "library" => Self::Library,
             _ => return None,
         })
+    }
+
+    /// What the key is called, on its cap.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Accept => "ENTER",
+            Self::Back => "BKSP",
+            Self::Alt => "C",
+            Self::Select => "M",
+            Self::Library => "L",
+            Self::Start => "SPACE",
+            Self::Prev => "←",
+            Self::Next => "→",
+            Self::Up => "↑",
+            Self::Down => "↓",
+        }
     }
 
     /// The icon's file, without `.png`.
@@ -211,6 +227,13 @@ pub fn prompt<'a>(template: &str, style: Style, size: f32, color: Color) -> Elem
             line = line.push(text(words.to_string()).font(FONT).size(size).color(color));
         }
         let name = &rest[open + 1..close];
+        // Keys are drawn as key caps in the pixel face: the pictures of
+        // them are pale grey, and vanish on the pale windows.
+        if let (Style::Keys, Some(glyph)) = (style, Glyph::parse(name)) {
+            line = line.push(key_cap(glyph.key(), size, color));
+            rest = &rest[close + 1..];
+            continue;
+        }
         match Glyph::parse(name).and_then(|g| icon(g.icon(style))) {
             // The art has an eighth of padding on each side, so it is drawn
             // larger than the text, as Rainbow Player draws it.
@@ -236,96 +259,31 @@ pub fn prompt<'a>(template: &str, style: Style, size: f32, color: Color) -> Elem
     if !rest.is_empty() {
         line = line.push(text(rest.to_string()).font(FONT).size(size).color(color));
     }
-    line.into()
+    // Onto a second line rather than off the edge, in a narrow window.
+    line.wrap().into()
 }
 
-/// A button that stays out of the way until the pointer finds it: small,
-/// dim and pill-shaped, as Rainbow Player's quiet buttons are.
-pub fn quiet<'a>(
-    content: impl Into<Element<'a, Message>>,
-    on_press: Message,
-) -> Element<'a, Message> {
-    button(content)
-        .padding([8, 16])
-        .on_press(on_press)
-        .style(|_, status| {
-            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            button::Style {
-                background: hovered
-                    .then_some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.05))),
-                text_color: Color::from_rgba(1.0, 1.0, 1.0, if hovered { 0.8 } else { 0.45 }),
-                border: Border {
-                    radius: 999.0.into(),
-                    ..Border::default()
-                },
-                ..button::Style::default()
-            }
+/// A key, drawn as its cap: its name in the pixel face, in a frame.
+fn key_cap<'a>(name: &'static str, size: f32, color: Color) -> Element<'a, Message> {
+    iced::widget::container(text(name).font(FONT).size(size * 0.85).color(color))
+        .padding([1.0, size * 0.35])
+        .style(move |_| iced::widget::container::Style {
+            border: iced::Border {
+                color,
+                width: 1.5,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
         })
         .into()
 }
 
-/// Text in a quiet button: small and dim, in capitals.
-pub fn quiet_text<'a>(words: &str) -> Element<'a, Message> {
-    text(words.to_uppercase()).font(FONT).size(13).into()
-}
-
-/// What a disc holds, for the small picture on it in the library.
+/// What a disc holds: which section of your discs it goes in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Game,
     Film,
     Music,
-}
-
-impl Kind {
-    /// Its picture: a controller, a screen or a pair of notes, white, from
-    /// `assets/kinds`. The controller is Kenney's (CC0); the others are drawn
-    /// to match it. Decoded the first time each is shown.
-    pub fn icon(self) -> image::Handle {
-        static DECODED: [OnceLock<image::Handle>; 3] =
-            [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-        let (slot, bytes): (usize, &[u8]) = match self {
-            Self::Game => (0, include_bytes!("../assets/kinds/game.png")),
-            Self::Film => (1, include_bytes!("../assets/kinds/film.png")),
-            Self::Music => (2, include_bytes!("../assets/kinds/music.png")),
-        };
-        DECODED[slot]
-            .get_or_init(|| {
-                let pixels = ::image::load_from_memory(bytes)
-                    .expect("built-in icon decodes")
-                    .to_rgba8();
-                image::Handle::from_rgba(pixels.width(), pixels.height(), pixels.into_raw())
-            })
-            .clone()
-    }
-}
-
-/// The library's light: a soft blue glow from the top of the screen, made
-/// once as a small image the GPU stretches, like the stage's backdrop.
-pub fn glow() -> image::Handle {
-    static GLOW: OnceLock<image::Handle> = OnceLock::new();
-    GLOW.get_or_init(|| {
-        const W: u32 = 64;
-        const H: u32 = 40;
-        let base = [6.0f32, 6.0, 10.0];
-        let tint = [27.0f32, 34.0, 64.0];
-        let mut pixels = Vec::with_capacity((W * H * 4) as usize);
-        for y in 0..H {
-            for x in 0..W {
-                // An ellipse 90% wide and 60% tall, centred at the top edge.
-                let dx = (x as f32 + 0.5) / W as f32 - 0.5;
-                let dy = (y as f32 + 0.5) / H as f32;
-                let r = ((dx / 0.9).powi(2) + (dy / 0.6).powi(2)).sqrt();
-                let t = (1.0 - r / 0.7).clamp(0.0, 1.0) * (0xaa as f32 / 255.0);
-                for c in 0..3 {
-                    pixels.push((base[c] + (tint[c] - base[c]) * t) as u8);
-                }
-                pixels.push(255);
-            }
-        }
-        image::Handle::from_rgba(W, H, pixels)
-    })
-    .clone()
 }
 
 /// A rounded rectangle's edge in dashes, behind whatever is stacked on it.

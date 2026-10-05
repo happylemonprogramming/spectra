@@ -88,6 +88,100 @@ pub fn for_copy(entry: &Entry) -> Pictures {
     }
 }
 
+/// What is printed on a copy's disc, as a picture: a scan of the disc kept
+/// with it or cached for its game, or failing that its cover. Never the
+/// network. True for a scan, which wants cutting out.
+fn print_path(entry: &Entry) -> Option<(PathBuf, bool)> {
+    let kept = |name: &str| Some(entry.dir.join(name)).filter(|p| p.is_file());
+    let cached = |name: Option<String>| {
+        name.and_then(|n| cache_dir().map(|d| d.join(n)))
+            .filter(|p| p.is_file())
+    };
+    let scan = kept(FACE).or_else(|| {
+        cached(
+            entry
+                .meta
+                .disc_art
+                .as_deref()
+                .filter(|f| is_file_name(f))
+                .map(|f| format!("disc-{f}")),
+        )
+    });
+    if let Some(scan) = scan {
+        return Some((scan, true));
+    }
+    let cover = kept(COVER).or_else(|| {
+        let mut game = GameIdentity::new(entry.meta.system?);
+        game.serial = entry.meta.serial.clone();
+        cached(cover_url(&game).map(|(name, _)| name))
+    })?;
+    Some((cover, false))
+}
+
+/// A copy's face: its disc as an icon. Decoding a full-size picture and
+/// drawing the disc from it is most of a second's work for a desktop of
+/// them, so the icon is kept, with its colour, as raw pixels: they open in
+/// the time it takes to read them. Kept under the picture's own path, size
+/// and time, so a new picture makes a new icon.
+pub fn face_for_copy(entry: &Entry) -> crate::art::Face {
+    use crate::art::{self, Face};
+    let Some((print, scan)) = print_path(entry) else {
+        return Face::blank();
+    };
+    let kept = std::fs::metadata(&print).ok().and_then(|meta| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(&print, meta.len(), meta.modified().ok()), &mut hasher);
+        let name = format!("icon-{:016x}.rgba", std::hash::Hasher::finish(&hasher));
+        Some(cache_dir()?.join(name))
+    });
+    if let Some((icon, _)) = kept.as_deref().and_then(read_sleeve) {
+        return Face::from_icon(icon);
+    }
+    let Some(image) = decode(&print) else {
+        return Face::blank();
+    };
+    let print = if scan {
+        art::cut_out(&image)
+    } else {
+        art::square(&image)
+    };
+    let icon = art::disc_icon(&print);
+    let accent = art::accent(&print);
+    if let Some(kept) = &kept {
+        write_sleeve(kept, &icon, accent);
+    }
+    Face::from_icon(icon)
+}
+
+/// A small picture as kept: its width and height, its colour, its pixels.
+fn read_sleeve(path: &Path) -> Option<(RgbaImage, [f32; 3])> {
+    let bytes = std::fs::read(path).ok()?;
+    let word = |i: usize| {
+        bytes
+            .get(i * 4..i * 4 + 4)
+            .map(|b| [b[0], b[1], b[2], b[3]])
+    };
+    let (w, h) = (u32::from_le_bytes(word(0)?), u32::from_le_bytes(word(1)?));
+    let accent = [2, 3, 4].map(|i| word(i).map_or(0.0, f32::from_le_bytes));
+    let image = RgbaImage::from_raw(w, h, bytes.get(20..)?.to_vec())?;
+    Some((image, accent))
+}
+
+fn write_sleeve(path: &Path, small: &RgbaImage, accent: [f32; 3]) {
+    let mut bytes = Vec::with_capacity(20 + small.as_raw().len());
+    bytes.extend(small.width().to_le_bytes());
+    bytes.extend(small.height().to_le_bytes());
+    for c in accent {
+        bytes.extend(c.to_le_bytes());
+    }
+    bytes.extend(small.as_raw());
+    // Whole or not at all: written aside, then put in place.
+    let part = path.with_extension("part");
+    if std::fs::write(&part, bytes).is_ok() {
+        let _ = std::fs::rename(&part, path);
+    }
+}
+
 pub const COVER: &str = "cover.jpg";
 pub const FACE: &str = "face.png";
 
@@ -169,6 +263,17 @@ pub fn cache_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_kept_sleeve_reads_back_as_it_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sleeve.rgba");
+        let small = image::RgbaImage::from_fn(3, 5, |x, y| image::Rgba([x as u8, y as u8, 7, 255]));
+        super::write_sleeve(&path, &small, [0.25, 0.5, 0.75]);
+        let (read, accent) = super::read_sleeve(&path).unwrap();
+        assert_eq!(read, small);
+        assert_eq!(accent, [0.25, 0.5, 0.75]);
+    }
+
     use super::*;
 
     #[test]

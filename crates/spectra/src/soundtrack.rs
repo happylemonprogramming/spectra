@@ -43,6 +43,31 @@ pub fn game_id(entry: &Entry) -> &str {
     entry.meta.id.strip_suffix(SUFFIX).unwrap_or(&entry.meta.id)
 }
 
+/// Whether a game was last heard to have music. Listening reads the whole
+/// disc, a few hundred milliseconds a game, so the answer is kept: the
+/// soundtrack is on the shelf from the first frame, not slotted in after,
+/// moving everything along. Kept under the copy's image, its size and its
+/// time, so it is asked again of a copy kept again.
+pub fn remembered(game: &Entry) -> Option<bool> {
+    let answer = std::fs::read(note(game)?).ok()?;
+    Some(answer == b"music")
+}
+
+pub fn remember(game: &Entry, music: bool) {
+    if let Some(path) = note(game) {
+        let _ = std::fs::write(path, if music { "music" } else { "none" });
+    }
+}
+
+fn note(game: &Entry) -> Option<std::path::PathBuf> {
+    let bin = game.bin();
+    let meta = std::fs::metadata(&bin).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&(&bin, meta.len(), meta.modified().ok()), &mut hasher);
+    let name = format!("music-{:016x}", std::hash::Hasher::finish(&hasher));
+    Some(crate::artwork::cache_dir()?.join(name))
+}
+
 /// The music on a kept game's copy - its CD audio, or else music files -
 /// or None if it has none. Reads all of it, so off the UI thread.
 pub fn load(entry: &Entry) -> Option<Soundtrack> {

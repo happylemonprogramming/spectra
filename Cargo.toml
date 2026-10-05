@@ -28,3 +28,12 @@ panic = "abort"
 # Dependencies (iced, wgpu, naga) optimised for size; Spectra's own code for speed.
 [profile.release.package."*"]
 opt-level = "s"
+
+# For trying changes: as fast to run as a release build, near enough, but
+# without the whole-program pass that makes one take minutes to link.
+# `cargo run --profile fast -p spectra`
+[profile.fast]
+inherits = "release"
+codegen-units = 16
+lto = false
+incremental = true

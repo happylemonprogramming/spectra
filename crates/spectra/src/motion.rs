@@ -15,9 +15,6 @@ const HOLD_SECONDS: f32 = 2.1;
 /// Turns on arrival.
 const SHOWCASE_TURNS: u8 = 2;
 const PLAYING_RPM: f32 = 320.0;
-/// A disc on the shelf that is not in focus, against one that is.
-const SHELF_REST: f32 = 0.84;
-
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Pose {
     /// About the vertical axis: flips, the three-quarter turn, sway.
@@ -28,7 +25,7 @@ pub struct Pose {
     pub spin: f32,
     /// 0 invisible to 1 fully present.
     pub presence: f32,
-    /// Size against a disc that fills its box: smaller at rest on the shelf.
+    /// Size against a disc that fills its box.
     pub zoom: f32,
 }
 
@@ -92,32 +89,6 @@ impl Motion {
             zoom: 1.0,
             zoom_to: 1.0,
             reduced,
-        }
-    }
-
-    /// A disc on the library's shelf: it fades in at rest, label side out,
-    /// and smaller than the one in focus.
-    pub fn shelved(reduced: bool) -> Self {
-        let mut motion = Self::new(reduced);
-        motion.turns_left = 0;
-        motion.zoom = SHELF_REST;
-        motion.zoom_to = SHELF_REST;
-        motion
-    }
-
-    /// The shelf's focus arrived or left. The disc that has just been
-    /// reached turns straight away, rather than sitting through a hold first;
-    /// one that is left finishes the turn it is in, which brings the label
-    /// back round.
-    pub fn set_focused(&mut self, focused: bool) {
-        self.zoom_to = if focused { 1.0 } else { SHELF_REST };
-        if focused {
-            if !self.reduced {
-                self.turns_left = SHOWCASE_TURNS;
-                self.hold = self.hold.min(0.15);
-            }
-        } else {
-            self.turns_left = 0;
         }
     }
 
@@ -221,19 +192,6 @@ mod tests {
         assert!(m.moving());
         run(&mut m, 15.0);
         assert!(!m.moving(), "still moving after the showcase");
-    }
-
-    #[test]
-    fn a_shelved_disc_rests_label_out_after_losing_focus() {
-        let mut m = Motion::shelved(false);
-        m.set_focused(true);
-        // Part way through the first turn, read side to camera.
-        run(&mut m, 1.1);
-        m.set_focused(false);
-        run(&mut m, 15.0);
-        assert!(!m.moving(), "still moving after losing focus");
-        assert_eq!(m.pose().turn.cos().signum(), 1.0, "rests read side out");
-        assert_eq!(m.pose().zoom, SHELF_REST);
     }
 
     #[test]
