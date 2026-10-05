@@ -44,6 +44,13 @@ pub enum Request {
     Next,
     Previous,
     Stop,
+    /// Play on the TV, through Sunshine, or come back from it. `mode` is the
+    /// size the TV asked for, `WIDTHxHEIGHT@FPS`.
+    Tv {
+        on: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+    },
     Quit,
 }
 
@@ -90,6 +97,10 @@ pub struct Status {
     pub in_film: bool,
     /// The drive is busy keeping a copy of the disc.
     pub copying: bool,
+    /// The TV: `off`, `starting` (Sunshine is getting ready), `ready` (for
+    /// Moonlight to open Spectra) or `on` (on the TV's screen).
+    #[serde(default)]
+    pub tv: String,
     /// The line under the title: what can be done now, or what went wrong.
     pub note: Option<String>,
 }
@@ -262,6 +273,21 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"command":"pause"}"#).unwrap(),
             Request::Pause
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Tv {
+                on: true,
+                mode: Some("3840x2160@60".into())
+            })
+            .unwrap(),
+            r#"{"command":"tv","on":true,"mode":"3840x2160@60"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"command":"tv","on":false}"#).unwrap(),
+            Request::Tv {
+                on: false,
+                mode: None
+            }
         );
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"command":"play","target":"disc","track":null}"#)

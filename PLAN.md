@@ -17,7 +17,9 @@ can read.
 | Hardware | Phases 0-2 and 4: any name-brand USB DVD drive (about $20). It reads every CD and DVD format Spectra plays except GameCube, Wii and Xbox. Phase 3 and Blu-ray need a drive on LG's MT1959 platform, which OmniDrive runs on - ideally a used internal LG Blu-ray drive in a USB enclosure, checked against the [Redump OmniDrive page](https://wiki.redump.info/OmniDrive). Selling hardware is out of scope |
 | Stack | Rust throughout. The UI is [iced](https://iced.rs) 0.14 on wgpu, with the disc as a wgpu shader. Chosen over Tauri by the UI weight spike (`docs/spikes.md`): a quarter of the memory of an empty WebKitGTK page, with the whole screen built |
 | License | GPL-3.0-or-later, the same as Rainbow Player, so its code can be reused |
-| Emulators | Hosted, not forked. Standalone programs or libretro cores do the emulation; Spectra identifies the disc, routes it, and supplies the UI |
+| Offline | Every disc Spectra supports plays without a network once it is installed. The installer sets up every engine while there is one, accepted for now over fetching an engine when a disc first needs it. Only engines tested on real discs are installed: today VLC and `libdvdcss` for DVDs, RetroArch with PCSX-ReARMed for PS1 and Spectra's Play! for PS2, about 45 MB. Another console's engine joins once one of its discs has played. `--no-engines` installs Spectra alone. Names and pictures found online are kept, so a disc looked up once looks the same offline |
+| Firmware | The user's own. Spectra never ships, downloads or points to console firmware (BIOS). A user who has dumped it from their own console hands Spectra the file (`spectra firmware add`), which is recognised by its checksum and copied into RetroArch's system folder. Cores that need none come after the best core, so a disc still plays without it |
+| Emulators | Hosted, with our own patched build when upstream lags. Standalone programs or libretro cores do the emulation; Spectra identifies the disc, routes it, and supplies the UI. A fix Spectra needs is sent upstream and also kept in `emulators/<name>/patches`, applied to a pinned upstream commit by `emulators/<name>/build.sh`, so users have it whether or not it is merged. A patch is dropped once upstream has it |
 
 ## Principles
 
@@ -29,7 +31,8 @@ can read.
 4. **Emulators see a file.** In the end every engine reads a disc image, and
    Spectra decides whether that image is backed by the drive, a cache or a dump.
 5. **Nothing legally doubtful ships.** No BIOS files, keys or cracks. CSS and
-   AACS come from the system's `libdvdcss` and `libaacs`.
+   AACS come from the system's `libdvdcss` and `libaacs`. Firmware is only
+   ever the user's own, from their own console.
 6. **Lean, in the Omarchy spirit.** Fast to open, nothing running when
    nothing is happening, small to install, and fine on an old laptop. Spectra
    should never be what makes a machine slow: when a game runs, the emulator
@@ -50,7 +53,7 @@ build.
 | Spectra's memory while a game runs | < 20 MB | not built yet |
 | GPU while the menu sits idle | 0% | 0% above the desktop's own baseline |
 | CPU while the disc spins | none set | ~14% of one core at 60 Hz: iced lays the whole view out every frame |
-| Emulators bundled | none: installed when a disc first needs them | none |
+| Engines installed with Spectra | every tested one, for offline | about 45 MB: RetroArch 17 MB, VLC's DVD pieces ~14 MB, PCSX-ReARMed 2 MB, Play! 9.9 MB (built by `emulators/play/build.sh`) |
 
 How the design keeps to them:
 
@@ -75,19 +78,24 @@ How the design keeps to them:
   download, 14.6 MB installed, against 169 MB for the full `vlc` package.
   It runs through XWayland: VLC 3 cannot open a Wayland window on Hyprland,
   and Omarchy runs XWayland anyway (spike 6).
-- **What installs with Spectra, and what on demand.** Spectra's package
-  depends on what DVDs need - those VLC pieces and `libdvdcss`, about 15 MB -
-  because a DVD is the likeliest first disc, and an install prompt then would
-  spoil the first impression. None of it is copied into Spectra: `libdvdcss`
-  is legally delicate to distribute, and system packages get security
-  fixes. The package also loads the `sg` module at boot, if spike 1 shows it
-  is needed.
-- **Emulators on demand.** The first PS2 disc offers to install PCSX2;
-  nobody downloads Dolphin to play CDs.
+- **Every tested engine installs with Spectra.** A disc should play the
+  first time it goes in, network or not, so the installer sets up every
+  engine at once: the VLC pieces and `libdvdcss` for DVDs, RetroArch,
+  PCSX-ReARMed from libretro's buildbot (Arch does not package it), and
+  Spectra's Play! (built by `emulators/play/build.sh` for now; a ready-made build to
+  download comes once the repository is public). None of it is copied into
+  Spectra: `libdvdcss` is legally delicate to distribute, and system
+  packages get security fixes. Installed engines cost disk, not memory or
+  CPU: nothing runs until a disc does. Phase 3's engines (Dolphin, xemu)
+  are larger, and are weighed again when they come.
 - **Old laptops.** Spectra itself, music, films and CD-era consoles should
   run on roughly a 2012-era laptop. PS2, GameCube and Wii need a stronger CPU,
   and original Xbox a modern one; that is the emulators' floor, and Spectra
   says so when a disc is inserted rather than stuttering.
+- **Power saver is the user's choice.** In power-saver mode Midnight Club
+  ran at half speed, with half its sound missing; balanced was enough. When
+  a PS2 game is ready to play in power saver, the window says to expect
+  stutter and choppy sound, and leaves the mode alone.
 
 ## Architecture
 
@@ -250,7 +258,9 @@ Get the core experience working for the most common discs.
       core when there is no BIOS
 - [ ] PS1 through `retroarch -L beetle_psx_hw`
 - [ ] BIOS setup screen: drop files in, check their hashes, show what each
-      system is missing
+      system is missing. The checking is done, from the command line:
+      `spectra firmware add FILE|FOLDER` and `spectra firmware`; the window
+      says when a game needs firmware
 - [ ] One gamepad-driven menu, plus a hotkey to leave a game (close the
       engine and focus Spectra through `hyprctl`)
 
@@ -269,7 +279,13 @@ you insert it, with no terminal.
       before boots from the cache
 - [ ] Move the Phase 1 engines onto `vdisc`
 - [ ] Saturn (Kronos or Yabause), Sega CD, PC Engine CD, Neo Geo CD, 3DO,
-      CD-i, PC-FX, Amiga CD32
+      CD-i, PC-FX, Amiga CD32. Routed, untested: Beetle Saturn with the
+      user's firmware or else Yabause, Genesis Plus GX and Beetle PCE with
+      it, NeoCD with or without. Not installed with Spectra until one of
+      their discs has played. They play kept copies, except PC Engine CD
+      from the drive, as its discs carry no serial to keep a copy by. Neo
+      Geo CD discs carry none either, and NeoCD reads only images, so they
+      wait on a copy kept by another name
 - [ ] VCD/SVCD, CD+G karaoke (R–W subchannel), CD-Text
 - [ ] Library: discs seen before, with covers, save locations and per-game
       settings
@@ -374,17 +390,19 @@ for free.
 AirPlay is the gap: there is no mature open-source AirPlay mirroring sender
 on Linux, so an Apple TV without Moonlight cannot be reached.
 
-- [ ] Detect `sunshine` and offer Omarchy's `omarchy-install-service-sunshine`
+- [x] Detect `sunshine` and offer Omarchy's `omarchy-install-service-sunshine`
       when it is missing; never install it unasked
-- [ ] "Play on TV": create a 1920×1080 headless output
+- [x] "Play on TV": create a 1920×1080 headless output
       (`hyprctl output create headless`), move Spectra and the engine it
       launches there, and stream or cast that output. A straight mirror of a
-      16:10 laptop letterboxes on a 16:9 TV
+      16:10 laptop letterboxes on a 16:9 TV. Done as `SPECTRA-TV`, sized as
+      the TV asks when Sunshine starts it (`spectra tv on` as an app's prep
+      command), with Sunshine's `output_name` naming it
 - [ ] Without Sunshine, cast the output through the screencast portal
       (`gnome-network-displays`, Google Cast first, then Miracast)
 - [ ] Measure input-to-photon latency on both paths with a PS2 game, and
       record it in `docs/spikes.md`
-- [ ] While streaming, keep the machine awake: hold a systemd inhibitor so
+- [x] While streaming, keep the machine awake: hold a systemd inhibitor so
       the computer does not suspend mid-film
 
 ## Experiment: a game's music

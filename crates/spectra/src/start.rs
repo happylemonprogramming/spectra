@@ -216,9 +216,10 @@ impl Spectra {
                 let _ = settings::clear_cache();
                 self.look_round()
             }
+            // As Ctrl+Q does: off the TV first, if it is there.
             Item::Quit => {
                 let _ = std::fs::remove_file(crate::windows::socket(std::process::id()));
-                iced::exit()
+                self.quit()
             }
         }
     }

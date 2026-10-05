@@ -11,7 +11,8 @@ use serde::Serialize;
 use spectra_core::library::{self, Entry};
 
 use crate::control::{self, Reply, Request, Status, Target, TrackStatus};
-use crate::windows;
+use crate::firmware::{self, Added};
+use crate::{game, windows};
 
 const USAGE: &str = "\
 Spectra: put a disc in, and it plays.
@@ -36,6 +37,21 @@ Usage:
   spectra status [--json] What is on the stage, the drive, and what plays
   spectra windows [--json]
                           Every open window, the current one marked *
+  spectra tv on | off [--size WxH@FPS] [--json]
+                          Over to the TV's screen, which Sunshine streams to
+                          Moonlight, with what Spectra starts, or back from
+                          it. Sunshine runs this as Spectra's prep command;
+                          T in the window gets it ready. on goes to the
+                          window that got it ready, or opens one. The size is
+                          the TV's, read from Sunshine, or 1920x1080@60
+  spectra firmware [--json]
+                          Each console's firmware: which Spectra has, and
+                          which games need. It comes from your own console;
+                          Spectra never provides it
+  spectra firmware add FILE|FOLDER... [--json]
+                          Add firmware, recognised by its checksum whatever
+                          its name, to RetroArch's system folder. Other
+                          files are left alone, and nothing is overwritten
   spectra quit [--json]   Close the window
 
 Commands go to the current window - the one last looked at - or to the
@@ -84,7 +100,7 @@ fn options(args: &[String]) -> Result<(Options, Vec<String>), String> {
 
 const COMMANDS: &[&str] = &[
     "help", "--help", "-h", "open", "library", "play", "pause", "resume", "toggle", "next",
-    "previous", "prev", "stop", "status", "windows", "quit",
+    "previous", "prev", "stop", "status", "windows", "tv", "firmware", "quit",
 ];
 
 /// Run a command. None when the arguments are for opening the window in
@@ -121,6 +137,14 @@ pub fn run(args: &[String]) -> Option<i32> {
         "open" => open(&options, rest.iter().any(|a| a == "--reduced-motion")),
         "library" => list(json),
         "windows" => list_windows(json),
+        "firmware" => firmware(rest, json),
+        "tv" => match tv_request(rest) {
+            Ok(request) => tv(&options, &request),
+            Err(e) => {
+                eprintln!("spectra: {e}");
+                2
+            }
+        },
         "play" => match play_request(rest) {
             Ok(request) => {
                 let window = match target(options.window) {
@@ -207,6 +231,90 @@ fn list_windows(json: bool) -> i32 {
         println!("{mark} {:<8} {}", status.window, summary(status));
     }
     0
+}
+
+/// `on` or `off`, and the size of the TV's screen: given, or what Sunshine
+/// says the TV asked for when it runs this before a stream.
+fn tv_request(args: &[String]) -> Result<Request, String> {
+    let mut on = None;
+    let mut size = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => {}
+            "on" => on = Some(true),
+            "off" => on = Some(false),
+            "--size" => {
+                let given = args
+                    .next()
+                    .ok_or("--size needs WIDTHxHEIGHT, as 1920x1080@60")?;
+                size = Some(
+                    crate::tv::mode(given)
+                        .ok_or(format!("--size {given}: give it as 1920x1080@60"))?,
+                );
+            }
+            other => return Err(format!("tv takes on or off, not {other}")),
+        }
+    }
+    let on = on.ok_or("tv takes on or off")?;
+    let sunshine = || {
+        let var = |name| std::env::var(name).ok();
+        let (w, h) = (
+            var("SUNSHINE_CLIENT_WIDTH")?,
+            var("SUNSHINE_CLIENT_HEIGHT")?,
+        );
+        let fps = var("SUNSHINE_CLIENT_FPS").unwrap_or_else(|| "60".into());
+        crate::tv::mode(&format!("{w}x{h}@{fps}"))
+    };
+    let mode = if on { size.or_else(sunshine) } else { None };
+    Ok(Request::Tv { on, mode })
+}
+
+/// On the TV: the window named, the current one, or a new one. Off: the
+/// window that has the TV, wherever it is; with none, a screen left by a
+/// window that went without taking it away is cleared, and that is done.
+fn tv(options: &Options, request: &Request) -> i32 {
+    let json = options.json;
+    let window = match request {
+        Request::Tv { on: false, .. } => match options.window.or_else(crate::tv::holder) {
+            Some(window) => target(Some(window)),
+            None => {
+                crate::tv::clear_leftover();
+                if json {
+                    println!("{}", serde_json::json!({ "ok": true, "running": false }));
+                } else {
+                    println!("Spectra is not on the TV");
+                }
+                return 0;
+            }
+        },
+        _ => match options.window.map_or_else(
+            || waiting_for_tv().or_else(|| target(None)),
+            |named| target(Some(named)),
+        ) {
+            _ if options.new => start(false).ok(),
+            Some(window) => Some(window),
+            None if options.window.is_some() => None,
+            None => match start(false) {
+                Ok(window) => Some(window),
+                Err(e) => return fail(&e, json),
+            },
+        },
+    };
+    match window {
+        Some(window) => send(window, request, json),
+        None => not_running(options),
+    }
+}
+
+/// The window that got the TV ready, which Moonlight opening Spectra is for.
+fn waiting_for_tv() -> Option<u32> {
+    windows::running().into_iter().find(|&window| {
+        control::send(window, &Request::Status)
+            .and_then(Result::ok)
+            .and_then(|reply| reply.status)
+            .is_some_and(|status| status.tv == "ready" || status.tv == "starting")
+    })
 }
 
 fn play_request(args: &[String]) -> Result<Request, String> {
@@ -363,6 +471,140 @@ fn list(json: bool) -> i32 {
     0
 }
 
+fn firmware(args: &[String], json: bool) -> i32 {
+    let args: Vec<&String> = args.iter().filter(|a| *a != "--json").collect();
+    let system = firmware::system_dir();
+    match args.split_first() {
+        None => list_firmware(&system, json),
+        Some((add, paths)) if *add == "add" && !paths.is_empty() => {
+            let paths: Vec<_> = paths.iter().map(std::path::PathBuf::from).collect();
+            add_firmware(&paths, &system, json)
+        }
+        _ => {
+            eprintln!("spectra: firmware, or firmware add FILE|FOLDER...");
+            2
+        }
+    }
+}
+
+/// Whether the file a core looks for is there, and is the one it should be.
+fn firmware_state(system: &std::path::Path, f: &firmware::Firmware) -> &'static str {
+    let path = system.join(f.file);
+    if !path.is_file() {
+        "missing"
+    } else if firmware::recognise(&path).is_some_and(|there| there.file == f.file) {
+        "have"
+    } else {
+        "different"
+    }
+}
+
+fn list_firmware(system: &std::path::Path, json: bool) -> i32 {
+    #[derive(Serialize)]
+    struct Known {
+        #[serde(flatten)]
+        firmware: &'static firmware::Firmware,
+        needed: bool,
+        state: &'static str,
+    }
+    let known: Vec<Known> = firmware::KNOWN
+        .iter()
+        .map(|f| Known {
+            firmware: f,
+            needed: game::needs_firmware(f.system),
+            state: firmware_state(system, f),
+        })
+        .collect();
+    if json {
+        let list = serde_json::json!({ "folder": system, "firmware": known });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&list).expect("firmware serialises")
+        );
+        return 0;
+    }
+    println!("In {}, from your own consoles:", system.display());
+    let width = known
+        .iter()
+        .map(|k| k.firmware.file.len())
+        .max()
+        .unwrap_or(0);
+    let mut last = None;
+    for k in &known {
+        let f = k.firmware;
+        if last != Some(f.system) {
+            let need = if k.needed {
+                "games need one of these"
+            } else {
+                "optional: more games play with one"
+            };
+            println!("\n{}, {need}", f.system.name());
+            last = Some(f.system);
+        }
+        let state = match k.state {
+            "have" => "  have it",
+            "different" => "  a different file has this name",
+            _ => "",
+        };
+        println!("  {:width$}  {}{state}", f.file, f.what);
+    }
+    0
+}
+
+fn add_firmware(paths: &[std::path::PathBuf], system: &std::path::Path, json: bool) -> i32 {
+    let added = firmware::add(paths, system);
+    let ok = added
+        .iter()
+        .any(|(_, a)| matches!(a, Added::Copied(_) | Added::AlreadyThere(_)));
+    if json {
+        let list: Vec<_> = added
+            .iter()
+            .map(|(path, a)| {
+                let (result, f) = match a {
+                    Added::Copied(f) => ("added", Some(f)),
+                    Added::AlreadyThere(f) => ("already there", Some(f)),
+                    Added::Taken(f) => ("a different file has its name", Some(f)),
+                    Added::Unknown => ("not firmware Spectra knows", None),
+                    Added::Failed(e) => (e.as_str(), None),
+                };
+                serde_json::json!({ "file": path, "result": result, "firmware": f })
+            })
+            .collect();
+        let reply = serde_json::json!({ "ok": ok, "folder": system, "files": list });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply).expect("firmware serialises")
+        );
+        return if ok { 0 } else { 1 };
+    }
+    let others = added
+        .iter()
+        .filter(|(_, a)| matches!(a, Added::Unknown))
+        .count();
+    for (path, a) in added.iter().filter(|(_, a)| !matches!(a, Added::Unknown)) {
+        let what = |f: &firmware::Firmware| format!("{} firmware ({})", f.system.name(), f.what);
+        let line = match a {
+            Added::Copied(f) => format!("{}, added as {}", what(f), f.file),
+            Added::AlreadyThere(f) => format!("{}, already there", what(f)),
+            Added::Taken(f) => format!(
+                "{}, but a different {} is there already; left as it is",
+                what(f),
+                f.file
+            ),
+            Added::Unknown => continue,
+            Added::Failed(e) => format!("could not copy: {e}"),
+        };
+        println!("{}: {line}", path.display());
+    }
+    match others {
+        0 if added.is_empty() => eprintln!("spectra: no files there"),
+        0 => {}
+        1 if added.len() == 1 => eprintln!("spectra: not firmware Spectra knows"),
+        n => println!("{n} other files are not firmware Spectra knows; left alone"),
+    }
+    if ok { 0 } else { 1 }
+}
+
 /// Send a command to a window and say how it went.
 fn send(window: u32, request: &Request, json: bool) -> i32 {
     let Some(reply) = control::send(window, request) else {
@@ -448,6 +690,8 @@ fn say(request: &Request, reply: &Reply) {
     match request {
         Request::Quit => println!("Closed Spectra"),
         Request::Status => describe(status),
+        Request::Tv { on: true, .. } => println!("On the TV"),
+        Request::Tv { on: false, .. } => println!("Back from the TV"),
         _ => println!("{}", summary(status)),
     }
 }
@@ -491,6 +735,12 @@ fn describe(s: &Status) {
     println!("Screen: {}", s.screen);
     if s.copying {
         println!("Keeping a copy of the disc");
+    }
+    match s.tv.as_str() {
+        "on" => println!("On the TV"),
+        "ready" => println!("TV: ready for Moonlight to open Spectra"),
+        "starting" => println!("TV: Sunshine is getting ready"),
+        _ => {}
     }
     if let Some(note) = &s.note {
         println!("Note: {note}");
@@ -668,5 +918,27 @@ mod tests {
         );
         assert!(play_request(&args(&["disc", "--track", "0"])).is_err());
         assert!(play_request(&args(&["disc", "--loud"])).is_err());
+    }
+
+    #[test]
+    fn tv_reads_on_or_off_and_a_size() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            tv_request(&args(&["on", "--size", "3840x2160@60"])),
+            Ok(Request::Tv {
+                on: true,
+                mode: Some("3840x2160@60".into())
+            })
+        );
+        assert_eq!(
+            tv_request(&args(&["off", "--json"])),
+            Ok(Request::Tv {
+                on: false,
+                mode: None
+            })
+        );
+        assert!(tv_request(&args(&[])).is_err());
+        assert!(tv_request(&args(&["sideways"])).is_err());
+        assert!(tv_request(&args(&["on", "--size", "huge"])).is_err());
     }
 }

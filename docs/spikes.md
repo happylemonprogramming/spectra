@@ -212,6 +212,57 @@ keys, and asks whether the highlight moved.
 - If `key nav-*` does nothing, try `key key-nav-*` (VLC 3's older action
   names), then D-Bus. The fallback is Spectra listing titles itself.
 
+## 7. GameCube and Wii without OmniDrive
+
+OmniDrive only runs on LG's MT1959 Blu-ray drives. The question was whether
+the GUD0N, a DVD drive, could read Nintendo discs some other way, in software.
+
+GameCube and Wii discs are ordinary DVDs physically. What differs is the
+scrambling: each 16-sector block uses its own 15-bit seed, not the
+standard's, so the drive's EDC check fails and it refuses the read. FriiDump
+got round that on old LG drives by pulling the frames out of the drive's
+cache after the refusal. The GUD0N has a cache like that:
+
+- `READ BUFFER` mode 1 (`3C 01 00 OFF×3 LEN×3 00`) returns raw 2064-byte
+  frames (ID, IED, CPR_MAI, 2048 bytes, EDC), frame n at offset n × 0x810,
+  and passes through the INIC-1618L bridge. Each command returns at most
+  0xDBB0 bytes, 27 frames.
+- One READ at sector x leaves a ring of 144 frames, x onward. Reads that hit
+  the drive's own cache do not refill it.
+- The frames are already descrambled with the standard seed, and their EDC
+  checks. Since scrambling is an XOR, re-applying the standard keystream gives
+  the frame as pressed.
+- **It keeps frames it refused to return.** CSS sectors read without
+  authentication fail with `05/6F/03`, and are in the ring, whole.
+- The read-retry count (mode page 1, 30 by default) is changeable, so a dump
+  can stop the drive retrying sectors that will always fail.
+- The scrambler and the EDC are both linear over GF(2), so a block's seed is
+  one lookup in a table of all 32768 seeds' EDCs (built in 30 ms), not
+  FriiDump's brute force. 16 of 16 synthetic Nintendo frames came back.
+
+`scripts/nintendo-dump.py` does all this. On the Dude, Where's My Car? DVD,
+`dump --standard` read 30000 sectors at 2.9 MB/s with none bad, identical to
+`dd` as far as `dd` could go (it stops at the first CSS sector). At that rate
+a GameCube disc takes about 9 minutes and a single-layer Wii disc about 28.
+
+### Still needs a GameCube or Wii disc
+
+```bash
+scripts/nintendo-dump.py probe
+scripts/nintendo-dump.py dump game.iso     # if probe finds Nintendo frames
+```
+
+Three things only a real disc can answer:
+
+- Whether the drive spins one up at all, rather than calling it no medium or
+  an incompatible format. LG drives of FriiDump's era did.
+- Whether a read that fails its EDC still leaves the ring filled. Refused CSS
+  sectors do, but that refusal comes after a good read.
+- Whether a GameCube disc, 8 cm, sits in this slim tray.
+
+If the probe finds frames with Nintendo seeds, Phase 3 needs no new drive for
+GameCube and Wii.
+
 ## Results
 
 | Spike | Answer | Evidence |
@@ -222,6 +273,7 @@ keys, and asks whether the highlight moved.
 | 4. USB bridge | **BOT, works** | Same log: LG GUD0N slim drive behind an Initio INIC-1618L bridge (`13fd:0840`), `usb-storage` at 480M, subclass 02; came up as BOT, so there was no UAS to force off |
 | 5. UI weight | **Native: iced + wgpu** | Section 5 above: 25 MB vs ~220 MB, all budgets met |
 | 6. VLC for video discs | **Yes so far: through XWayland** | Section 6: lighter than mpv, GPU decoding works; menus wait for a DVD |
+| 7. GameCube and Wii without OmniDrive | **Probably: the drive keeps refused frames in a readable cache** | Section 7: raw frames over `READ BUFFER`, dump loop verified on a DVD at 2.9 MB/s; waiting on a Nintendo disc |
 
 Drive: model, firmware and USB bridge, as `spectra-discid --list` and `lsusb`
 report them:

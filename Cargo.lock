@@ -2877,6 +2877,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha1",
  "spectra-core",
  "tempfile",
 ]

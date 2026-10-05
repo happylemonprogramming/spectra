@@ -28,13 +28,25 @@ scripts/install.sh               # build and install
 scripts/install.sh --uninstall   # remove it; kept copies stay
 ```
 
-What else helps, all optional:
+The installer also sets up what plays discs, after asking, so that they
+play offline from then on: about 45 MB. Only what has been tested on real
+discs is installed. On Arch:
 
-| For | Install |
+| For | What |
 | --- | --- |
-| Full drive access | the `sg` kernel module: `sudo modprobe sg` |
-| PS1 and PS2 games | RetroArch, with the `pcsx_rearmed` and `play` cores from its Online Updater. No BIOS needed |
-| Films | VLC, and `libdvdcss` for most DVDs |
+| Music CDs | Nothing more: Spectra plays them itself |
+| DVDs | VLC without its interface, its DVD pieces, and `libdvdcss` |
+| PS1 games | RetroArch, with the `pcsx_rearmed` core |
+| PS2 games | RetroArch, with Play! built with Spectra's fixes |
+
+Saturn, Sega CD, PC Engine CD and Neo Geo CD games are routed but untested:
+with RetroArch's `mednafen_saturn` (or `yabause`), `genesis_plus_gx`,
+`mednafen_pce` or `neocd` core installed by hand, and for most of them the
+console's firmware from your own console (see [Firmware](#firmware)), they
+may play.
+
+`--no-engines` installs Spectra alone. Elsewhere, it says what to install.
+For full drive access, load the `sg` kernel module: `sudo modprobe sg`.
 
 On macOS and Windows the one-liners say Spectra is not there yet:
 `irm https://__SPECTRA_RAW_URL__/scripts/install.ps1 | iex` on Windows.
@@ -59,6 +71,47 @@ Open Spectra from the app launcher and put a disc in. Keyboard or gamepad:
 | N | | Night or day |
 | , | Home | The start menu: places, settings, players, keys, quit |
 | Backspace or Esc | B | Clear the search or filter, stop, or back |
+| T | | Get the TV ready, or stop |
+
+## On the TV
+
+With [Sunshine](https://github.com/LizardByte/Sunshine) on the computer and
+Moonlight on the TV, Spectra plays on the TV while the computer's own screen
+stays yours. Press T: Spectra starts Sunshine if it is not running and says
+when it is ready. Open Spectra in Moonlight on the TV, and only then does
+Spectra move to a screen of its own, as large as the TV asks for, with the
+films and games it starts. End the stream and it comes back; T again stops
+Sunshine. Opening Spectra from the launcher while it is on the TV brings it
+back too.
+
+Once, Sunshine is pointed at Spectra's screen, in
+`~/.config/sunshine/sunshine.conf`:
+
+```
+capture = wlr
+output_name = SPECTRA-TV
+```
+
+and Spectra is added to Sunshine's apps, with `spectra tv on` to do and
+`spectra tv off` to undo. Hyprland only, for now.
+
+## Firmware
+
+Most consoles start from firmware, a BIOS, which belongs to their maker.
+Spectra never provides it. PS2 games and Neo Geo CD games play without it;
+PS1 and Saturn games play without it too, but more of them play with it;
+Sega CD and PC Engine CD games need it.
+
+If you have dumped it from a console of your own, hand Spectra the files,
+or a folder of them, by any name:
+
+```sh
+spectra firmware add ~/bios      # copies what it recognises into RetroArch's system folder
+spectra firmware                 # what is there, and which games need what
+```
+
+Files are recognised by their checksums, the ones libretro publishes. Other
+files are left alone, and nothing already there is overwritten.
 
 ## From a terminal, or an agent
 
@@ -72,6 +125,8 @@ spectra play disc                # whatever is in the drive
 spectra pause; spectra next; spectra status
 spectra play "blue lines" --new  # a second window, playing beside the first
 spectra windows                  # every window; commands take --window PID
+spectra tv on                    # over to the TV, through Sunshine; tv off, back
+spectra firmware add ~/bios      # a console's firmware, from your own console
 spectra quit
 ```
 
