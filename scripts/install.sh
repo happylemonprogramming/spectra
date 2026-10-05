@@ -9,7 +9,8 @@
 # or from a checkout:
 #
 #   scripts/install.sh              build and install
-#   scripts/install.sh --yes        install missing build packages without asking
+#   scripts/install.sh --yes        install missing packages without asking
+#   scripts/install.sh --no-engines Spectra alone, without what plays discs
 #   scripts/install.sh --uninstall  remove what it installed (kept copies stay)
 #
 # Piped, options go after `bash -s --`. SPECTRA_REPO and SPECTRA_REF pick the
@@ -18,6 +19,12 @@
 # No sudo for Spectra itself: it goes under ~/.local. sudo is only asked for
 # to install missing build packages (a C compiler, pkg-config, the ALSA and
 # udev headers), and Rust is installed with rustup when there is none.
+#
+# Then everything that plays discs is set up now, while there is a network,
+# so that afterwards every disc plays without one: RetroArch and its cores,
+# Spectra's build of Play!, and VLC with what DVDs need. On Arch, from its
+# packages; the cores Arch does not package come from libretro's buildbot,
+# as RetroArch's own updater fetches them. About 100 MB in all.
 set -euo pipefail
 
 # Filled in once the repository has a home.
@@ -37,10 +44,12 @@ die() { printf 'spectra install: %s\n' "$*" >&2; exit 1; }
 
 yes=no
 uninstall=no
+engines=yes
 for arg in "$@"; do
 	case $arg in
 	--yes | -y) yes=yes ;;
 	--uninstall) uninstall=yes ;;
+	--no-engines) engines=no ;;
 	*) die "unknown option $arg" ;;
 	esac
 done
@@ -54,8 +63,9 @@ esac
 
 if [ "$uninstall" = yes ]; then
 	rm -fv "$bin_dir/spectra" "$bin_dir/spectra-discid" "$desktop" "$icon"
-	rm -rf "$src"
-	echo "removed Spectra; kept copies are still in $data/spectra/library"
+	rm -rf "$src" "$data/spectra/cores"
+	echo "removed Spectra and its cores; kept copies are still in $data/spectra/library"
+	echo "RetroArch, VLC and the other system packages stay; pacman removes them"
 	exit 0
 fi
 
@@ -170,17 +180,103 @@ case ":$PATH:" in
 *) echo "  $bin_dir is not on your PATH: add it to use \`spectra\` in a terminal" ;;
 esac
 
-# --- What else helps ------------------------------------------------------------
+# --- What plays discs -------------------------------------------------------------
 
+cores=$data/spectra/cores
 notes=()
 ls /dev/sg* >/dev/null 2>&1 ||
 	notes+=("Load the sg module for full drive access: sudo modprobe sg, and to keep it: echo sg | sudo tee /etc/modules-load.d/sg.conf")
-command -v retroarch >/dev/null ||
-	notes+=("For games, install RetroArch, then the pcsx_rearmed (PS1) core from its Online Updater")
-[ -f "$data/spectra/cores/play_libretro.so" ] ||
-	notes+=("For PS2 games, build Play! with Spectra's fixes: $PWD/emulators/play/build.sh (needs cmake and ninja)")
-command -v vlc >/dev/null ||
-	notes+=("For films, install VLC, and libdvdcss for most DVDs")
+
+# What Arch packages: RetroArch, the cores it has, VLC trimmed to what discs
+# need (docs/spikes.md, spike 6), and the tools to build Play!.
+arch_packages=(
+	retroarch libretro-genesis-plus-gx libretro-beetle-pce libretro-yabause
+	vlc-cli vlc-plugin-dvd vlc-plugin-bluray vlc-plugin-ffmpeg vlc-plugin-a52dec
+	vlc-plugin-pulse vlc-plugin-freetype libdvdcss
+	cmake ninja
+)
+# What it does not, from libretro's buildbot: PS1, Saturn, Neo Geo CD.
+buildbot=https://buildbot.libretro.com/nightly/linux/x86_64/latest
+buildbot_cores=(pcsx_rearmed_libretro.so mednafen_saturn_libretro.so neocd_libretro.so)
+
+has_core() {
+	local dir
+	for dir in "$cores" "${XDG_CONFIG_HOME:-$HOME/.config}/retroarch/cores" /usr/lib/libretro; do
+		[ -f "$dir/$1" ] && return 0
+	done
+	return 1
+}
+
+# The Play! the source asks for: its commit and patches, as build.sh writes
+# them beside the core.
+play_wanted() (
+	. emulators/play/upstream
+	echo "Play! $PLAY_COMMIT"
+	for patch in emulators/play/patches/*.patch; do echo "+ $(basename "$patch")"; done
+)
+
+unzip_one() {
+	if command -v bsdtar >/dev/null; then
+		bsdtar -xOf "$1" "$2"
+	elif command -v unzip >/dev/null; then
+		unzip -p "$1" "$2"
+	else
+		return 1
+	fi
+}
+
+fetch_core() {
+	local zip
+	zip=$(mktemp)
+	if curl -fsSL --proto '=https' "$buildbot/$1.zip" -o "$zip" &&
+		unzip_one "$zip" "$1" >"$cores/$1.part" && [ -s "$cores/$1.part" ]; then
+		mv "$cores/$1.part" "$cores/$1"
+		chmod 755 "$cores/$1"
+	else
+		rm -f "$cores/$1.part"
+		notes+=("Could not fetch $1 from libretro's buildbot; run this again, or get it from RetroArch's Online Updater")
+	fi
+	rm -f "$zip"
+}
+
+if [ "$engines" = yes ]; then
+	id=$(. /etc/os-release 2>/dev/null && echo "${ID:-} ${ID_LIKE:-}")
+	missing=()
+	fetch=()
+	case " $id " in
+	*" arch "*)
+		# pacman -T names what is not installed, without the network.
+		mapfile -t missing < <(pacman -T "${arch_packages[@]}" || true)
+		;;
+	*) notes+=("Install RetroArch, VLC and libdvdcss with your package manager, and the genesis_plus_gx, mednafen_pce and yabause cores from RetroArch's Online Updater") ;;
+	esac
+	for core in "${buildbot_cores[@]}"; do has_core "$core" || fetch+=("$core"); done
+	play=no
+	[ "$(cat "$cores/play_libretro.txt" 2>/dev/null)" = "$(play_wanted)" ] || play=yes
+
+	if [ ${#missing[@]} -gt 0 ] || [ ${#fetch[@]} -gt 0 ] || [ "$play" = yes ]; then
+		echo
+		say "To play every disc, offline too, Spectra sets up:"
+		[ ${#missing[@]} -gt 0 ] && echo "  sudo pacman -S --needed ${missing[*]}"
+		[ ${#fetch[@]} -gt 0 ] && echo "  from libretro's buildbot, into $cores: ${fetch[*]}"
+		[ "$play" = yes ] && echo "  Play! for PS2, built with Spectra's fixes (a few minutes)"
+		if confirm "Set them up now?"; then
+			[ ${#missing[@]} -gt 0 ] && sudo pacman -S --needed "${missing[@]}"
+			mkdir -p "$cores"
+			for core in "${fetch[@]}"; do
+				say "Fetching $core"
+				fetch_core "$core"
+			done
+			if [ "$play" = yes ]; then
+				emulators/play/build.sh "$cores" ||
+					notes+=("Play! did not build; PS2 games wait for $PWD/emulators/play/build.sh")
+			fi
+		else
+			notes+=("Without them some discs will not play: run this again to set them up")
+		fi
+	fi
+fi
+
 if [ ${#notes[@]} -gt 0 ]; then
 	echo
 	for note in "${notes[@]}"; do echo "  - $note"; done
@@ -188,3 +284,4 @@ fi
 echo
 echo "Open it from the app launcher, or: spectra open"
 echo "Put a disc in and it plays. 'spectra --help' lists the commands."
+echo "Console firmware, from your own consoles: 'spectra firmware'."

@@ -28,14 +28,17 @@ scripts/install.sh               # build and install
 scripts/install.sh --uninstall   # remove it; kept copies stay
 ```
 
-What else helps, all optional:
+The installer also sets up everything that plays discs, after asking, so
+that every disc plays offline from then on: about 100 MB. On Arch:
 
-| For | Install |
+| For | What |
 | --- | --- |
-| Full drive access | the `sg` kernel module: `sudo modprobe sg` |
-| PS1 and PS2 games | RetroArch, with the `pcsx_rearmed` and `play` cores from its Online Updater. No BIOS needed |
-| Saturn, Sega CD, PC Engine CD, Neo Geo CD games | RetroArch's `mednafen_saturn` (or `yabause`), `genesis_plus_gx`, `mednafen_pce` and `neocd` cores, and for most of them the console's firmware, from your own console: see [Firmware](#firmware) |
-| Films | VLC, and `libdvdcss` for most DVDs |
+| Films | VLC without its interface, its DVD and Blu-ray pieces, and `libdvdcss` |
+| PS2 games | Play!, built with Spectra's fixes |
+| PS1, Saturn, Sega CD, PC Engine CD, Neo Geo CD games | RetroArch, with the `pcsx_rearmed`, `mednafen_saturn`, `yabause`, `genesis_plus_gx`, `mednafen_pce` and `neocd` cores. Most of these consoles want their firmware too, from your own console: see [Firmware](#firmware) |
+
+`--no-engines` installs Spectra alone. Elsewhere, it says what to install.
+For full drive access, load the `sg` kernel module: `sudo modprobe sg`.
 
 On macOS and Windows the one-liners say Spectra is not there yet:
 `irm https://__SPECTRA_RAW_URL__/scripts/install.ps1 | iex` on Windows.

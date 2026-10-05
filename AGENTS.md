@@ -11,8 +11,9 @@ that. Working on the code instead: see [Changing the code](#changing-the-code).
 command -v spectra || curl -fsSL https://__SPECTRA_RAW_URL__/scripts/install.sh | bash -s -- --yes
 ```
 
-`--yes` installs missing build packages with sudo without asking; leave it
-out to let the user decide. The binary goes to `~/.local/bin/spectra`.
+`--yes` installs missing packages with sudo without asking, and sets up
+RetroArch, its cores, Play! and VLC so every disc plays offline (about
+100 MB); leave it out to let the user decide. The binary goes to `~/.local/bin/spectra`.
 
 ## Commands
 
