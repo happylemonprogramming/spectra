@@ -68,6 +68,16 @@ pub fn find(system: GameSystem) -> Option<Emulator> {
     })
 }
 
+/// The core that would play a system, installed, whether or not RetroArch
+/// is: for saying what is there.
+pub fn core_for(system: GameSystem) -> Option<PathBuf> {
+    let dirs = core_dirs();
+    cores(system)
+        .iter()
+        .flat_map(|&(name, _)| dirs.iter().map(move |dir| dir.join(name)))
+        .find(|path| path.is_file())
+}
+
 /// What RetroArch calls a drive: `/dev/sg0` is `cdrom://drive0.cue`. Only
 /// the sg node will do, and only a one-digit one, as RetroArch reads a
 /// single character.

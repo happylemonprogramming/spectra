@@ -32,6 +32,11 @@ pub struct Art {
     pub icon: Icon,
     /// The cover, small, for layouts with no room for the disc.
     pub thumbnail: iced::widget::image::Handle,
+    /// The cover the shape it is - a box, a poster - for beside what a
+    /// film or game is about.
+    pub poster: iced::widget::image::Handle,
+    /// Its width over its height.
+    pub poster_aspect: f32,
     /// The cover's characteristic colour, for tinting the room and the UI.
     pub accent: [f32; 3],
 }
@@ -47,6 +52,8 @@ impl Art {
             icon: Icon::new(&disc_icon(printed)),
             label: Arc::new(label(printed, LABEL_SIZE)),
             thumbnail: thumbnail(&square),
+            poster: poster(cover),
+            poster_aspect: cover.width() as f32 / cover.height().max(1) as f32,
             accent: accent(&square),
         }
     }
@@ -212,6 +219,17 @@ fn label(square: &RgbaImage, size: u32) -> Label {
         id: next_id(),
         levels,
     }
+}
+
+/// The whole cover, no taller than twice the size it is shown.
+fn poster(cover: &RgbaImage) -> iced::widget::image::Handle {
+    let scale = (360.0 / cover.height().max(1) as f32).min(1.0);
+    let (w, h) = (
+        ((cover.width() as f32 * scale).round() as u32).max(1),
+        ((cover.height() as f32 * scale).round() as u32).max(1),
+    );
+    let small = imageops::resize(cover, w, h, FilterType::CatmullRom);
+    iced::widget::image::Handle::from_rgba(small.width(), small.height(), small.into_raw())
 }
 
 /// Enough pixels for a thumbnail at twice its largest size.

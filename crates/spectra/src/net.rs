@@ -22,6 +22,11 @@ pub const ANONYMOUS: &str = "Mozilla/5.0";
 pub const SPECTRA: &str = concat!("Spectra/", env!("CARGO_PKG_VERSION"));
 
 pub fn get(url: &str, user_agent: &str) -> Get {
+    // Lookups turned off: as if offline, so nothing missing is remembered
+    // as missing.
+    if !crate::settings::online() {
+        return Get::Failed;
+    }
     let Ok(output) = Command::new("curl")
         .args(["--silent", "--location", "--max-time", "30"])
         .args(["--user-agent", user_agent])

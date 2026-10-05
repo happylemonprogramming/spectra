@@ -44,6 +44,9 @@ pub fn subscription() -> Subscription<(Pad, Remote)> {
                             Button::South => Some(Remote::Select),
                             Button::East => Some(Remote::Back),
                             Button::North => Some(Remote::Keep),
+                            Button::West => Some(Remote::Favorite),
+                            // The pad's own home button: the start menu.
+                            Button::Mode => Some(Remote::Settings),
                             Button::Start => Some(Remote::PlayPause),
                             Button::Select => Some(Remote::Menu),
                             Button::LeftTrigger => Some(Remote::Previous),

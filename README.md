@@ -45,13 +45,20 @@ Open Spectra from the app launcher and put a disc in. Keyboard or gamepad:
 
 | Key | Pad | Does |
 | --- | --- | --- |
-| Enter | A | Play the track, game or film |
+| Enter | A | Open a disc; on the stage, play the track, game or film |
 | Space | Start | Play / pause |
-| Page Up / Down | LB / RB | Previous / next track |
+| Page Up / Down | LB / RB | Previous / next track; among your discs, the next filter |
+| S, V, G | | Show only Sounds, Videos or Games; again for all |
+| Shift+F | | Show only Favorites; again for all |
+| / or Ctrl+F | | Search your discs |
+| F | X | Favorite, or not |
 | C | Y | Keep a copy of the disc |
-| L or M | Select | The library of kept copies |
-| Backspace | B | Stop, or back |
-| Esc | | Quit |
+| M | Select | Options for a disc; on the stage, your discs |
+| Delete | | Remove a kept copy (press twice) |
+| D | | The disc in the drive |
+| N | | Night or day |
+| , | Home | The start menu: places, settings, players, keys, quit |
+| Backspace or Esc | B | Clear the search or filter, stop, or back |
 
 ## From a terminal, or an agent
 

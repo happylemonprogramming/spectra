@@ -79,6 +79,8 @@ enum Glyph {
     Down,
     /// The library: L on a keyboard, the select button on a pad.
     Library,
+    /// A favourite: F on a keyboard, the left face button on a pad.
+    Star,
 }
 
 impl Glyph {
@@ -94,6 +96,7 @@ impl Glyph {
             "up" => Self::Up,
             "down" => Self::Down,
             "library" => Self::Library,
+            "star" => Self::Star,
             _ => return None,
         })
     }
@@ -111,6 +114,7 @@ impl Glyph {
             Self::Next => "→",
             Self::Up => "↑",
             Self::Down => "↓",
+            Self::Star => "F",
         }
     }
 
@@ -130,6 +134,7 @@ impl Glyph {
                     Next => "keyboard_arrow_right",
                     Up => "keyboard_arrow_up",
                     Down => "keyboard_arrow_down",
+                    Star => "keyboard_f",
                 };
             }
             Style::Pad(pad) => pad,
@@ -138,6 +143,12 @@ impl Glyph {
         // button, which is B on a Nintendo pad. Face buttons are in colour
         // only where the pad's own are.
         match (pad, self) {
+            (Pad::Ps5, Star) => "playstation_button_square",
+            (Pad::Ps4 | Pad::Ps3, Star) => "playstation_button_color_square",
+            (Pad::Xbox, Star) => "xbox_button_color_x",
+            (Pad::Switch, Star) => "switch_button_y",
+            (Pad::SteamDeck, Star) => "steamdeck_button_x",
+            (Pad::SteamController, Star) => "steam_button_x",
             (Pad::Ps5, Accept) => "playstation_button_cross",
             (Pad::Ps5, Back) => "playstation_button_circle",
             (Pad::Ps5, Alt) => "playstation_button_triangle",
@@ -264,7 +275,7 @@ pub fn prompt<'a>(template: &str, style: Style, size: f32, color: Color) -> Elem
 }
 
 /// A key, drawn as its cap: its name in the pixel face, in a frame.
-fn key_cap<'a>(name: &'static str, size: f32, color: Color) -> Element<'a, Message> {
+pub fn key_cap<'a>(name: &'static str, size: f32, color: Color) -> Element<'a, Message> {
     iced::widget::container(text(name).font(FONT).size(size * 0.85).color(color))
         .padding([1.0, size * 0.35])
         .style(move |_| iced::widget::container::Style {
@@ -380,6 +391,7 @@ mod tests {
         ];
         let glyphs = [
             "accept", "back", "alt", "select", "start", "prev", "next", "up", "down", "library",
+            "star",
         ];
         for style in styles {
             for name in glyphs {
