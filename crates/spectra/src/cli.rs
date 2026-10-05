@@ -11,7 +11,8 @@ use serde::Serialize;
 use spectra_core::library::{self, Entry};
 
 use crate::control::{self, Reply, Request, Status, Target, TrackStatus};
-use crate::windows;
+use crate::firmware::{self, Added};
+use crate::{game, windows};
 
 const USAGE: &str = "\
 Spectra: put a disc in, and it plays.
@@ -43,6 +44,14 @@ Usage:
                           T in the window gets it ready. on goes to the
                           window that got it ready, or opens one. The size is
                           the TV's, read from Sunshine, or 1920x1080@60
+  spectra firmware [--json]
+                          Each console's firmware: which Spectra has, and
+                          which games need. It comes from your own console;
+                          Spectra never provides it
+  spectra firmware add FILE|FOLDER... [--json]
+                          Add firmware, recognised by its checksum whatever
+                          its name, to RetroArch's system folder. Other
+                          files are left alone, and nothing is overwritten
   spectra quit [--json]   Close the window
 
 Commands go to the current window - the one last looked at - or to the
@@ -91,7 +100,7 @@ fn options(args: &[String]) -> Result<(Options, Vec<String>), String> {
 
 const COMMANDS: &[&str] = &[
     "help", "--help", "-h", "open", "library", "play", "pause", "resume", "toggle", "next",
-    "previous", "prev", "stop", "status", "windows", "tv", "quit",
+    "previous", "prev", "stop", "status", "windows", "tv", "firmware", "quit",
 ];
 
 /// Run a command. None when the arguments are for opening the window in
@@ -128,6 +137,7 @@ pub fn run(args: &[String]) -> Option<i32> {
         "open" => open(&options, rest.iter().any(|a| a == "--reduced-motion")),
         "library" => list(json),
         "windows" => list_windows(json),
+        "firmware" => firmware(rest, json),
         "tv" => match tv_request(rest) {
             Ok(request) => tv(&options, &request),
             Err(e) => {
@@ -459,6 +469,140 @@ fn list(json: bool) -> i32 {
         );
     }
     0
+}
+
+fn firmware(args: &[String], json: bool) -> i32 {
+    let args: Vec<&String> = args.iter().filter(|a| *a != "--json").collect();
+    let system = firmware::system_dir();
+    match args.split_first() {
+        None => list_firmware(&system, json),
+        Some((add, paths)) if *add == "add" && !paths.is_empty() => {
+            let paths: Vec<_> = paths.iter().map(std::path::PathBuf::from).collect();
+            add_firmware(&paths, &system, json)
+        }
+        _ => {
+            eprintln!("spectra: firmware, or firmware add FILE|FOLDER...");
+            2
+        }
+    }
+}
+
+/// Whether the file a core looks for is there, and is the one it should be.
+fn firmware_state(system: &std::path::Path, f: &firmware::Firmware) -> &'static str {
+    let path = system.join(f.file);
+    if !path.is_file() {
+        "missing"
+    } else if firmware::recognise(&path).is_some_and(|there| there.file == f.file) {
+        "have"
+    } else {
+        "different"
+    }
+}
+
+fn list_firmware(system: &std::path::Path, json: bool) -> i32 {
+    #[derive(Serialize)]
+    struct Known {
+        #[serde(flatten)]
+        firmware: &'static firmware::Firmware,
+        needed: bool,
+        state: &'static str,
+    }
+    let known: Vec<Known> = firmware::KNOWN
+        .iter()
+        .map(|f| Known {
+            firmware: f,
+            needed: game::needs_firmware(f.system),
+            state: firmware_state(system, f),
+        })
+        .collect();
+    if json {
+        let list = serde_json::json!({ "folder": system, "firmware": known });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&list).expect("firmware serialises")
+        );
+        return 0;
+    }
+    println!("In {}, from your own consoles:", system.display());
+    let width = known
+        .iter()
+        .map(|k| k.firmware.file.len())
+        .max()
+        .unwrap_or(0);
+    let mut last = None;
+    for k in &known {
+        let f = k.firmware;
+        if last != Some(f.system) {
+            let need = if k.needed {
+                "games need one of these"
+            } else {
+                "optional: more games play with one"
+            };
+            println!("\n{}, {need}", f.system.name());
+            last = Some(f.system);
+        }
+        let state = match k.state {
+            "have" => "  have it",
+            "different" => "  a different file has this name",
+            _ => "",
+        };
+        println!("  {:width$}  {}{state}", f.file, f.what);
+    }
+    0
+}
+
+fn add_firmware(paths: &[std::path::PathBuf], system: &std::path::Path, json: bool) -> i32 {
+    let added = firmware::add(paths, system);
+    let ok = added
+        .iter()
+        .any(|(_, a)| matches!(a, Added::Copied(_) | Added::AlreadyThere(_)));
+    if json {
+        let list: Vec<_> = added
+            .iter()
+            .map(|(path, a)| {
+                let (result, f) = match a {
+                    Added::Copied(f) => ("added", Some(f)),
+                    Added::AlreadyThere(f) => ("already there", Some(f)),
+                    Added::Taken(f) => ("a different file has its name", Some(f)),
+                    Added::Unknown => ("not firmware Spectra knows", None),
+                    Added::Failed(e) => (e.as_str(), None),
+                };
+                serde_json::json!({ "file": path, "result": result, "firmware": f })
+            })
+            .collect();
+        let reply = serde_json::json!({ "ok": ok, "folder": system, "files": list });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply).expect("firmware serialises")
+        );
+        return if ok { 0 } else { 1 };
+    }
+    let others = added
+        .iter()
+        .filter(|(_, a)| matches!(a, Added::Unknown))
+        .count();
+    for (path, a) in added.iter().filter(|(_, a)| !matches!(a, Added::Unknown)) {
+        let what = |f: &firmware::Firmware| format!("{} firmware ({})", f.system.name(), f.what);
+        let line = match a {
+            Added::Copied(f) => format!("{}, added as {}", what(f), f.file),
+            Added::AlreadyThere(f) => format!("{}, already there", what(f)),
+            Added::Taken(f) => format!(
+                "{}, but a different {} is there already; left as it is",
+                what(f),
+                f.file
+            ),
+            Added::Unknown => continue,
+            Added::Failed(e) => format!("could not copy: {e}"),
+        };
+        println!("{}: {line}", path.display());
+    }
+    match others {
+        0 if added.is_empty() => eprintln!("spectra: no files there"),
+        0 => {}
+        1 if added.len() == 1 => eprintln!("spectra: not firmware Spectra knows"),
+        n => println!("{n} other files are not firmware Spectra knows; left alone"),
+    }
+    if ok { 0 } else { 1 }
 }
 
 /// Send a command to a window and say how it went.

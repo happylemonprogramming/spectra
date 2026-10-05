@@ -34,6 +34,7 @@ What else helps, all optional:
 | --- | --- |
 | Full drive access | the `sg` kernel module: `sudo modprobe sg` |
 | PS1 and PS2 games | RetroArch, with the `pcsx_rearmed` and `play` cores from its Online Updater. No BIOS needed |
+| Saturn, Sega CD, PC Engine CD, Neo Geo CD games | RetroArch's `mednafen_saturn` (or `yabause`), `genesis_plus_gx`, `mednafen_pce` and `neocd` cores, and for most of them the console's firmware, from your own console: see [Firmware](#firmware) |
 | Films | VLC, and `libdvdcss` for most DVDs |
 
 On macOS and Windows the one-liners say Spectra is not there yet:
@@ -76,6 +77,24 @@ output_name = SPECTRA-TV
 and Spectra is added to Sunshine's apps, with `spectra tv on` to do and
 `spectra tv off` to undo. Hyprland only, for now.
 
+## Firmware
+
+Most consoles start from firmware, a BIOS, which belongs to their maker.
+Spectra never provides it. PS2 games and Neo Geo CD games play without it;
+PS1 and Saturn games play without it too, but more of them play with it;
+Sega CD and PC Engine CD games need it.
+
+If you have dumped it from a console of your own, hand Spectra the files,
+or a folder of them, by any name:
+
+```sh
+spectra firmware add ~/bios      # copies what it recognises into RetroArch's system folder
+spectra firmware                 # what is there, and which games need what
+```
+
+Files are recognised by their checksums, the ones libretro publishes. Other
+files are left alone, and nothing already there is overwritten.
+
 ## From a terminal, or an agent
 
 The window can be driven from the command line, so scripts and AI agents can
@@ -89,6 +108,7 @@ spectra pause; spectra next; spectra status
 spectra play "blue lines" --new  # a second window, playing beside the first
 spectra windows                  # every window; commands take --window PID
 spectra tv on                    # over to the TV, through Sunshine; tv off, back
+spectra firmware add ~/bios      # a console's firmware, from your own console
 spectra quit
 ```
 

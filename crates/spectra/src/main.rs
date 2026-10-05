@@ -23,6 +23,7 @@ mod control;
 mod disc;
 mod film;
 mod filmdb;
+mod firmware;
 mod game;
 mod gamepad;
 mod hyprland;
@@ -972,10 +973,11 @@ impl Spectra {
                     } else if self.launch.is_some() {
                         self.start_game()
                     } else {
-                        return (
-                            Err("no emulator for this console is installed".into()),
-                            task,
+                        let why = self.picked.as_ref().and_then(|p| p.meta.system).map_or(
+                            "no emulator for this console is installed".into(),
+                            game::missing,
                         );
+                        return (Err(why), task);
                     };
                     return self.started(Task::batch([task, start]));
                 }
@@ -1567,7 +1569,7 @@ impl Spectra {
             .disc
             .as_ref()
             .and_then(|d| d.game.as_ref())
-            .is_some_and(|g| game::find(g.system).is_some());
+            .is_some_and(|g| game::hosted(g.system));
         if self.launch.is_some() || music || emulator || self.film_uri.is_some() {
             album.note = Some(self.ready_note());
         }
@@ -1627,7 +1629,11 @@ impl Spectra {
             } else if entry.is_film() {
                 format!("Your copy  ·  {{accept}} Play in VLC  ·  {{back}} Back {back}")
             } else if self.launch.is_none() {
-                format!("No emulator for this console is installed  ·  {{back}} Back {back}")
+                let why = entry.meta.system.map_or_else(
+                    || "No emulator for this console is installed".into(),
+                    game::missing,
+                );
+                format!("{why}  ·  {{back}} Back {back}")
             } else {
                 format!("Your copy  ·  {{accept}} Play  ·  {{back}} Back {back}")
             };
@@ -1652,7 +1658,8 @@ impl Spectra {
             // An emulator that only plays copies.
             return match (game::find(game.system), library::id(&disc.report)) {
                 (Some(_), Some(_)) => "{alt} Keep a copy, then play it from the copy".into(),
-                _ => "No emulator for this console is installed".into(),
+                (Some(_), None) => "This plays from a copy, and this disc can't be kept yet".into(),
+                (None, _) => game::missing(game.system),
             };
         }
         match library::id(&disc.report) {

@@ -27,6 +27,8 @@ out to let the user decide. The binary goes to `~/.local/bin/spectra`.
 | `spectra status [--json]` | What is on the stage, what plays, the drive |
 | `spectra windows [--json]` | Every open window and what it plays; the current one marked `*` |
 | `spectra tv on \| off [--size WxH@FPS]` | Over to the TV's screen, which Sunshine streams to Moonlight, or back. `on` opens a window first if none is open; `off` finds the window that is on the TV |
+| `spectra firmware [--json]` | Each console's firmware: which is in RetroArch's system folder, and whether its games need it. Works without a window |
+| `spectra firmware add FILE\|FOLDER...` | Copy the files that are known firmware, by checksum, into RetroArch's system folder under the names the cores look for. Never overwrites |
 | `spectra quit` | Close the window |
 
 `play` takes:
@@ -153,6 +155,9 @@ every couple of seconds until `drive` is `disc` (or `empty` /
   a time. It reads the TV's size from `SUNSHINE_CLIENT_WIDTH`, `_HEIGHT` and
   `_FPS`. If a window goes without `tv off`, a helper takes the screen away.
   Needs Hyprland and Sunshine, and the error says so.
+- **Firmware is the user's own.** Never look for, download or suggest a
+  source of console firmware (BIOS). `spectra firmware add` takes only what
+  the user hands it, dumped from their own console.
 - **Keeping a copy** (C in the window) reads the whole disc, minutes for a
   CD; while `copying` is true commands are refused. Keeping and deleting
   copies are the user's choices: `spectra-discid --keep` keeps one from a
@@ -183,6 +188,7 @@ crates/spectra/         the app (iced on wgpu)
   src/control.rs        the socket the command line talks to; Request and Status
   src/windows.rs        several windows: which is current, finding them, the drive lock
   src/audio.rs          CD audio through cpal; game.rs RetroArch; film.rs VLC
+  src/firmware.rs       console firmware the user adds, known by checksum
   src/tv.rs             on the TV: a screen of its own, streamed by Sunshine
   src/hyprland.rs       Hyprland's events, windows and screens
 emulators/play/         Play! as Spectra plays it: the upstream commit, our patches, build.sh

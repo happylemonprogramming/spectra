@@ -26,6 +26,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Already built for disc IDs; here for firmware checksums.
+sha1.workspace = true
 spectra-core.workspace = true
 
 [dev-dependencies]

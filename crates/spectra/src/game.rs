@@ -5,8 +5,9 @@
 //! first. Cores are looked for in Spectra's own folder first, where
 //! `emulators/*/build.sh` puts the ones it builds with fixes upstream has not
 //! merged yet; then where RetroArch's own core updater puts them, then where
-//! Arch's packages do. A core that needs no BIOS comes first, so a disc plays
-//! without anything else to set up.
+//! Arch's packages do. The best core comes first, and one that needs the
+//! console's firmware is passed over until the user has added it
+//! (`firmware`); a core that needs none comes after, so a disc still plays.
 //!
 //! Not every core reads through RetroArch's drive: Play!, for the PS2, opens
 //! its files itself, so it plays a kept copy rather than the disc.
@@ -19,6 +20,8 @@ use std::process::{Child, Command, Stdio};
 
 use spectra_core::GameSystem;
 
+use crate::firmware;
+
 pub struct Emulator {
     program: PathBuf,
     core: PathBuf,
@@ -26,16 +29,77 @@ pub struct Emulator {
     pub reads_drive: bool,
 }
 
-/// The cores that play a system, best first, and whether each reads the
-/// drive.
-fn cores(system: GameSystem) -> &'static [(&'static str, bool)] {
+struct Core {
+    file: &'static str,
+    name: &'static str,
+    /// Plays from the drive, not only from a copy.
+    reads_drive: bool,
+    /// Firmware it cannot start without: any one of these.
+    needs: &'static [&'static str],
+}
+
+const fn core(file: &'static str, name: &'static str, reads_drive: bool) -> Core {
+    Core {
+        file,
+        name,
+        reads_drive,
+        needs: &[],
+    }
+}
+
+/// The cores that play a system, best first. Only PCSX-ReARMed has been
+/// tried on a disc in the drive; the others play copies until they have
+/// been, except PC Engine CD games, which cannot be kept yet as they carry
+/// no serial number.
+fn cores(system: GameSystem) -> &'static [Core] {
+    // PCSX-ReARMed has a BIOS of its own, and uses the console's if the user
+    // has added it; Beetle PSX needs Sony's.
+    const PS1: &[Core] = &[core("pcsx_rearmed_libretro.so", "PCSX-ReARMed", true)];
+    // Play! too; PCSX2 needs Sony's.
+    const PS2: &[Core] = &[core("play_libretro.so", "Play!", false)];
+    const SATURN: &[Core] = &[
+        Core {
+            needs: &["mpr-17933.bin", "sega_101.bin"],
+            ..core("mednafen_saturn_libretro.so", "Beetle Saturn", false)
+        },
+        // Imitates the firmware, and plays fewer games for it.
+        core("yabause_libretro.so", "Yabause", false),
+    ];
+    const SEGA_CD: &[Core] = &[Core {
+        needs: &["bios_CD_U.bin", "bios_CD_E.bin", "bios_CD_J.bin"],
+        ..core("genesis_plus_gx_libretro.so", "Genesis Plus GX", false)
+    }];
+    const PC_ENGINE_CD: &[Core] = &[
+        Core {
+            needs: &["syscard3.pce"],
+            ..core("mednafen_pce_libretro.so", "Beetle PCE", true)
+        },
+        Core {
+            needs: &["syscard3.pce"],
+            ..core("mednafen_pce_fast_libretro.so", "Beetle PCE Fast", true)
+        },
+    ];
+    // Has a firmware of its own, and uses the console's if it is there.
+    const NEO_GEO_CD: &[Core] = &[core("neocd_libretro.so", "NeoCD", false)];
     match system {
-        // PCSX-ReARMed has a BIOS of its own; Beetle PSX needs Sony's.
-        GameSystem::Ps1 => &[("pcsx_rearmed_libretro.so", true)],
-        // Play! too; PCSX2 needs Sony's.
-        GameSystem::Ps2 => &[("play_libretro.so", false)],
+        GameSystem::Ps1 => PS1,
+        GameSystem::Ps2 => PS2,
+        GameSystem::Saturn => SATURN,
+        GameSystem::SegaCd => SEGA_CD,
+        GameSystem::PcEngineCd => PC_ENGINE_CD,
+        GameSystem::NeoGeoCd => NEO_GEO_CD,
         _ => &[],
     }
+}
+
+/// Whether Spectra hands this console's games to an emulator at all.
+pub fn hosted(system: GameSystem) -> bool {
+    !cores(system).is_empty()
+}
+
+/// Whether the console's games need its firmware to play at all.
+pub fn needs_firmware(system: GameSystem) -> bool {
+    hosted(system) && cores(system).iter().all(|c| !c.needs.is_empty())
 }
 
 /// Where Spectra keeps the cores it builds: `$XDG_DATA_HOME/spectra/cores`.
@@ -63,19 +127,54 @@ pub fn on_path(program: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// RetroArch and a core for this system, if both are installed.
+fn installed(core: &Core, dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.join(core.file))
+        .find(|path| path.is_file())
+}
+
+fn ready(core: &Core) -> bool {
+    core.needs.is_empty() || core.needs.iter().any(|file| firmware::present(file))
+}
+
+/// RetroArch and a core for this system, if both are installed, with the
+/// firmware the core needs.
 pub fn find(system: GameSystem) -> Option<Emulator> {
     let program = on_path("retroarch")?;
     let dirs = core_dirs();
-    let (core, reads_drive) = cores(system)
+    let (core, path) = cores(system)
         .iter()
-        .flat_map(|&(name, reads)| dirs.iter().map(move |dir| (dir.join(name), reads)))
-        .find(|(path, _)| path.is_file())?;
+        .filter(|core| ready(core))
+        .find_map(|core| Some((core, installed(core, &dirs)?)))?;
     Some(Emulator {
         program,
-        core,
-        reads_drive,
+        core: path,
+        reads_drive: core.reads_drive,
     })
+}
+
+/// Why `find` found nothing, in a sentence for the window.
+pub fn missing(system: GameSystem) -> String {
+    let Some(best) = cores(system).first() else {
+        return format!("Spectra doesn't play {} games yet", system.name());
+    };
+    if on_path("retroarch").is_none() {
+        return "Games play in RetroArch, which isn't installed".into();
+    }
+    let dirs = core_dirs();
+    match cores(system)
+        .iter()
+        .find(|core| installed(core, &dirs).is_some())
+    {
+        None => format!(
+            "Needs RetroArch's {} core, from its Online Updater",
+            best.name
+        ),
+        Some(_) => format!(
+            "Needs the {} firmware, from your own console: spectra firmware add FILE",
+            system.name()
+        ),
+    }
 }
 
 /// What RetroArch calls a drive: `/dev/sg0` is `cdrom://drive0.cue`. Only
@@ -196,6 +295,33 @@ mod tests {
         let retroarch = dirs.iter().position(|dir| dir.ends_with("retroarch/cores"));
         assert!(own.is_some() && own < retroarch, "{dirs:?}");
         assert_eq!(dirs.last(), Some(&PathBuf::from("/usr/lib/libretro")));
+    }
+
+    #[test]
+    fn every_firmware_a_core_needs_is_one_spectra_recognises() {
+        for system in [
+            GameSystem::Ps1,
+            GameSystem::Ps2,
+            GameSystem::Saturn,
+            GameSystem::SegaCd,
+            GameSystem::PcEngineCd,
+            GameSystem::NeoGeoCd,
+        ] {
+            for file in cores(system).iter().flat_map(|c| c.needs) {
+                let known = firmware::KNOWN.iter();
+                assert!(
+                    known
+                        .filter(|f| f.system == system)
+                        .any(|f| f.file == *file),
+                    "{file}"
+                );
+            }
+        }
+        assert!(needs_firmware(GameSystem::SegaCd));
+        assert!(needs_firmware(GameSystem::PcEngineCd));
+        assert!(!needs_firmware(GameSystem::Saturn));
+        assert!(!needs_firmware(GameSystem::Ps1));
+        assert!(!needs_firmware(GameSystem::Xbox));
     }
 
     #[test]
