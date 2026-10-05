@@ -302,7 +302,7 @@ impl Spectra {
                 ("⇧F", "Favorites"),
                 ("/", "Search"),
                 ("F", "Favorite, or not"),
-                ("C", "Keep a copy"),
+                ("C", "Keep a copy; a game's music"),
                 ("M", "Options"),
                 ("DEL", "Remove a copy"),
                 ("D", "The drive"),

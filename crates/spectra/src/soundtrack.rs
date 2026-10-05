@@ -7,6 +7,11 @@
 //! and silence stay with the game. CD audio tracks keep the disc's own
 //! numbers, so "Track 4" is track 4 wherever else it is looked up; music
 //! files are named by their file names.
+//!
+//! Saved, it is written out of Spectra, to the Music folder as FLAC: then
+//! it is the user's, and stays when the game goes.
+
+use std::path::{Path, PathBuf};
 
 use spectra_core::library::Entry;
 use spectra_core::soundtrack::{self, Kind, MusicFile};
@@ -105,6 +110,119 @@ fn file_music(entry: &Entry) -> Option<Soundtrack> {
     })
 }
 
+/// Save a game's music to the Music folder, a FLAC file to a track, tagged
+/// and with its cover, so it plays anywhere: on a phone, in another player.
+/// Saved again, the files are written over. Telling `progress` as each
+/// track is done; returns the folder. Off the UI thread: it reads the
+/// whole soundtrack.
+pub fn save(
+    game: &Entry,
+    music: &Soundtrack,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<PathBuf, String> {
+    let album = format!("{} (Soundtrack)", game.meta.title);
+    let folder = music_dir().join(file_name(&album));
+    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+    let picture = crate::artwork::cover_file(game).and_then(|path| picture(&path));
+    let total = music.tracks.len();
+    let system = game.meta.system.map_or("game", |s| s.name());
+    for (i, (track, span)) in music.tracks.iter().zip(&music.spans).enumerate() {
+        progress(i, total);
+        let (rate, pcm) = audio::read_span(&music.source, *span)?;
+        let mut tags = vec![
+            ("TITLE", track.title.clone()),
+            ("ALBUM", album.clone()),
+            ("TRACKNUMBER", (i + 1).to_string()),
+            ("TRACKTOTAL", total.to_string()),
+            ("GENRE", "Soundtrack".into()),
+            (
+                "COMMENT",
+                format!("From the {system} disc {}", game.meta.id),
+            ),
+        ];
+        // Who made the music is not known; who put the game out is, and
+        // is what players group a soundtrack under.
+        if let Some(publisher) = &game.meta.publisher {
+            tags.push(("ARTIST", publisher.clone()));
+            tags.push(("ALBUMARTIST", publisher.clone()));
+        }
+        if let Some(year) = &game.meta.year {
+            tags.push(("DATE", year.clone()));
+        }
+        let file = crate::flac::encode(&pcm, rate, &tags, picture.as_ref());
+        let name = format!("{:02} {}.flac", i + 1, file_name(&track.title));
+        // Whole or not at all: a file cut short by a full disk is not
+        // left looking like a track.
+        let part = folder.join(format!(".{name}.part"));
+        std::fs::write(&part, file)
+            .and_then(|()| std::fs::rename(&part, folder.join(&name)))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&part);
+                e.to_string()
+            })?;
+    }
+    progress(total, total);
+    Ok(folder)
+}
+
+/// The user's Music folder, as the desktop names it, or `~/Music`.
+fn music_dir() -> PathBuf {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    std::fs::read_to_string(config.join("user-dirs.dirs"))
+        .ok()
+        .and_then(|dirs| music_in(&dirs, &home))
+        .unwrap_or_else(|| home.join("Music"))
+}
+
+/// `XDG_MUSIC_DIR="$HOME/Music"`, from user-dirs.dirs, as a path.
+fn music_in(dirs: &str, home: &Path) -> Option<PathBuf> {
+    let line = dirs
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("XDG_MUSIC_DIR="))?;
+    let path = line.trim_matches('"');
+    let path = match path.strip_prefix("$HOME") {
+        Some(rest) => home.join(rest.trim_start_matches('/')),
+        None => PathBuf::from(path),
+    };
+    // Set to home itself means the desktop has no Music folder.
+    (path.is_absolute() && path != home).then_some(path)
+}
+
+/// A name with nothing a file name cannot hold: `AC/DC` is `AC-DC`.
+fn file_name(name: &str) -> String {
+    let name: String = name
+        .chars()
+        .map(|c| if c == '/' || c.is_control() { '-' } else { c })
+        .collect();
+    name.trim().trim_start_matches('.').to_string()
+}
+
+/// A cover as a FLAC file holds one: as it is, if a JPEG or PNG.
+fn picture(path: &Path) -> Option<crate::flac::Picture> {
+    let data = std::fs::read(path).ok()?;
+    let mime = if data.starts_with(&[0xFF, 0xD8]) {
+        "image/jpeg"
+    } else if data.starts_with(b"\x89PNG") {
+        "image/png"
+    } else {
+        return None;
+    };
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(&data))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    Some(crate::flac::Picture {
+        data,
+        mime,
+        width,
+        height,
+    })
+}
+
 fn file_track(file: &MusicFile) -> Track {
     Track {
         title: title(&file.name),
@@ -174,6 +292,30 @@ mod tests {
         std::fs::create_dir(root.path().join("SLUS-00152")).unwrap();
         assert!(spectra_core::library::remove_in(root.path(), &music).is_err());
         assert!(root.path().join("SLUS-00152").exists());
+    }
+
+    #[test]
+    fn the_music_folder_is_the_desktops() {
+        let home = std::path::Path::new("/home/someone");
+        let dirs = "# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\nXDG_MUSIC_DIR=\"$HOME/Tunes\"\n";
+        assert_eq!(super::music_in(dirs, home), Some(home.join("Tunes")));
+        assert_eq!(
+            super::music_in("XDG_MUSIC_DIR=\"/srv/music\"", home),
+            Some("/srv/music".into())
+        );
+        // None at all, or home itself: ~/Music, then.
+        assert_eq!(super::music_in("XDG_MUSIC_DIR=\"$HOME/\"", home), None);
+        assert_eq!(super::music_in("", home), None);
+    }
+
+    #[test]
+    fn titles_become_file_names_that_can_be() {
+        assert_eq!(super::file_name("AC/DC"), "AC-DC");
+        assert_eq!(super::file_name("..hidden"), "hidden");
+        assert_eq!(
+            super::file_name("Tomb Raider (Soundtrack)"),
+            "Tomb Raider (Soundtrack)"
+        );
     }
 
     #[test]

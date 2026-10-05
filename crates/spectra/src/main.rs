@@ -25,6 +25,7 @@ mod disc;
 mod film;
 mod filmdb;
 mod firmware;
+mod flac;
 mod game;
 mod gamepad;
 mod hyprland;
@@ -169,6 +170,7 @@ enum Message {
     /// Pictures for the game with this serial arrived.
     Pictures(String, artwork::Pictures),
     Keeping(Keeping),
+    Saving(Saving),
     Audio(audio::Event),
     /// MusicBrainz's answer for the audio CD with this disc ID.
     Release(String, Box<musicbrainz::Found>),
@@ -206,6 +208,8 @@ enum Message {
     /// The stage's buttons: play it, star it, throw its copy away.
     StagePlay,
     StageStar,
+    /// A game's soundtrack onto the stage; on the soundtrack's, saved.
+    StageMusic,
     StageRemove,
     /// The stage's window closed.
     CloseStage,
@@ -366,6 +370,8 @@ struct Spectra {
     /// Each kept game listened to so far, by ID, and the music it has. A
     /// game being listened to is here already, with none yet.
     soundtracks: HashMap<String, Option<Arc<soundtrack::Soundtrack>>>,
+    /// The soundtrack being saved to the Music folder, by its entry's ID.
+    saving: Option<String>,
     /// What the prompts are drawn as: keys, or the pad last used.
     style: ui::Style,
     /// The mouse is what is in use, so there is a pointer to show where
@@ -451,6 +457,14 @@ struct Copying {
 }
 
 #[derive(Debug, Clone)]
+enum Saving {
+    /// Tracks done, of how many.
+    Progress(usize, usize),
+    /// The folder they went to.
+    Done(Result<PathBuf, String>),
+}
+
+#[derive(Debug, Clone)]
 enum Keeping {
     Progress(u32, u32),
     Done(Result<Box<library::Entry>, String>),
@@ -528,6 +542,7 @@ impl Spectra {
             },
             shelf: Shelf::new(),
             soundtracks: HashMap::new(),
+            saving: None,
             style: ui::Style::Keys,
             pointing: false,
             cursor: Point::ORIGIN,
@@ -621,6 +636,67 @@ impl Spectra {
         }
         self.stage_open = false;
         Task::batch([task, self.open_library()])
+    }
+
+    /// The game on the stage's soundtrack, by its place among my discs, if
+    /// it has music and it has been heard.
+    fn soundtrack_index(&self) -> Option<usize> {
+        let game = self.picked.as_ref().filter(|e| !soundtrack::is_entry(e))?;
+        self.soundtracks.get(&game.meta.id)?.as_ref()?;
+        let id = soundtrack::entry(game).meta.id;
+        self.shelf.entries.iter().position(|e| e.meta.id == id)
+    }
+
+    /// On a game: its soundtrack, onto the stage. On the soundtrack: saved
+    /// to the Music folder, as files of its own.
+    fn stage_music(&mut self) -> Task<Message> {
+        if let Some(index) = self.soundtrack_index() {
+            return self.pick(index);
+        }
+        let Some(entry) = self.picked.clone().filter(soundtrack::is_entry) else {
+            return Task::none();
+        };
+        let Some(music) = self
+            .soundtracks
+            .get(soundtrack::game_id(&entry))
+            .cloned()
+            .flatten()
+        else {
+            return Task::none();
+        };
+        let Some(game) = library::find(soundtrack::game_id(&entry)) else {
+            return Task::none();
+        };
+        if self.saving.is_some() {
+            return Task::none();
+        }
+        self.saving = Some(entry.meta.id.clone());
+        self.album.note = Some("Saving to Music".into());
+        Task::run(
+            iced::stream::channel(4, async move |mut output| {
+                let (tx, mut rx) = iced::futures::channel::mpsc::unbounded();
+                std::thread::spawn(move || {
+                    let done = soundtrack::save(&game, &music, |done, total| {
+                        let _ = tx.unbounded_send(Saving::Progress(done, total));
+                    });
+                    let _ = tx.unbounded_send(Saving::Done(done));
+                });
+                use iced::futures::StreamExt;
+                while let Some(event) = rx.next().await {
+                    if output.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            }),
+            Message::Saving,
+        )
+    }
+
+    /// Whether the soundtrack being saved is the one on the stage, for its
+    /// note to say how it goes.
+    fn saving_shown(&self) -> bool {
+        self.saving.is_some()
+            && self.saving.as_deref() == self.picked.as_ref().map(|e| e.meta.id.as_str())
     }
 
     fn rewind(&mut self) {
@@ -944,6 +1020,26 @@ impl Spectra {
                 Task::none()
             }
             Message::StageRemove => self.stage_remove(),
+            Message::StageMusic => self.stage_music(),
+            Message::Saving(Saving::Progress(done, total)) => {
+                if self.saving_shown() {
+                    self.album.note = Some(format!("Saving to Music  ·  {done} of {total} tracks"));
+                }
+                Task::none()
+            }
+            Message::Saving(Saving::Done(result)) => {
+                let shown = self.saving_shown();
+                self.saving = None;
+                if shown {
+                    self.album.note = Some(match result {
+                        Ok(folder) => {
+                            format!("Saved to {}  ·  {{accept}} Play", home_relative(&folder))
+                        }
+                        Err(e) => format!("Couldn't save the soundtrack: {e}"),
+                    });
+                }
+                Task::none()
+            }
             // Enter in the search: open the first that fits, as a launcher
             // does.
             Message::SearchSubmit => self.activate(),
@@ -1453,7 +1549,8 @@ impl Spectra {
             Remote::Library | Remote::Menu => return self.open_library(),
             // Only the disc in the drive can be kept.
             Remote::Keep if self.picked.is_none() => return self.keep_copy(),
-            Remote::Keep => return Task::none(),
+            // A kept game's has its music to offer, and its music, saving.
+            Remote::Keep => return self.stage_music(),
             // Back from whatever is on the stage, not playing, is back to
             // the wall it was chosen from.
             Remote::Back if self.playing.is_none() => return self.open_library(),
@@ -2697,6 +2794,32 @@ impl Spectra {
                     Some(Message::StageStar),
                     false,
                 ));
+                // A game's music, from its stage; a soundtrack's, out to
+                // the Music folder. The same button, one step on.
+                let music = if soundtrack::is_entry(entry) {
+                    Some(if self.saving.is_some() {
+                        "Saving…"
+                    } else {
+                        "Save to Music"
+                    })
+                } else {
+                    self.soundtrack_index().map(|_| "Soundtrack")
+                };
+                if let Some(words) = music {
+                    doing = doing.push(theme::button_with(
+                        row![
+                            image(theme::notes_icon())
+                                .width(16)
+                                .height(16)
+                                .filter_method(image::FilterMethod::Nearest),
+                            label("{alt}", words),
+                        ]
+                        .spacing(6)
+                        .align_y(Vertical::Center),
+                        self.saving.is_none().then_some(Message::StageMusic),
+                        false,
+                    ));
+                }
                 // A soundtrack goes with its game, not by itself.
                 if !soundtrack::is_entry(entry) {
                     let armed = self.shelf.armed.as_deref() == Some(entry.meta.id.as_str());
@@ -2737,7 +2860,9 @@ impl Spectra {
             }
             _ => {}
         }
-        let mut bar = row![doing, space().width(Fill)].align_y(Vertical::Center);
+        // In a narrow window the buttons go onto a second line, My discs
+        // staying at the end of the first.
+        let mut bar = row![doing.width(Fill).wrap().vertical_spacing(8)].align_y(Vertical::Center);
         if !busy {
             bar = bar.push(theme::button_with(
                 label("{back}", "My discs"),
@@ -3297,6 +3422,18 @@ fn shorten(title: &str, most: usize) -> String {
 }
 
 /// Seconds as a player shows them: `4:28`.
+/// A path as it is said to the user: `~/Music/…` rather than all of it.
+fn home_relative(path: &std::path::Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 fn clock(seconds: u32) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }

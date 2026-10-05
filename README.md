@@ -64,7 +64,7 @@ Open Spectra from the app launcher and put a disc in. Keyboard or gamepad:
 | Shift+F | | Show only Favorites; again for all |
 | / or Ctrl+F | | Search your discs |
 | F | X | Favorite, or not |
-| C | Y | Keep a copy of the disc |
+| C | Y | Keep a copy of the disc; on a kept game, its soundtrack; on that, save it to Music |
 | M | Select | Options for a disc; on the stage, your discs |
 | Delete | | Remove a kept copy (press twice) |
 | D | | The disc in the drive |
@@ -72,6 +72,11 @@ Open Spectra from the app launcher and put a disc in. Keyboard or gamepad:
 | , | Home | The start menu: places, settings, players, keys, quit |
 | Backspace or Esc | B | Clear the search or filter, stop, or back |
 | T | | Get the TV ready, or stop |
+
+A kept game with music on its disc - CD audio, or plain WAV files - has its
+soundtrack beside it among your discs, and a Soundtrack button on its stage.
+It plays as an album does. Save to Music writes each track to your Music
+folder as a FLAC file, tagged and with the game's cover, to play anywhere.
 
 ## On the TV
 

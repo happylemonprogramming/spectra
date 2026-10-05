@@ -88,6 +88,18 @@ pub fn for_copy(entry: &Entry) -> Pictures {
     }
 }
 
+/// Where a kept game's cover is, as a file: with the copy, or in the cache.
+pub fn cover_file(entry: &Entry) -> Option<PathBuf> {
+    let kept = entry.dir.join(COVER);
+    if kept.is_file() {
+        return Some(kept);
+    }
+    let mut game = GameIdentity::new(entry.meta.system?);
+    game.serial = entry.meta.serial.clone();
+    let (name, _) = cover_url(&game)?;
+    Some(cache_dir()?.join(name)).filter(|p| p.is_file())
+}
+
 /// What is printed on a copy's disc, as a picture: a scan of the disc kept
 /// with it or cached for its game, or failing that its cover. Never the
 /// network. True for a scan, which wants cutting out.

@@ -147,6 +147,13 @@ impl Reader {
     }
 }
 
+/// The samples of a whole track, at once, for saving it: off the UI
+/// thread. Its rate, and 16-bit stereo pairs.
+pub fn read_span(source: &Source, span: Span) -> Result<(u32, Vec<u8>), String> {
+    let data = Reader::open(source)?.read(span.start, span.end - span.start)?;
+    Ok((source.rate(), data))
+}
+
 /// A track, as the frames it spans: on a CD, index 1 to the next track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
