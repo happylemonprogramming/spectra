@@ -186,7 +186,8 @@ esac
 
 cores=$data/spectra/cores
 notes=()
-ls /dev/sg* >/dev/null 2>&1 ||
+# Loaded, or built in: with no drive plugged in there is no /dev/sg* to look for.
+[ -d /sys/module/sg ] || ls /dev/sg* >/dev/null 2>&1 ||
 	notes+=("Load the sg module for full drive access: sudo modprobe sg, and to keep it: echo sg | sudo tee /etc/modules-load.d/sg.conf")
 
 # What Arch packages: RetroArch, VLC trimmed to what DVDs need (docs/spikes.md,
@@ -258,7 +259,7 @@ if [ "$engines" = yes ]; then
 
 	if [ ${#missing[@]} -gt 0 ] || [ ${#fetch[@]} -gt 0 ] || [ "$play" = yes ]; then
 		echo
-		say "To play every disc, offline too, Spectra sets up:"
+		say "To play discs offline too, Spectra sets up:"
 		[ ${#missing[@]} -gt 0 ] && echo "  sudo pacman -S --needed ${missing[*]}"
 		[ ${#fetch[@]} -gt 0 ] && echo "  from libretro's buildbot, into $cores: ${fetch[*]}"
 		[ "$play" = yes ] && echo "  Play! for PS2, built with Spectra's fixes (a few minutes)"
