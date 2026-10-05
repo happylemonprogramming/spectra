@@ -303,8 +303,8 @@ a minute in, normally; why is not known yet. Not yet played into a level.
 | 4. USB bridge | **BOT, works** | Same log: LG GUD0N slim drive behind an Initio INIC-1618L bridge (`13fd:0840`), `usb-storage` at 480M, subclass 02; came up as BOT, so there was no UAS to force off |
 | 5. UI weight | **Native: iced + wgpu** | Section 5 above: 25 MB vs ~220 MB, all budgets met |
 | 6. VLC for video discs | **Yes so far: through XWayland** | Section 6: lighter than mpv, GPU decoding works; menus wait for a DVD |
-| 8. RetroArch's keyboard on Wayland | pending | Section 8: one press ignored with `x`, one taken with `wayland` |
 | 7. GameCube and Wii without OmniDrive | **Probably: the drive keeps refused frames in a readable cache** | Section 7: raw frames over `READ BUFFER`, dump loop verified on a DVD at 2.9 MB/s; waiting on a Nintendo disc |
+| 8. RetroArch's keyboard on Wayland | pending | Section 8: one press ignored with `x`, one taken with `wayland` |
 
 Drive: model, firmware and USB bridge, as `spectra-discid --list` and `lsusb`
 report them:
