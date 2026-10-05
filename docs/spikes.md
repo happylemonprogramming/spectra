@@ -263,6 +263,36 @@ Three things only a real disc can answer:
 If the probe finds frames with Nintendo seeds, Phase 3 needs no new drive for
 GameCube and Wii.
 
+## 8. RetroArch's keyboard on Wayland
+
+Seen on 2026-10-05, trying Beetle PSX HW (the buildbot nightly) on Tomb
+Raider. The user's `retroarch.cfg` has `input_driver = "x"`, and RetroArch
+draws a native Wayland window. With that, ✕ (`z`) on the title screen did
+nothing; started again with `input_driver = "wayland"` appended, the same
+key started the game at once. Once each, through `wtype`, so not proven.
+
+To answer it:
+
+- Start a game from Spectra as it is, and press Enter and `z` on the title
+  screen. Then the same with `input_driver = "wayland"` in Spectra's
+  appended settings (`game.rs`, `settings_text`).
+- Also with a real keyboard, not `wtype`, in case the virtual keyboard is
+  what differs.
+- Check a gamepad still works with each: it goes through `udev`, not the
+  input driver, so it should.
+
+- **Yes** (Wayland only works): Spectra appends `input_driver = "wayland"`
+  when `WAYLAND_DISPLAY` is set.
+- **No**: note what did differ, and leave the user's setting alone.
+
+Found on the way: **Beetle PSX plays with no BIOS.** Since 2026-03-28
+(`5da5a3e`, "Support for OpenBIOS (as fallback and override)") it falls back
+to the OpenBIOS it carries when no Sony BIOS is found; Arch's
+`libretro-beetle-psx-hw` (`b4bca9f`, September 2026) has it. Tomb Raider got
+past the logos, its title screen and into its opening video on it, with
+`Firmware is missing: scph5501.bin` in the log. RetroArch closed itself about
+a minute in, normally; why is not known yet. Not yet played into a level.
+
 ## Results
 
 | Spike | Answer | Evidence |
@@ -273,6 +303,7 @@ GameCube and Wii.
 | 4. USB bridge | **BOT, works** | Same log: LG GUD0N slim drive behind an Initio INIC-1618L bridge (`13fd:0840`), `usb-storage` at 480M, subclass 02; came up as BOT, so there was no UAS to force off |
 | 5. UI weight | **Native: iced + wgpu** | Section 5 above: 25 MB vs ~220 MB, all budgets met |
 | 6. VLC for video discs | **Yes so far: through XWayland** | Section 6: lighter than mpv, GPU decoding works; menus wait for a DVD |
+| 8. RetroArch's keyboard on Wayland | pending | Section 8: one press ignored with `x`, one taken with `wayland` |
 | 7. GameCube and Wii without OmniDrive | **Probably: the drive keeps refused frames in a readable cache** | Section 7: raw frames over `READ BUFFER`, dump loop verified on a DVD at 2.9 MB/s; waiting on a Nintendo disc |
 
 Drive: model, firmware and USB bridge, as `spectra-discid --list` and `lsusb`

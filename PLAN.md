@@ -218,6 +218,12 @@ Answer the unknowns cheaply before building anything big.
 - [ ] **Spike: PCSX2.** Does it boot a PS2 disc straight from `/dev/sr0`?
 - [ ] **Spike: RetroArch.** Do Beetle PSX and Genesis Plus GX boot a physical
       disc (`cdrom://` or `/dev/sr0`)?
+- [ ] **Spike: RetroArch's keyboard on Wayland.** Does the keyboard reach a
+      game Spectra starts? This `retroarch.cfg` says `input_driver = "x"`
+      while RetroArch draws a native Wayland window: a key on Tomb Raider's
+      title did nothing, and with `input_driver = "wayland"` appended the
+      same key worked. Seen once. If it holds, Spectra's appended settings
+      say `wayland` under Wayland. Details in `docs/spikes.md`, section 8
 - [ ] **Spike: USB bridge.** Does the drive attach as UAS or BOT, which
       USB bridge chip does it use, and does SG_IO behave differently between
       the two modes?
