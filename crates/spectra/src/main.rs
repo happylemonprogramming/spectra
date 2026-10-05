@@ -68,7 +68,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use iced::futures::SinkExt;
 use spectra_core::drive::Drive;
-use spectra_core::{DiscKind, GameIdentity, Report, library};
+use spectra_core::{DiscKind, GameIdentity, GameSystem, Report, library};
 use watch::DriveState;
 
 const FONT: Font = Font::with_name("Adwaita Sans");
@@ -1618,6 +1618,22 @@ impl Spectra {
     /// What can be done now, for the line under the title. Buttons are
     /// written `{accept}`, and drawn as the controller in hand has them.
     fn ready_note(&self) -> String {
+        let note = self.what_can_be_done();
+        // Only PS2 has been seen to suffer: PS1, music and films are light.
+        let system = match &self.picked {
+            Some(entry) => entry.meta.system,
+            None => self
+                .disc
+                .as_ref()
+                .and_then(|d| Some(d.game.as_ref()?.system)),
+        };
+        if self.launch.is_some() && system == Some(GameSystem::Ps2) && platform::power_saver() {
+            return format!("Power saver is on: expect stutter and choppy sound  ·  {note}");
+        }
+        note
+    }
+
+    fn what_can_be_done(&self) -> String {
         if let Some(entry) = &self.picked {
             let back = if self.disc_in_drive() {
                 "for the disc in the drive"

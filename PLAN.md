@@ -92,6 +92,10 @@ How the design keeps to them:
   run on roughly a 2012-era laptop. PS2, GameCube and Wii need a stronger CPU,
   and original Xbox a modern one; that is the emulators' floor, and Spectra
   says so when a disc is inserted rather than stuttering.
+- **Power saver is the user's choice.** In power-saver mode Midnight Club
+  ran at half speed, with half its sound missing; balanced was enough. When
+  a PS2 game is ready to play in power saver, the window says to expect
+  stutter and choppy sound, and leaves the mode alone.
 
 ## Architecture
 
