@@ -82,8 +82,8 @@ How the design keeps to them:
   first time it goes in, network or not, so the installer sets up every
   engine at once: the VLC pieces and `libdvdcss` for DVDs, RetroArch,
   PCSX-ReARMed from libretro's buildbot (Arch does not package it), and
-  Spectra's Play! (built by `emulators/play/build.sh` for now; a ready-made build to
-  download comes once the repository is public). None of it is copied into
+  Spectra's Play! (built by `emulators/play/build.sh`, in CI for each release
+  and here only when building from source). None of it is copied into
   Spectra: `libdvdcss` is legally delicate to distribute, and system
   packages get security fixes. Installed engines cost disk, not memory or
   CPU: nothing runs until a disc does. Phase 3's engines (Dolphin, xemu)
@@ -192,8 +192,10 @@ packaging/              the desktop entry and icon
 scripts/check.sh        fmt, clippy, tests
 scripts/measure.sh      a release build against the budgets
 scripts/first-drive.sh  the first evening with a drive: spikes 1, 4 and 6
-scripts/install.sh      the one-line install: builds from source under ~/.local, from a
-                        checkout or piped from curl
+scripts/install.sh      the one-line install under ~/.local: piped from curl, downloads
+                        the latest release; from a checkout, builds from source
+.github/workflows/      release.yml: on a v* tag, builds Spectra and Play! and
+                        publishes them as a release
 scripts/install.ps1     the Windows one-liner, which for now says Spectra is Linux only
 README.md               install and use
 AGENTS.md               driving Spectra from the command line, for agents
@@ -452,9 +454,13 @@ Shelved, not ruled out: Omarchy comes first, and the
 - [x] Put the repository's URLs into the scripts, README and AGENTS.md: it
       lives at `github.com/happylemonprogramming/spectra`, and the one-liner
       fetches the script from `raw.githubusercontent.com`
-- [ ] Prebuilt binaries instead of a build on every machine: cargo-dist in CI
-      builds them and writes both scripts. Start it on Linux once the repo
-      has CI
+- [x] Prebuilt binaries instead of a build on every machine: on a `v*` tag,
+      `release.yml` builds Spectra and Play! on Ubuntu 22.04 (glibc 2.35, so
+      they run on nearly any distro since) and publishes
+      `spectra-x86_64-linux.tar.gz`; `install.sh` downloads it, in seconds,
+      and builds from source only where there is none. A hand-written
+      workflow rather than cargo-dist, whose installer would replace ours,
+      which also sets up the engines
 - [ ] Drive backends behind the `Disc` trait: IOKit's
       SCSITaskDeviceInterface on macOS (unmount through DiskArbitration
       first), SPTI on Windows. Repeat the USB bridge spike on each

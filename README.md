@@ -15,13 +15,18 @@ Linux only, for now. macOS and Windows need drive backends of their own; see
 curl -fsSL https://raw.githubusercontent.com/happylemonprogramming/spectra/main/scripts/install.sh | bash
 ```
 
-That builds Spectra from source and installs it for your user under
-`~/.local`: no sudo, except to install missing build packages (a C compiler,
-pkg-config, the ALSA and udev headers), which it asks about first. Rust comes
-from rustup when there is none. Arch, Debian/Ubuntu, Fedora and openSUSE are
-recognised.
+That downloads Spectra, ready-built, from the latest
+[release](https://github.com/happylemonprogramming/spectra/releases) and
+installs it for your user under `~/.local`, in seconds: no sudo for Spectra
+itself. On Arch it then offers to install RetroArch and VLC, which play games
+and films.
 
-From a checkout, the same script:
+Where there is no ready-built Spectra (not x86_64), it builds from source
+instead, in a few minutes: it asks before installing build packages (a C
+compiler, pkg-config, the ALSA and udev headers), and Rust comes from rustup
+when there is none. Arch, Debian/Ubuntu, Fedora and openSUSE are recognised.
+
+From a checkout, the same script builds what is there:
 
 ```sh
 scripts/install.sh               # build and install

@@ -53,8 +53,12 @@ for patch in "$here"/patches/*.patch; do
 done
 
 say "Building (a few minutes the first time)"
+# Without ICU, which only names memory card saves in Play!'s own UI: its
+# library's version is in its file name, so a core linked to it runs only
+# where that version is installed, and the prebuilt core runs everywhere.
 cmake -S "$src" -B "$src/build" -G Ninja -Wno-dev \
-	-DCMAKE_BUILD_TYPE=Release -DBUILD_LIBRETRO_CORE=ON -DBUILD_PLAY=OFF -DBUILD_TESTS=OFF >/dev/null
+	-DCMAKE_BUILD_TYPE=Release -DBUILD_LIBRETRO_CORE=ON -DBUILD_PLAY=OFF -DBUILD_TESTS=OFF \
+	-DCMAKE_DISABLE_FIND_PACKAGE_ICUUC=ON >/dev/null
 # Quiet unless it fails: the compiler warns a great deal about upstream's code.
 cmake --build "$src/build" --target play_libretro >"$src/build.log" 2>&1 || {
 	tail -n 40 "$src/build.log" >&2

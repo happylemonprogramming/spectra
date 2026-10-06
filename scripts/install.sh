@@ -11,10 +11,14 @@
 #   scripts/install.sh              build and install
 #   scripts/install.sh --yes        install missing packages without asking
 #   scripts/install.sh --no-engines Spectra alone, without what plays discs
+#   scripts/install.sh --source     build it even when piped (see below)
 #   scripts/install.sh --uninstall  remove what it installed (kept copies stay)
 #
-# Piped, options go after `bash -s --`. SPECTRA_REPO and SPECTRA_REF pick the
-# repository and branch or tag to build when not run from a checkout.
+# Piped, options go after `bash -s --`, and Spectra and its Play! come
+# ready-built from the latest release, in seconds. From a checkout, with
+# --source, or where there is no release for the machine, they are built
+# here, which takes minutes. SPECTRA_REPO and SPECTRA_REF pick the repository
+# and branch or tag to build then; SPECTRA_PREBUILT the release to download.
 #
 # No sudo for Spectra itself: it goes under ~/.local. sudo is only asked for
 # to install missing build packages (a C compiler, pkg-config, the ALSA and
@@ -29,7 +33,9 @@
 # own updater fetches it. About 45 MB in all.
 set -euo pipefail
 
-# Where the source is cloned from when piped from curl.
+# What the release workflow (.github/workflows/release.yml) builds.
+SPECTRA_PREBUILT=${SPECTRA_PREBUILT:-https://github.com/happylemonprogramming/spectra/releases/latest/download/spectra-x86_64-linux.tar.gz}
+# Where the source is cloned from when building it.
 SPECTRA_REPO=${SPECTRA_REPO:-https://github.com/happylemonprogramming/spectra.git}
 SPECTRA_REF=${SPECTRA_REF:-main}
 # let-chains and slice::as_chunks.
@@ -47,9 +53,11 @@ die() { printf 'spectra install: %s\n' "$*" >&2; exit 1; }
 yes=no
 uninstall=no
 engines=yes
+source=no
 for arg in "$@"; do
 	case $arg in
 	--yes | -y) yes=yes ;;
+	--source) source=yes ;;
 	--uninstall) uninstall=yes ;;
 	--no-engines) engines=no ;;
 	*) die "unknown option $arg" ;;
@@ -109,7 +117,7 @@ install_packages() {
 	$cmd
 }
 
-# --- The source ---------------------------------------------------------------
+# --- Ready-built --------------------------------------------------------------
 
 # Run from a checkout, or piped from curl.
 here=${BASH_SOURCE[0]:-}
@@ -119,14 +127,28 @@ if [ -n "$here" ] && [ -f "$here" ]; then
 	[ -f "$root/crates/spectra/Cargo.toml" ] && checkout=$root
 fi
 
-missing_packages && install_packages
+# Piped, from the latest release: what a build here would make, made already.
+prebuilt=
+if [ -z "$checkout" ] && [ "$source" = no ] && [ "$(uname -m)" = x86_64 ]; then
+	tmp=$(mktemp -d)
+	trap 'rm -rf "$tmp"' EXIT
+	say "Downloading Spectra"
+	if curl -fsSL --proto '=https,file' "$SPECTRA_PREBUILT" | tar -xz -C "$tmp" 2>/dev/null &&
+		[ -x "$tmp/spectra-x86_64-linux/spectra" ]; then
+		prebuilt=$tmp/spectra-x86_64-linux
+	else
+		say "There is no ready-built Spectra to download; building it instead"
+	fi
+fi
 
-if [ -n "$checkout" ]; then
-	cd "$checkout"
-else
-	case $SPECTRA_REPO in
-	__*__) die "this script does not know where Spectra's repository is yet: set SPECTRA_REPO to its git URL" ;;
-	esac
+# --- The source ---------------------------------------------------------------
+
+fetch_source() {
+	missing_packages && install_packages
+	if [ -n "$checkout" ]; then
+		cd "$checkout"
+		return
+	fi
 	if [ -d "$src/.git" ]; then
 		say "Updating the source in $src"
 		git -C "$src" fetch --depth 1 origin "$SPECTRA_REF"
@@ -137,42 +159,54 @@ else
 		git clone -q --depth 1 --branch "$SPECTRA_REF" "$SPECTRA_REPO" "$src"
 	fi
 	cd "$src"
-fi
+}
 
 # --- Rust -----------------------------------------------------------------------
 
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-cargo=(cargo)
-# The project pins its Rust with mise; use it where it is installed.
-if command -v mise >/dev/null && [ -f mise.toml ]; then
-	cargo=(mise exec -- cargo)
-elif ! command -v cargo >/dev/null; then
-	say "Installing Rust with rustup (into ~/.rustup and ~/.cargo)"
-	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-		sh -s -- -y --profile minimal --no-modify-path
-	. "$HOME/.cargo/env"
-fi
+find_rust() {
+	[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+	cargo=(cargo)
+	# The project pins its Rust with mise; use it where it is installed.
+	if command -v mise >/dev/null && [ -f mise.toml ]; then
+		cargo=(mise exec -- cargo)
+	elif ! command -v cargo >/dev/null; then
+		say "Installing Rust with rustup (into ~/.rustup and ~/.cargo)"
+		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+			sh -s -- -y --profile minimal --no-modify-path
+		. "$HOME/.cargo/env"
+	fi
 
-version=$("${cargo[@]}" --version | awk '{print $2}')
-if [ "$(printf '%s\n%s\n' "$RUST_MIN" "$version" | sort -V | head -1)" != "$RUST_MIN" ]; then
-	command -v rustup >/dev/null || die "Rust $version is too old: Spectra needs $RUST_MIN or newer"
-	say "Rust $version is too old; updating"
-	rustup update stable
-fi
+	local version
+	version=$("${cargo[@]}" --version | awk '{print $2}')
+	if [ "$(printf '%s\n%s\n' "$RUST_MIN" "$version" | sort -V | head -1)" != "$RUST_MIN" ]; then
+		command -v rustup >/dev/null || die "Rust $version is too old: Spectra needs $RUST_MIN or newer"
+		say "Rust $version is too old; updating"
+		rustup update stable
+	fi
+}
 
 # --- Build and install ----------------------------------------------------------
 
-say "Building Spectra (a few minutes the first time)"
-# Here, whatever the user's own setting, so the binaries are where they are
-# copied from.
-export CARGO_TARGET_DIR=$PWD/target
-"${cargo[@]}" build --release --locked -p spectra -p spectra-discid
+if [ -n "$prebuilt" ]; then
+	bins=$prebuilt
+	files=$prebuilt
+else
+	fetch_source
+	find_rust
+	say "Building Spectra (a few minutes the first time)"
+	# Here, whatever the user's own setting, so the binaries are where they are
+	# copied from.
+	export CARGO_TARGET_DIR=$PWD/target
+	"${cargo[@]}" build --release --locked -p spectra -p spectra-discid
+	bins=target/release
+	files=packaging
+fi
 
-install -Dm755 target/release/spectra "$bin_dir/spectra"
-install -Dm755 target/release/spectra-discid "$bin_dir/spectra-discid"
-install -Dm644 packaging/spectra.svg "$icon"
+install -Dm755 "$bins/spectra" "$bin_dir/spectra"
+install -Dm755 "$bins/spectra-discid" "$bin_dir/spectra-discid"
+install -Dm644 "$files/spectra.svg" "$icon"
 # The full path, because a launcher's PATH need not include ~/.local/bin.
-sed "s#^Exec=spectra#Exec=$bin_dir/spectra#" packaging/spectra.desktop | install -Dm644 /dev/stdin "$desktop"
+sed "s#^Exec=spectra#Exec=$bin_dir/spectra#" "$files/spectra.desktop" | install -Dm644 /dev/stdin "$desktop"
 command -v update-desktop-database >/dev/null && update-desktop-database -q "$(dirname "$desktop")"
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$data/icons/hicolor" || true
 
@@ -191,13 +225,15 @@ notes=()
 	notes+=("Load the sg module for full drive access: sudo modprobe sg, and to keep it: echo sg | sudo tee /etc/modules-load.d/sg.conf")
 
 # What Arch packages: RetroArch, VLC trimmed to what DVDs need (docs/spikes.md,
-# spike 6; Blu-ray waits for a disc to test), and the tools to build Play!.
+# spike 6; Blu-ray waits for a disc to test), GLU for Play!, and the tools to
+# build Play! when it is not ready-built.
 arch_packages=(
 	retroarch
 	vlc-cli vlc-plugin-dvd vlc-plugin-ffmpeg vlc-plugin-a52dec
 	vlc-plugin-pulse vlc-plugin-freetype libdvdcss
-	cmake ninja
+	glu
 )
+[ -n "$prebuilt" ] || arch_packages+=(cmake ninja)
 # What it does not, from libretro's buildbot: PS1.
 buildbot=https://buildbot.libretro.com/nightly/linux/x86_64/latest
 buildbot_cores=(pcsx_rearmed_libretro.so)
@@ -211,8 +247,9 @@ has_core() {
 }
 
 # The Play! the source asks for: its commit and patches, as build.sh writes
-# them beside the core.
+# them beside the core. Ready-built, the one that came with Spectra.
 play_wanted() (
+	[ -n "$prebuilt" ] && exec cat "$prebuilt/cores/play_libretro.txt"
 	. emulators/play/upstream
 	echo "Play! $PLAY_COMMIT"
 	for patch in emulators/play/patches/*.patch; do echo "+ $(basename "$patch")"; done
@@ -262,7 +299,11 @@ if [ "$engines" = yes ]; then
 		say "To play discs offline too, Spectra sets up:"
 		[ ${#missing[@]} -gt 0 ] && echo "  sudo pacman -S --needed ${missing[*]}"
 		[ ${#fetch[@]} -gt 0 ] && echo "  from libretro's buildbot, into $cores: ${fetch[*]}"
-		[ "$play" = yes ] && echo "  Play! for PS2, built with Spectra's fixes (a few minutes)"
+		if [ "$play" = yes ] && [ -n "$prebuilt" ]; then
+			echo "  Play! for PS2, with Spectra's fixes, into $cores"
+		elif [ "$play" = yes ]; then
+			echo "  Play! for PS2, built with Spectra's fixes (a few minutes)"
+		fi
 		if confirm "Set them up now?"; then
 			[ ${#missing[@]} -gt 0 ] && sudo pacman -S --needed "${missing[@]}"
 			mkdir -p "$cores"
@@ -270,7 +311,10 @@ if [ "$engines" = yes ]; then
 				say "Fetching $core"
 				fetch_core "$core"
 			done
-			if [ "$play" = yes ]; then
+			if [ "$play" = yes ] && [ -n "$prebuilt" ]; then
+				install -m755 "$prebuilt/cores/play_libretro.so" -t "$cores"
+				install -m644 "$prebuilt"/cores/play_libretro.{txt,License.txt} -t "$cores"
+			elif [ "$play" = yes ]; then
 				emulators/play/build.sh "$cores" ||
 					notes+=("Play! did not build; PS2 games wait for $PWD/emulators/play/build.sh")
 			fi

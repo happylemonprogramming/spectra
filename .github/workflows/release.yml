@@ -1,0 +1,61 @@
+# Builds what the installer downloads, so nobody has to compile: Spectra, and
+# Play! with Spectra's fixes. A tag (v0.2.0) publishes them as a release; run
+# by hand, it only keeps them as an artifact of the run, to try first.
+#
+# On Ubuntu 22.04 for its older glibc (2.35): a binary runs on the glibc it
+# was built against and newer, so this one runs on nearly every distro of the
+# last few years.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    env:
+      name: spectra-x86_64-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq pkg-config libasound2-dev libudev-dev \
+            cmake ninja-build libgl-dev libglu1-mesa-dev libbz2-dev \
+            libsqlite3-dev zlib1g-dev libssl-dev libcurl4-openssl-dev
+
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Spectra
+        run: cargo build --release --locked -p spectra -p spectra-discid
+
+      - name: Play!
+        run: emulators/play/build.sh "$PWD/dist/$name/cores"
+
+      - name: Package
+        run: |
+          d=dist/$name
+          install -Dm755 target/release/spectra target/release/spectra-discid -t "$d"
+          install -Dm644 packaging/spectra.desktop packaging/spectra.svg LICENSE -t "$d"
+          # What each needs from the system, in the log, for when one does not run.
+          readelf -d "$d/spectra" "$d/cores/play_libretro.so" | grep NEEDED
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.name }}
+          path: dist/${{ env.name }}.tar.gz
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "dist/$name.tar.gz" --generate-notes
