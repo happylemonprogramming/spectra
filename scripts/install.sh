@@ -225,13 +225,12 @@ notes=()
 	notes+=("Load the sg module for full drive access: sudo modprobe sg, and to keep it: echo sg | sudo tee /etc/modules-load.d/sg.conf")
 
 # What Arch packages: RetroArch, VLC trimmed to what DVDs need (docs/spikes.md,
-# spike 6; Blu-ray waits for a disc to test), GLU for Play!, and the tools to
-# build Play! when it is not ready-built.
+# spike 6; Blu-ray waits for a disc to test), and the tools to build Play!
+# when it is not ready-built.
 arch_packages=(
 	retroarch
 	vlc-cli vlc-plugin-dvd vlc-plugin-ffmpeg vlc-plugin-a52dec
 	vlc-plugin-pulse vlc-plugin-freetype libdvdcss
-	glu
 )
 [ -n "$prebuilt" ] || arch_packages+=(cmake ninja)
 # What it does not, from libretro's buildbot: PS1.
