@@ -1,6 +1,6 @@
 # Spectra for Windows, in one line, once it runs there:
 #
-#   irm https://__SPECTRA_RAW_URL__/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/happylemonprogramming/spectra/main/scripts/install.ps1 | iex
 #
 # Spectra runs on Linux for now: Windows needs a drive backend of its own
 # (SPTI), and macOS one through IOKit. See PLAN.md, "Later: macOS and Windows".

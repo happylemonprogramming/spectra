@@ -4,7 +4,7 @@
 #
 # From anywhere, in one line:
 #
-#   curl -fsSL https://__SPECTRA_RAW_URL__/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/happylemonprogramming/spectra/main/scripts/install.sh | bash
 #
 # or from a checkout:
 #
@@ -29,8 +29,8 @@
 # own updater fetches it. About 45 MB in all.
 set -euo pipefail
 
-# Filled in once the repository has a home.
-SPECTRA_REPO=${SPECTRA_REPO:-__SPECTRA_REPO_URL__}
+# Where the source is cloned from when piped from curl.
+SPECTRA_REPO=${SPECTRA_REPO:-https://github.com/happylemonprogramming/spectra.git}
 SPECTRA_REF=${SPECTRA_REF:-main}
 # let-chains and slice::as_chunks.
 RUST_MIN=1.88

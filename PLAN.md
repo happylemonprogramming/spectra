@@ -449,9 +449,9 @@ Shelved, not ruled out: Omarchy comes first, and the
       from source under `~/.local`, installing build packages (asked first)
       and Rust (rustup) where missing. macOS and Windows get a clear "Linux
       only for now"
-- [ ] Put the repository's URLs into the scripts, README and AGENTS.md once
-      it has a home: `__SPECTRA_REPO_URL__` (git) and `__SPECTRA_RAW_URL__`
-      (raw files)
+- [x] Put the repository's URLs into the scripts, README and AGENTS.md: it
+      lives at `github.com/happylemonprogramming/spectra`, and the one-liner
+      fetches the script from `raw.githubusercontent.com`
 - [ ] Prebuilt binaries instead of a build on every machine: cargo-dist in CI
       builds them and writes both scripts. Start it on Linux once the repo
       has CI

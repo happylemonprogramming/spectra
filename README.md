@@ -12,7 +12,7 @@ Linux only, for now. macOS and Windows need drive backends of their own; see
 ## Install
 
 ```sh
-curl -fsSL https://__SPECTRA_RAW_URL__/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/happylemonprogramming/spectra/main/scripts/install.sh | bash
 ```
 
 That builds Spectra from source and installs it for your user under
@@ -49,7 +49,7 @@ may play.
 For full drive access, load the `sg` kernel module: `sudo modprobe sg`.
 
 On macOS and Windows the one-liners say Spectra is not there yet:
-`irm https://__SPECTRA_RAW_URL__/scripts/install.ps1 | iex` on Windows.
+`irm https://raw.githubusercontent.com/happylemonprogramming/spectra/main/scripts/install.ps1 | iex` on Windows.
 
 ## Use
 

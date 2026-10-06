@@ -8,7 +8,7 @@ that. Working on the code instead: see [Changing the code](#changing-the-code).
 ## Is it installed?
 
 ```sh
-command -v spectra || curl -fsSL https://__SPECTRA_RAW_URL__/scripts/install.sh | bash -s -- --yes
+command -v spectra || curl -fsSL https://raw.githubusercontent.com/happylemonprogramming/spectra/main/scripts/install.sh | bash -s -- --yes
 ```
 
 `--yes` installs missing packages with sudo without asking, and sets up
